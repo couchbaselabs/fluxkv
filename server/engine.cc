@@ -86,6 +86,18 @@ Status Shard::Open() {
 
 void Shard::Close() {
     if (magma_) {
+        // Force everything buffered out to disk before closing. WriteDocs
+        // returning OK only means magma accepted the write, not that it is on
+        // disk, and nothing else in this server ever syncs. Without this, a
+        // clean shutdown lost the most recently written data: after a 200M key
+        // load, the first keys read back fine while 38% of the last ones were
+        // gone, the loss rising steadily towards the end of the load.
+        auto status = magma_->Sync(true /* flushAll */);
+        if (!status.IsOK()) {
+            spdlog::error("Sync failed during shutdown: {} - recently written "
+                          "data may be lost",
+                          status.String());
+        }
         magma_->Close();
     }
 }
