@@ -1,0 +1,746 @@
+#include "connection.h"
+
+#include <cbcrypto/digest.h>
+#include <folly/io/Cursor.h>
+#include <platform/base64.h>
+#include <spdlog/spdlog.h>
+
+#include <random>
+
+#include <sys/socket.h>
+#include <cstdlib>
+
+namespace magma {
+namespace kvserver {
+
+Connection::Connection(folly::AsyncSocket::UniquePtr socket,
+                       Bucket* bucket,
+                       const std::string& clusterConfig,
+                       const std::string& errorMap)
+    : socket_(std::move(socket)),
+      bucket_(bucket),
+      clusterConfig_(clusterConfig),
+      errorMap_(errorMap) {
+    // TCP_NODELAY: folly AsyncSocket does NOT set this by default. Without
+    // it, Nagle interacts with the small-response request/response pattern
+    // and adds tail latency on the order of 100s of microseconds to
+    // milliseconds at moderate concurrency. Critical for low-latency.
+    socket_->setNoDelay(true);
+
+    // SO_BUSY_POLL: kernel busy-polls the socket for arriving data instead
+    // of going through the softirq scheduler when packets land in the NIC
+    // ring. Eliminates a major source of p99 wake-up jitter at moderate
+    // request rates. Set MAGMA_BUSY_POLL_US to override (default 50µs).
+    {
+        int fd = socket_->getNetworkSocket().toFd();
+        if (fd >= 0) {
+            const char* env = std::getenv("MAGMA_BUSY_POLL_US");
+            int us = env ? std::atoi(env) : 50;
+            if (us > 0) {
+                int v = us;
+                ::setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &v, sizeof(v));
+            }
+        }
+    }
+
+    // SO_SNDBUF: enlarge the kernel TCP send buffer so the IO thread doesn't
+    // block on full buffer when bursts of pipelined responses fly out at
+    // 1 GB/s+. Default kernel cap is ~200KB which fills in <1ms at peak.
+    // 4 MB caps under 4ms even at sustained 1 GB/s. Requires
+    // net.core.wmem_max ≥ 4194304 (sysctl) — kernel silently caps otherwise.
+    // Set MAGMA_SNDBUF=0 to skip.
+    {
+        int fd = socket_->getNetworkSocket().toFd();
+        if (fd >= 0) {
+            const char* env = std::getenv("MAGMA_SNDBUF");
+            int sz = env ? std::atoi(env) : (4 * 1024 * 1024);
+            if (sz > 0) {
+                ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+            }
+        }
+    }
+    // Pre-build echo GET response buffer if echo mode is enabled
+    if (bucket_->GetEchoGetSize() > 0) {
+        auto& val = bucket_->GetEchoGetValue();
+        size_t bodyLen = 4 + val.size(); // 4 bytes flags + value
+        size_t totalLen = kHeaderSize + bodyLen;
+        echoResponseBuf_.resize(totalLen);
+
+        McbpHeader hdr{};
+        hdr.magic = kResponseMagic;
+        hdr.opcode = static_cast<uint8_t>(Opcode::Get);
+        hdr.keyLen = 0;
+        hdr.extrasLen = 4;
+        hdr.datatype = 0;
+        hdr.specific = static_cast<uint16_t>(McbpStatus::Success);
+        hdr.bodyLen = static_cast<uint32_t>(bodyLen);
+        hdr.opaque = 0; // stamped per-request
+        hdr.cas = 1;
+        hdr.hton();
+
+        auto* p = echoResponseBuf_.data();
+        memcpy(p, &hdr, kHeaderSize);
+        p += kHeaderSize;
+        uint32_t flagsNBO = htonl(0x04000000);
+        memcpy(p, &flagsNBO, 4);
+        p += 4;
+        memcpy(p, val.data(), val.size());
+    }
+}
+
+Connection::~Connection() {
+    for (auto* r : reqPool_) {
+        delete r;
+    }
+}
+
+Request* Connection::acquireRequest() {
+    if (!reqPool_.empty()) {
+        auto* r = reqPool_.back();
+        reqPool_.pop_back();
+        return r;
+    }
+    return new Request();
+}
+
+void Connection::releaseRequest(Request* req) {
+    if (reqPool_.size() < kMaxPooledReqs) {
+        req->reset();
+        reqPool_.push_back(req);
+    } else {
+        delete req;
+    }
+}
+
+void Connection::start() {
+    gDispStats.connectAccept.fetch_add(1, std::memory_order_relaxed);
+    socket_->setReadCB(this);
+}
+
+void Connection::destroy() {
+    if (closing_)
+        return;
+    closing_ = true;
+    gDispStats.connectClose.fetch_add(1, std::memory_order_relaxed);
+    auto* evb = socket_->getEventBase();
+    if (flushCb_.isLoopCallbackScheduled()) {
+        flushCb_.cancelLoopCallback();
+    }
+    flushScheduled_ = false;
+    socket_->setReadCB(nullptr);
+    socket_->close();
+    // Defer delete to next event loop iteration to avoid use-after-free
+    // when destroy() is called from within a read/write callback.
+    if (outstandingRequests_.load() == 0) {
+        evb->runInEventBaseThread([this]() { delete this; });
+    }
+}
+
+// ---- ReadCallback ----
+
+void Connection::getReadBuffer(void** bufReturn, size_t* lenReturn) {
+    auto res = readBuf_.preallocate(4096, 65536);
+    *bufReturn = res.first;
+    *lenReturn = res.second;
+}
+
+void Connection::readDataAvailable(size_t len) noexcept {
+    readBuf_.postallocate(len);
+    while (!closing_ && parseAndDispatch()) {
+    }
+    flushPending();
+}
+
+void Connection::flushPending() {
+    if (pendingWriteBuf_.empty() || closing_) {
+        return;
+    }
+    inflightBufs_.emplace_back(std::move(pendingWriteBuf_));
+    pendingWriteBuf_.clear();
+    auto& buf = inflightBufs_.back();
+    socket_->write(this, buf.data(), buf.size());
+}
+
+void Connection::scheduleFlush() {
+    if (flushScheduled_ || closing_) {
+        return;
+    }
+    flushScheduled_ = true;
+    if (!flushCb_.conn) {
+        flushCb_.conn = this;
+    }
+    socket_->getEventBase()->runInLoop(&flushCb_, /*thisIteration=*/true);
+}
+
+void Connection::FlushLoopCb::runLoopCallback() noexcept {
+    if (!conn) return;
+    conn->flushScheduled_ = false;
+    conn->flushPending();
+}
+
+void Connection::readEOF() noexcept {
+    destroy();
+}
+
+void Connection::readErr(const folly::AsyncSocketException& ex) noexcept {
+    destroy();
+}
+
+// ---- WriteCallback ----
+
+void Connection::writeErr(size_t /*bytesWritten*/,
+                          const folly::AsyncSocketException& /*ex*/) noexcept {
+    destroy();
+}
+
+// ---- Protocol parsing ----
+
+bool Connection::parseAndDispatch() {
+    if (readBuf_.chainLength() < kHeaderSize) {
+        return false;
+    }
+
+    // Peek at header to determine body length
+    McbpHeader hdr;
+    {
+        folly::io::Cursor cursor(readBuf_.front());
+        cursor.pull(&hdr, kHeaderSize);
+    }
+
+    // Safety: reject non-mcbp data. Check magic AND opcode — HTTP data
+    // can have 0x80 at certain offsets, so magic alone isn't sufficient.
+    if (hdr.magic != kRequestMagic) {
+        gDispStats.badMagic.fetch_add(1, std::memory_order_relaxed);
+        spdlog::warn("Bad magic 0x{:02x} (first bytes: 0x{:02x} 0x{:02x} "
+                     "0x{:02x} 0x{:02x}), closing connection",
+                     hdr.magic,
+                     hdr.magic,
+                     hdr.opcode,
+                     (uint8_t)(hdr.keyLen >> 8),
+                     (uint8_t)(hdr.keyLen & 0xff));
+        readBuf_.move();
+        destroy();
+        return false;
+    }
+
+    auto op = static_cast<Opcode>(hdr.opcode);
+    if (op != Opcode::Get && op != Opcode::Set && op != Opcode::Delete &&
+        op != Opcode::Noop && op != Opcode::Hello &&
+        op != Opcode::SaslListMechs && op != Opcode::SaslAuth &&
+        op != Opcode::SaslStep && op != Opcode::SelectBucket &&
+        op != Opcode::GetClusterConfig && op != Opcode::GetErrorMap) {
+        gDispStats.badOpcode.fetch_add(1, std::memory_order_relaxed);
+        spdlog::warn("Bad opcode 0x{:02x}, closing connection", hdr.opcode);
+        readBuf_.move();
+        destroy();
+        return false;
+    }
+
+    hdr.ntoh();
+
+    size_t totalLen = kHeaderSize + hdr.bodyLen;
+    if (readBuf_.chainLength() < totalLen) {
+        return false;
+    }
+
+    // Fast path: echo-mode GET — skip IOBuf allocation entirely.
+    // Just consume the bytes and respond inline.
+    if (op == Opcode::Get && !echoResponseBuf_.empty()) {
+        readBuf_.trimStart(totalLen);
+        handleGet(hdr, nullptr);
+        return true;
+    }
+
+    // Consume header
+    readBuf_.trimStart(kHeaderSize);
+
+    // Consume body as IOBuf (zero-copy split)
+    std::unique_ptr<folly::IOBuf> body;
+    if (hdr.bodyLen > 0) {
+        body = readBuf_.split(hdr.bodyLen);
+    }
+
+    dispatch(hdr, std::move(body));
+    return true;
+}
+
+void Connection::dispatch(McbpHeader& hdr, std::unique_ptr<folly::IOBuf> body) {
+    switch (static_cast<Opcode>(hdr.opcode)) {
+    case Opcode::Hello:
+        handleHello(hdr, body.get());
+        break;
+    case Opcode::SaslListMechs:
+        handleSaslListMechs(hdr);
+        break;
+    case Opcode::SaslAuth:
+        handleSaslAuth(hdr, body.get());
+        break;
+    case Opcode::SaslStep:
+        handleSaslStep(hdr, body.get());
+        break;
+    case Opcode::SelectBucket:
+        handleSelectBucket(hdr);
+        break;
+    case Opcode::GetClusterConfig:
+        handleGetClusterConfig(hdr);
+        break;
+    case Opcode::GetErrorMap:
+        handleGetErrorMap(hdr);
+        break;
+    case Opcode::Noop:
+        handleNoop(hdr);
+        break;
+    case Opcode::Set:
+        handleSet(hdr, std::move(body));
+        break;
+    case Opcode::Delete:
+        handleDelete(hdr, std::move(body));
+        break;
+    case Opcode::Get:
+        handleGet(hdr, std::move(body));
+        break;
+    default:
+        sendUnknownCommand(hdr);
+        break;
+    }
+}
+
+// ---- Bootstrap handlers ----
+
+void Connection::handleHello(const McbpHeader& hdr, const folly::IOBuf* body) {
+    // Filter features — only echo back safe ones.
+    // Crucially do NOT echo ClustermapChangeNotification (0x0d) since
+    // we never push configs, and do NOT echo Collections (0x12) to
+    // avoid CID-prefixed keys.
+    std::vector<uint16_t> supported;
+    if (body && hdr.bodyLen > hdr.keyLen) {
+        auto coalesced = body->cloneCoalesced();
+        const uint8_t* fdata = coalesced->data() + hdr.keyLen;
+        size_t flen = hdr.bodyLen - hdr.keyLen;
+        for (size_t i = 0; i + 1 < flen; i += 2) {
+            uint16_t feat =
+                    ntohs(*reinterpret_cast<const uint16_t*>(fdata + i));
+            switch (feat) {
+            case 0x04: // MUTATION_SEQNO
+            case 0x07: // XERROR
+            case 0x08: // SELECT_BUCKET
+            case 0x0b: // JSON
+            case 0x0c: // DUPLEX
+            case 0x0e: // UnorderedExecution
+            case 0x0a: // SNAPPY
+                supported.push_back(htons(feat));
+                break;
+            default:
+                // Skip: Collections(0x12),
+                // ClustermapChangeNotification(0x0d), etc
+                break;
+            }
+        }
+    }
+    auto buf = buildResponse(hdr.opcode,
+                             McbpStatus::Success,
+                             hdr.opaque,
+                             0,
+                             nullptr,
+                             0,
+                             nullptr,
+                             0,
+                             supported.data(),
+                             supported.size() * sizeof(uint16_t));
+    socket_->writeChain(this, std::move(buf));
+}
+
+void Connection::handleSaslListMechs(const McbpHeader& hdr) {
+    const char* mechs = "SCRAM-SHA512 SCRAM-SHA256 SCRAM-SHA1 PLAIN";
+    auto buf = buildResponse(hdr.opcode,
+                             McbpStatus::Success,
+                             hdr.opaque,
+                             0,
+                             nullptr,
+                             0,
+                             nullptr,
+                             0,
+                             mechs,
+                             strlen(mechs));
+    socket_->writeChain(this, std::move(buf));
+}
+
+// Pre-computed PBKDF2 salted passwords — computed once, reused for all
+// connections. Eliminates ~10ms PBKDF2 call per SCRAM auth.
+static const std::string kSalt = "magmakvserversalt";
+static const std::string kSaltB64 = cb::base64::encode(kSalt);
+static const int kIterations = 4096;
+
+struct PrecomputedScram {
+    std::string sha512;
+    std::string sha256;
+    std::string sha1;
+
+    PrecomputedScram() {
+        sha512 = cb::crypto::PBKDF2_HMAC(
+                cb::crypto::Algorithm::SHA512, "password", kSalt, kIterations);
+        sha256 = cb::crypto::PBKDF2_HMAC(
+                cb::crypto::Algorithm::SHA256, "password", kSalt, kIterations);
+        sha1 = cb::crypto::PBKDF2_HMAC(
+                cb::crypto::Algorithm::SHA1, "password", kSalt, kIterations);
+    }
+};
+
+static const PrecomputedScram kScram;
+
+static cb::crypto::Algorithm getScramAlgo(const std::string& mech) {
+    if (mech.find("512") != std::string::npos)
+        return cb::crypto::Algorithm::SHA512;
+    if (mech.find("256") != std::string::npos)
+        return cb::crypto::Algorithm::SHA256;
+    return cb::crypto::Algorithm::SHA1;
+}
+
+void Connection::handleSaslAuth(const McbpHeader& hdr,
+                                const folly::IOBuf* body) {
+    std::string mech;
+    std::string authData;
+    if (body) {
+        auto coalesced = body->cloneCoalesced();
+        if (hdr.keyLen > 0) {
+            mech.assign(reinterpret_cast<const char*>(coalesced->data()),
+                        hdr.keyLen);
+        }
+        if (hdr.bodyLen > hdr.keyLen) {
+            authData.assign(reinterpret_cast<const char*>(coalesced->data()) +
+                                    hdr.keyLen,
+                            hdr.bodyLen - hdr.keyLen);
+        }
+    }
+
+    if (mech == "PLAIN") {
+        auto buf =
+                buildEmptyResponse(hdr.opcode, McbpStatus::Success, hdr.opaque);
+        socket_->writeChain(this, std::move(buf));
+        return;
+    }
+
+    // SCRAM step 1: parse client-first-message "n,,n=user,r=clientNonce"
+    std::string clientFirstBare;
+    auto nPos = authData.find("n=");
+    if (nPos != std::string::npos) {
+        clientFirstBare = authData.substr(nPos);
+    }
+
+    std::string clientNonce;
+    auto rPos = clientFirstBare.find("r=");
+    if (rPos != std::string::npos) {
+        clientNonce = clientFirstBare.substr(rPos + 2);
+    }
+
+    // Server nonce
+    static std::mt19937 rng(std::random_device{}());
+    std::string serverNonceSuffix;
+    for (int i = 0; i < 18; i++) {
+        serverNonceSuffix += "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"[rng() % 32];
+    }
+    scramServerNonce_ = clientNonce + serverNonceSuffix;
+
+    // Use pre-computed salted password — no PBKDF2 per connection
+    auto algo = getScramAlgo(mech);
+    if (algo == cb::crypto::Algorithm::SHA512) {
+        scramSaltedPassword_ = kScram.sha512;
+    } else if (algo == cb::crypto::Algorithm::SHA256) {
+        scramSaltedPassword_ = kScram.sha256;
+    } else {
+        scramSaltedPassword_ = kScram.sha1;
+    }
+
+    // Server-first-message
+    std::string serverFirst = "r=" + scramServerNonce_ + ",s=" + kSaltB64 +
+                              ",i=" + std::to_string(kIterations);
+
+    // Store auth message prefix for step 2
+    scramAuthMessage_ = clientFirstBare + "," + serverFirst + ",";
+
+    auto buf = buildResponse(hdr.opcode,
+                             McbpStatus::AuthContinue,
+                             hdr.opaque,
+                             0,
+                             nullptr,
+                             0,
+                             nullptr,
+                             0,
+                             serverFirst.data(),
+                             serverFirst.size());
+    socket_->writeChain(this, std::move(buf));
+}
+
+void Connection::handleSaslStep(const McbpHeader& hdr,
+                                const folly::IOBuf* body) {
+    std::string mech;
+    std::string authData;
+    if (body) {
+        auto coalesced = body->cloneCoalesced();
+        if (hdr.keyLen > 0) {
+            mech.assign(reinterpret_cast<const char*>(coalesced->data()),
+                        hdr.keyLen);
+        }
+        if (hdr.bodyLen > hdr.keyLen) {
+            authData.assign(reinterpret_cast<const char*>(coalesced->data()) +
+                                    hdr.keyLen,
+                            hdr.bodyLen - hdr.keyLen);
+        }
+    }
+
+    // SCRAM step 2: client sends "c=biws,r=nonce,p=proof"
+    auto pPos = authData.find(",p=");
+    std::string clientFinalWithoutProof =
+            (pPos != std::string::npos) ? authData.substr(0, pPos) : authData;
+
+    std::string authMessage = scramAuthMessage_ + clientFinalWithoutProof;
+
+    auto algo = getScramAlgo(mech);
+    std::string serverKey =
+            cb::crypto::HMAC(algo, scramSaltedPassword_, "Server Key");
+    std::string serverSignature =
+            cb::crypto::HMAC(algo, serverKey, authMessage);
+    std::string serverFinal = "v=" + cb::base64::encode(serverSignature);
+
+    auto buf = buildResponse(hdr.opcode,
+                             McbpStatus::Success,
+                             hdr.opaque,
+                             0,
+                             nullptr,
+                             0,
+                             nullptr,
+                             0,
+                             serverFinal.data(),
+                             serverFinal.size());
+    socket_->writeChain(this, std::move(buf));
+}
+
+void Connection::handleSelectBucket(const McbpHeader& hdr) {
+    auto buf = buildEmptyResponse(hdr.opcode, McbpStatus::Success, hdr.opaque);
+    socket_->writeChain(this, std::move(buf));
+}
+
+void Connection::handleGetClusterConfig(const McbpHeader& hdr) {
+    auto buf = buildResponse(hdr.opcode,
+                             McbpStatus::Success,
+                             hdr.opaque,
+                             0,
+                             nullptr,
+                             0,
+                             nullptr,
+                             0,
+                             clusterConfig_.data(),
+                             clusterConfig_.size());
+    socket_->writeChain(this, std::move(buf));
+}
+
+void Connection::handleGetErrorMap(const McbpHeader& hdr) {
+    auto buf = buildResponse(hdr.opcode,
+                             McbpStatus::Success,
+                             hdr.opaque,
+                             0,
+                             nullptr,
+                             0,
+                             nullptr,
+                             0,
+                             errorMap_.data(),
+                             errorMap_.size());
+    socket_->writeChain(this, std::move(buf));
+}
+
+void Connection::handleNoop(const McbpHeader& hdr) {
+    auto buf = buildEmptyResponse(hdr.opcode, McbpStatus::Success, hdr.opaque);
+    socket_->writeChain(this, std::move(buf));
+}
+
+// ---- Data op handlers ----
+
+void Connection::handleSet(McbpHeader& hdr,
+                           std::unique_ptr<folly::IOBuf> body) {
+    hotStatAdd(gDispStats.cmdSet);
+
+    auto* req = acquireRequest();
+    req->opcode = hdr.opcode;
+    req->vbucket = hdr.specific;
+    req->opaque = hdr.opaque;
+    req->cas = hdr.cas;
+    req->datatype = hdr.datatype;
+
+    if (body) {
+        body->coalesce();
+        req->dataBuf = std::move(body);
+        const char* p = reinterpret_cast<const char*>(req->dataBuf->data());
+
+        if (hdr.extrasLen >= 4) {
+            req->flags = ntohl(*reinterpret_cast<const uint32_t*>(p));
+        }
+        if (hdr.extrasLen >= 8) {
+            req->expiry = ntohl(*reinterpret_cast<const uint32_t*>(p + 4));
+        }
+
+        req->key = Slice(p + hdr.extrasLen, hdr.keyLen);
+        req->value = Slice(p + hdr.extrasLen + hdr.keyLen,
+                           hdr.bodyLen - hdr.extrasLen - hdr.keyLen);
+    }
+
+    if (bucket_->IsDurable()) {
+        // Durable: track outstanding, wait for WriteDocs completion
+        outstandingRequests_.fetch_add(1, std::memory_order_relaxed);
+        req->conn = this;
+        req->evb = socket_->getEventBase();
+        bucket_->EnqueueWrite(req);
+    } else {
+        // Async: enqueue and respond immediately. Append into pendingWriteBuf_
+        // so the response is coalesced with any others produced in this
+        // readDataAvailable wake (one socket write for many SETs).
+        if (bucket_->EnqueueWrite(req)) {
+            appendEmptyResponse(pendingWriteBuf_,
+                                hdr.opcode,
+                                McbpStatus::Success,
+                                hdr.opaque,
+                                0);
+        } else {
+            gDispStats.tmpFails.fetch_add(1, std::memory_order_relaxed);
+            appendEmptyResponse(pendingWriteBuf_,
+                                hdr.opcode,
+                                McbpStatus::TmpFail,
+                                hdr.opaque,
+                                0);
+            releaseRequest(req);
+        }
+    }
+}
+
+void Connection::handleDelete(McbpHeader& hdr,
+                              std::unique_ptr<folly::IOBuf> body) {
+    hotStatAdd(gDispStats.cmdDelete);
+
+    auto* req = acquireRequest();
+    req->opcode = hdr.opcode;
+    req->vbucket = hdr.specific;
+    req->opaque = hdr.opaque;
+    req->cas = hdr.cas;
+
+    if (body) {
+        body->coalesce();
+        req->dataBuf = std::move(body);
+        const char* p = reinterpret_cast<const char*>(req->dataBuf->data());
+        req->key = Slice(p + hdr.extrasLen, hdr.keyLen);
+    }
+
+    if (bucket_->IsDurable()) {
+        outstandingRequests_.fetch_add(1, std::memory_order_relaxed);
+        req->conn = this;
+        req->evb = socket_->getEventBase();
+        bucket_->EnqueueWrite(req);
+    } else {
+        if (bucket_->EnqueueWrite(req)) {
+            appendEmptyResponse(pendingWriteBuf_,
+                                hdr.opcode,
+                                McbpStatus::Success,
+                                hdr.opaque,
+                                0);
+        } else {
+            appendEmptyResponse(pendingWriteBuf_,
+                                hdr.opcode,
+                                McbpStatus::TmpFail,
+                                hdr.opaque,
+                                0);
+            releaseRequest(req);
+        }
+    }
+}
+
+void Connection::handleGet(McbpHeader& hdr,
+                           std::unique_ptr<folly::IOBuf> body) {
+    hotStatAdd(gDispStats.cmdGet);
+
+    // Echo mode: append pre-built response to coalesced write buffer.
+    // No malloc, no IOBuf, no per-op syscall — flushPending() emits
+    // one socket write for all responses produced in this read loop.
+    if (!echoResponseBuf_.empty()) {
+        hotStatAdd(gDispStats.cmdGetResp);
+        size_t off = pendingWriteBuf_.size();
+        pendingWriteBuf_.resize(off + echoResponseBuf_.size());
+        memcpy(pendingWriteBuf_.data() + off,
+               echoResponseBuf_.data(),
+               echoResponseBuf_.size());
+        // opaque is not byte-swapped by ntoh/hton — copy as-is
+        memcpy(pendingWriteBuf_.data() + off + kOpaqueOffset, &hdr.opaque, 4);
+        return;
+    }
+
+    outstandingRequests_.fetch_add(1, std::memory_order_relaxed);
+    auto* req = acquireRequest();
+    req->opcode = hdr.opcode;
+    req->vbucket = hdr.specific;
+    req->opaque = hdr.opaque;
+    req->conn = this;
+    req->evb = socket_->getEventBase();
+
+    if (body) {
+        body->coalesce();
+        req->dataBuf = std::move(body);
+        const char* p = reinterpret_cast<const char*>(req->dataBuf->data());
+        // GET has no extras, body is just key
+        req->key = Slice(p + hdr.extrasLen, hdr.keyLen);
+    }
+
+    bucket_->EnqueueRead(req);
+}
+
+void Connection::sendUnknownCommand(const McbpHeader& hdr) {
+    auto buf = buildEmptyResponse(
+            hdr.opcode, McbpStatus::UnknownCommand, hdr.opaque);
+    socket_->writeChain(this, std::move(buf));
+}
+
+// ---- Response senders called from engine threads via EventBase ----
+
+void Connection::sendWriteResponse(Request* req) {
+    if (!closing_) {
+        McbpStatus status = req->resultStatus.IsOK()
+                                    ? McbpStatus::Success
+                                    : McbpStatus::InternalError;
+        appendEmptyResponse(
+                pendingWriteBuf_, req->opcode, status, req->opaque, req->resultSeqno);
+        scheduleFlush();
+    }
+    releaseRequest(req);
+    if (outstandingRequests_.fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+        closing_) {
+        delete this;
+    }
+}
+
+void Connection::sendGetResponse(Request* req) {
+    if (!closing_) {
+        if (!req->resultStatus.IsOK()) {
+            appendEmptyResponse(pendingWriteBuf_,
+                                req->opcode,
+                                McbpStatus::KeyNotFound,
+                                req->opaque);
+        } else {
+            const void* val = req->responseBuf.empty()
+                                      ? nullptr
+                                      : req->responseBuf.data();
+            size_t valLen = req->responseBuf.size();
+            appendGetResponse(pendingWriteBuf_,
+                              req->opaque,
+                              req->resultSeqno,
+                              req->resultFlags,
+                              val,
+                              valLen,
+                              req->resultDatatype);
+        }
+        scheduleFlush();
+    }
+    releaseRequest(req);
+    if (outstandingRequests_.fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+        closing_) {
+        delete this;
+    }
+}
+
+} // namespace kvserver
+} // namespace magma

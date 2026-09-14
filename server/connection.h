@@ -1,0 +1,122 @@
+#pragma once
+
+#include "engine.h"
+#include "protocol.h"
+
+#include <folly/io/IOBufQueue.h>
+#include <folly/io/async/AsyncSocket.h>
+#include <folly/io/async/EventBase.h>
+
+#include <list>
+#include <memory>
+#include <string>
+
+namespace magma {
+namespace kvserver {
+
+class Connection : public folly::AsyncSocket::ReadCallback,
+                   public folly::AsyncSocket::WriteCallback {
+public:
+    Connection(folly::AsyncSocket::UniquePtr socket,
+               Bucket* bucket,
+               const std::string& clusterConfig,
+               const std::string& errorMap);
+    ~Connection();
+
+    void start();
+
+    // Called from engine threads via evb->runInEventBaseThread
+    void sendWriteResponse(Request* req);
+    void sendGetResponse(Request* req);
+
+private:
+    // folly::AsyncSocket::ReadCallback
+    void getReadBuffer(void** bufReturn, size_t* lenReturn) override;
+    void readDataAvailable(size_t len) noexcept override;
+    void readEOF() noexcept override;
+    void readErr(const folly::AsyncSocketException& ex) noexcept override;
+
+    // folly::AsyncSocket::WriteCallback
+    void writeSuccess() noexcept override {
+        if (!inflightBufs_.empty()) {
+            inflightBufs_.pop_front();
+        }
+    }
+    void writeErr(size_t bytesWritten,
+                  const folly::AsyncSocketException& ex) noexcept override;
+
+    bool parseAndDispatch();
+    void dispatch(McbpHeader& hdr, std::unique_ptr<folly::IOBuf> body);
+    void flushPending();
+    void scheduleFlush();
+
+    // Bootstrap handlers (respond inline on IO thread)
+    void handleHello(const McbpHeader& hdr, const folly::IOBuf* body);
+    void handleSaslListMechs(const McbpHeader& hdr);
+    void handleSaslAuth(const McbpHeader& hdr, const folly::IOBuf* body);
+    void handleSaslStep(const McbpHeader& hdr, const folly::IOBuf* body);
+    void handleSelectBucket(const McbpHeader& hdr);
+    void handleGetClusterConfig(const McbpHeader& hdr);
+    void handleGetErrorMap(const McbpHeader& hdr);
+    void handleNoop(const McbpHeader& hdr);
+
+    // Data op handlers
+    void handleSet(McbpHeader& hdr, std::unique_ptr<folly::IOBuf> body);
+    void handleDelete(McbpHeader& hdr, std::unique_ptr<folly::IOBuf> body);
+    void handleGet(McbpHeader& hdr, std::unique_ptr<folly::IOBuf> body);
+
+    void sendUnknownCommand(const McbpHeader& hdr);
+    void destroy();
+
+    folly::AsyncSocket::UniquePtr socket_;
+    folly::IOBufQueue readBuf_{folly::IOBufQueue::cacheChainLength()};
+    Bucket* bucket_;
+    const std::string& clusterConfig_;
+    const std::string& errorMap_;
+    bool closing_{false};
+    std::atomic<int> outstandingRequests_{0};
+
+    // SCRAM auth state
+    std::string scramServerNonce_;
+    std::string scramSaltedPassword_;
+    std::string scramAuthMessage_;
+
+    // Pre-built echo GET response — avoids malloc/free per request.
+    // Layout: [McbpHeader(24) | flags(4) | value(N)]
+    // Only the opaque field (offset 12, 4 bytes) changes per request.
+    std::vector<uint8_t> echoResponseBuf_;
+    static constexpr size_t kOpaqueOffset = 12; // offset of opaque in McbpHeader
+
+    // Coalesced response buffer: handlers append responses here; flushPending()
+    // emits one socket_->write per readDataAvailable wakeup or per LoopCallback
+    // (engine-thread responses). Converts N tiny sendmsg syscalls into 1.
+    std::vector<uint8_t> pendingWriteBuf_;
+    // In-flight send buffers awaiting writeSuccess. AsyncSocket::write() does
+    // not own the data; we keep it alive here until the callback fires.
+    std::list<std::vector<uint8_t>> inflightBufs_;
+
+    // LoopCallback to flush pendingWriteBuf_ at end of current EventBase loop
+    // iteration. Engine threads post sendXxxResponse via runInEventBaseThread;
+    // those callbacks all run in one batch. Instead of issuing a writeChain
+    // per response we accumulate into pendingWriteBuf_ and emit one write at
+    // the tail of the iteration. flushScheduled_ guards re-registration.
+    class FlushLoopCb : public folly::EventBase::LoopCallback {
+    public:
+        Connection* conn{nullptr};
+        void runLoopCallback() noexcept override;
+    };
+    FlushLoopCb flushCb_;
+    bool flushScheduled_{false};
+
+    // Per-Connection Request freelist. Requests flow IO-thread → engine-thread
+    // → IO-thread; we touch the pool only from the IO thread (this Connection's
+    // event-base), so no synchronization is needed. Cap prevents unbounded
+    // growth when the engine is slower than the network.
+    std::vector<Request*> reqPool_;
+    static constexpr size_t kMaxPooledReqs = 256;
+    Request* acquireRequest();
+    void releaseRequest(Request* req);
+};
+
+} // namespace kvserver
+} // namespace magma
