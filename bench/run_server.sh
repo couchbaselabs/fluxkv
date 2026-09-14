@@ -34,12 +34,24 @@ LOG=${LOG:-/tmp/fluxkv-server.log}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 DROP_CACHES=${DROP_CACHES:-1}
 
+# Ask the server to stop and give it time to flush before forcing it.
+#
+# SIGKILL here loses whatever magma has not yet written out. After a 200M key
+# load that cost 29% of the dataset: reads of the earliest keys all succeeded
+# while 97% of the most recently written keys were gone. The data looked
+# present - 177G on disk - so the loss only showed up as a miss rate.
 stop_server() {
-    pkill -9 -f "fluxkv_server --port ${PORT}" 2>/dev/null || true
-    for _ in $(seq 1 30); do
-        ss -ltn | grep -q ":${PORT}" || return 0
+    pkill -TERM -f "fluxkv_server --port ${PORT}" 2>/dev/null || true
+
+    for _ in $(seq 1 "${SHUTDOWN_TIMEOUT:-120}"); do
+        pgrep -f "fluxkv_server --port ${PORT}" > /dev/null || return 0
         sleep 1
     done
+
+    echo "WARN: server did not exit within ${SHUTDOWN_TIMEOUT:-120}s;" \
+         "forcing. Recently written data may be lost." >&2
+    pkill -9 -f "fluxkv_server --port ${PORT}" 2>/dev/null || true
+    sleep 2
 }
 
 stop_server
