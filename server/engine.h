@@ -11,6 +11,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <thread>
@@ -268,7 +269,16 @@ public:
     ~Bucket();
 
     Status Open();
+
+    // Closes the bucket. Waits for acknowledged writes to reach magma before
+    // tearing anything down, so a clean shutdown does not lose data.
     void Close();
+
+    // Blocks until every acknowledged write has been persisted, or until the
+    // timeout expires - in which case the shortfall is logged as an error and
+    // that data is lost. Called by Close().
+    void DrainWrites(
+            std::chrono::milliseconds timeout = std::chrono::minutes(10));
 
     Shard& GetShard(uint16_t vbid) {
         return *shards_[vbid % numShards_];

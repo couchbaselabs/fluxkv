@@ -111,7 +111,9 @@ void WriterPool::Shutdown() {
     if (shutdown_.exchange(true)) {
         return;
     }
-    // Post sentinel tasks to unblock all threads
+    // The sentinels queue behind whatever work is already pending. The queue
+    // is FIFO, so each worker executes every task enqueued before this point
+    // and only then reads its sentinel and exits.
     for (size_t i = 0; i < threads_.size(); i++) {
         taskQueue_.blockingWrite(PersistTask{nullptr, 0});
     }
@@ -123,7 +125,12 @@ void WriterPool::Shutdown() {
 }
 
 void WriterPool::workerLoop() {
-    while (!shutdown_.load(std::memory_order_relaxed)) {
+    // Exit on the sentinel only, never on the shutdown flag. Testing the flag
+    // here let a worker that had just finished a task return immediately and
+    // leave the rest of the queue unwritten, discarding writes the client had
+    // already been told were stored. Callers drain first - see
+    // Bucket::DrainWrites().
+    for (;;) {
         PersistTask task;
         taskQueue_.blockingRead(task);
         if (!task.shard) {
@@ -509,8 +516,44 @@ Status Bucket::Open() {
     return Status::OK();
 }
 
+void Bucket::DrainWrites(std::chrono::milliseconds timeout) {
+    // A write is acknowledged to the client as soon as it is queued, so at
+    // this point queuedBytes_ is data the client believes is stored but that
+    // has not reached magma yet. Let the writer pools finish before anything
+    // is torn down.
+    size_t pending = queuedBytes_.load(std::memory_order_relaxed);
+    if (pending == 0) {
+        return;
+    }
+
+    spdlog::info("Draining {} bytes of acknowledged writes before shutdown",
+                 pending);
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (true) {
+        pending = queuedBytes_.load(std::memory_order_relaxed);
+        if (pending == 0) {
+            spdlog::info("Write queue drained");
+            return;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            spdlog::error("Write queue did not drain within {}ms - {} bytes "
+                          "of acknowledged writes will be lost",
+                          timeout.count(),
+                          pending);
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+}
+
 void Bucket::Close() {
-    // Shut down per-shard pools first so workers stop pulling tasks.
+    // Drain before stopping the pools. Shutting them down with work still
+    // queued discarded acknowledged writes: after a 200M key load the most
+    // recently written ~29% of the dataset was simply absent, with nothing
+    // in the log to say so.
+    DrainWrites();
+
     for (auto& shard : shards_) {
         if (auto* w = shard->GetWriterPool()) {
             w->Shutdown();
