@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <random>
 #include <string>
 #include <thread>
@@ -184,9 +185,36 @@ int connectTo(const std::string& host, uint16_t port) {
     return fd;
 }
 
+// mcbp status codes the server can return. Knowing which one came back
+// matters: TmpFail means the engine applied backpressure and the load was
+// simply too heavy for the disk, while KeyNotFound means a read missed.
+const char* statusName(uint16_t status) {
+    switch (status) {
+    case 0x0000:
+        return "Success";
+    case 0x0001:
+        return "KeyNotFound";
+    case 0x0002:
+        return "KeyExists";
+    case 0x0007:
+        return "NotMyVbucket";
+    case 0x0020:
+        return "AuthError";
+    case 0x0081:
+        return "UnknownCommand";
+    case 0x0084:
+        return "InternalError";
+    case 0x0086:
+        return "TmpFail";
+    default:
+        return "Other";
+    }
+}
+
 struct Result {
     uint64_t ops = 0;
     uint64_t errors = 0;
+    std::map<uint16_t, uint64_t> statusCounts;
     std::vector<uint32_t> latenciesUs;
 };
 
@@ -274,6 +302,7 @@ void runConnection(const Options& opts,
                                     .count();
             result.latenciesUs.push_back(static_cast<uint32_t>(us));
 
+            result.statusCounts[status]++;
             if (status == 0) {
                 result.ops++;
             } else {
@@ -403,10 +432,14 @@ int main(int argc, char** argv) {
     uint64_t ops = 0;
     uint64_t errors = 0;
     std::vector<uint32_t> all;
+    std::map<uint16_t, uint64_t> statusCounts;
     for (auto& r : results) {
         ops += r.ops;
         errors += r.errors;
         all.insert(all.end(), r.latenciesUs.begin(), r.latenciesUs.end());
+        for (const auto& [status, count] : r.statusCounts) {
+            statusCounts[status] += count;
+        }
     }
     std::sort(all.begin(), all.end());
 
@@ -418,6 +451,18 @@ int main(int argc, char** argv) {
               << " p90=" << percentile(all, 0.90) << "us"
               << " p99=" << percentile(all, 0.99) << "us"
               << " p999=" << percentile(all, 0.999) << "us\n";
+
+    // Break the failures down by status. TmpFail dominating means the load
+    // outran the disk, not that anything is wrong.
+    if (errors > 0) {
+        std::cout << "STATUS";
+        for (const auto& [status, count] : statusCounts) {
+            if (status != 0) {
+                std::cout << " " << statusName(status) << "=" << count;
+            }
+        }
+        std::cout << "\n";
+    }
 
     return (errors > 0 && ops == 0) ? 1 : 0;
 }

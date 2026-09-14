@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+#
+# End-to-end smoke test: start a fluxkv server on a scratch directory, write
+# keys, read them back, and require that every operation succeeded.
+#
+# A GET for a key that was never stored comes back as KeyNotFound, which
+# fluxbench counts as an error. So "zero errors on the read pass" is the real
+# assertion here: it proves reads returned what writes stored.
+#
+# Usage: smoke_test.sh <server-binary> <client-binary>
+
+set -euo pipefail
+
+SERVER_BIN=${1:?usage: smoke_test.sh <server-binary> <client-binary>}
+CLIENT_BIN=${2:?usage: smoke_test.sh <server-binary> <client-binary>}
+
+PORT=${FLUXKV_TEST_PORT:-12399}
+VBUCKETS=64
+
+# The load here is deliberately light: one connection, one request in flight.
+# This is a correctness check, not a benchmark. Heavy concurrent writes make
+# magma apply backpressure (TmpFail) once the disk falls behind, which is
+# correct engine behaviour but would make this test fail on slower storage.
+KEYS=1000
+CONNS=1
+PIPELINE=1
+RUNTIME=3s
+DATA_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fluxkv-smoke-XXXXXX")
+LOG="${DATA_DIR}/server.log"
+SERVER_PID=""
+
+cleanup() {
+    if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
+        kill -9 "${SERVER_PID}" 2>/dev/null || true
+    fi
+    rm -rf "${DATA_DIR}"
+}
+trap cleanup EXIT
+
+echo "# data dir: ${DATA_DIR}"
+
+"${SERVER_BIN}" \
+    --port "${PORT}" \
+    --data-dir "${DATA_DIR}" \
+    --bucket default \
+    --shards 2 \
+    --vbuckets "${VBUCKETS}" \
+    --readers 8 \
+    --writers 4 \
+    --io-threads 4 \
+    --mem-quota 268435456 \
+    > "${LOG}" 2>&1 &
+SERVER_PID=$!
+
+# Wait for the listener rather than sleeping a fixed amount; magma has to
+# create its kvstores first.
+for _ in $(seq 1 60); do
+    if grep -q "listening on" "${LOG}" 2>/dev/null; then
+        break
+    fi
+    if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+        echo "FAIL: server exited during startup" >&2
+        tail -20 "${LOG}" >&2
+        exit 1
+    fi
+    sleep 1
+done
+
+if ! grep -q "listening on" "${LOG}"; then
+    echo "FAIL: server did not start listening within 60s" >&2
+    tail -20 "${LOG}" >&2
+    exit 1
+fi
+echo "# server up on port ${PORT}"
+
+run_phase() {
+    local mode=$1 extra=${2:-}
+    # shellcheck disable=SC2086
+    "${CLIENT_BIN}" \
+        -host "127.0.0.1:${PORT}" \
+        -mode "${mode}" \
+        -keys "${KEYS}" \
+        -vbuckets "${VBUCKETS}" \
+        -conns "${CONNS}" \
+        -pipeline "${PIPELINE}" \
+        -runtime "${RUNTIME}" \
+        ${extra}
+}
+
+check() {
+    local phase=$1 output=$2
+    local ops errs
+    ops=$(sed -n 's/.*ops=\([0-9]*\).*/\1/p' <<<"${output}" | head -1)
+    errs=$(sed -n 's/.*errs=\([0-9]*\).*/\1/p' <<<"${output}" | head -1)
+
+    if [[ -z "${ops}" || -z "${errs}" ]]; then
+        echo "FAIL: ${phase}: could not parse client output" >&2
+        echo "${output}" >&2
+        exit 1
+    fi
+    if (( ops == 0 )); then
+        echo "FAIL: ${phase}: no operations completed" >&2
+        exit 1
+    fi
+    if (( errs != 0 )); then
+        echo "FAIL: ${phase}: ${errs} errors" >&2
+        echo "${output}" >&2
+        exit 1
+    fi
+    echo "# ${phase}: ops=${ops} errs=${errs}"
+}
+
+set_out=$(run_phase set "-valsize 1024")
+check "set" "${set_out}"
+
+get_out=$(run_phase get)
+check "get" "${get_out}"
+
+echo "PASS"
