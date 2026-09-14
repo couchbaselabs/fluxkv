@@ -59,7 +59,41 @@ them:
 - `folly` — async socket, `EventBase`, `IOBuf`, `MPMCQueue`
 - `spdlog`, `nlohmann/json`, `libevent`
 
+## Quick start
+
+Build the server and the client, then run the smoke test:
+
+```bash
+cmake -B build -G Ninja \
+  -DCOUCHBASE_SOURCE_DIR=/path/to/couchbase/source \
+  -DCOUCHBASE_BUILD_DIR=/path/to/couchbase/build
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
+Build only the client, on a load-generator machine with no Couchbase tree:
+
+```bash
+cmake -B build -DFLUXKV_BUILD_SERVER=OFF && cmake --build build -j
+```
+
+Run a server and measure it:
+
+```bash
+DATA_DIR=/data/fluxkv-1k bench/run_server.sh
+HOST=127.0.0.1:12210 KEYS=500000000 bench/measure.sh
+```
+
+See `bench/README.md` for loading datasets and running the experiments.
+
 ## Status
 
-Early. The repo is being assembled in small, reviewable commits. See
-`docs/` for what has been verified to build and run.
+Verified on Linux (GCC 13.3, C++23) against a Couchbase build:
+
+- `fluxkv_server` compiles and links with zero undefined symbols
+- `fluxbench` builds with no Couchbase dependency
+- the smoke test passes: writes and reads return what was stored
+- `bench/run_server.sh` and `bench/measure.sh` run a real measurement
+
+Not done yet: unit tests for the protocol layer, and a documented dataset
+load recipe with results in `docs/`.
