@@ -71,22 +71,63 @@ UNIT=fluxkv-bench bench/cgroup_stats.sh
 
 ## Measured results
 
-200M x 1KB incompressible keys (257G on disk), 64G quota, `--no-compression`,
-libaio + DirectIO, 10GbE between client and server:
+`bench/read_benchmark.sh` reproduces this. 200M x 1KB incompressible keys
+(233G on disk), 100G quota, `--no-compression`, DirectIO, client on a separate
+node over 10GbE:
 
 | | value |
 |---|---|
-| Client throughput | 691,149 ops/s, zero errors |
-| Data returned | 693 MB/s of real 1KB values |
-| Disk | ~1,083,000 reads/s, 4.84 GB/s |
-| Read amplification | 1.57 disk reads per GET |
-| Network | 5.5 Gbit/s - not the limit |
+| **Throughput** | **1,028,000 ops/s, zero errors** |
+| **Network** | **9.62 Gbit/s - 96% of the 10GbE link** |
+| Disk | 1,084,799 reads/s, 4.80 GB/s |
+| Read amplification | 1.055 disk reads per GET |
+| CPU | 98% busy |
+| **Memory (RSS)** | **17.39 GB**, peak 17.43 GB, of a 100 GB quota |
+| Latency | p50 31.8ms, p90 33.5ms, p99 35.0ms |
 
-The disk sustains over 1M IOPS, but each GET costs 1.57 of them, so the
-client sees 691K. This is disk bound, not network bound: index and bloom
-lookups miss the 64G cache against a 257G dataset. Getting client throughput
-to ~1M means getting amplification near 1.0 - a larger quota, or a dataset
-whose index fits.
+Network, CPU and disk are all at their limit together. Every GET costs about
+one disk read, so this is genuinely served from disk rather than from cache.
+
+### What each setting is worth
+
+| change | result |
+|---|---|
+| quota 64G -> 100G | 691K -> **1,005K** ops/s |
+| 64 conns x 512 pipeline | 1,012K -> **1,028K** (vs 256x128, same in-flight) |
+| io-threads 32 -> 16 | **476K** - starves this many connections |
+| `--no-hot-stats` | **545K** - halves throughput, cause unknown |
+
+### libaio vs io_uring
+
+Both measured at 64x512 on the same dataset, back to back. `MAGMA_ASYNC_IO`
+selects the backend; **libaio is the default**, io_uring is opt-in with
+`MAGMA_ASYNC_IO=uring`.
+
+| | libaio (default) | io_uring |
+|---|---|---|
+| Throughput | 1,015,831 ops/s | **1,028,000 ops/s** |
+| p50 latency | 32.1ms | 31.8ms |
+| p99 latency | 37.4ms | **35.0ms** |
+| Network | 9.56 Gbit/s | 9.62 Gbit/s |
+| Disk | 1,078,554 r/s | 1,084,799 r/s |
+| CPU idle | 7.4% | 1.9% |
+| RSS | 17.39 GB | 17.39 GB |
+
+io_uring is 1.2% faster with a slightly tighter tail. Both clear a million
+operations a second and saturate the link, so on this hardware the backend is
+not what decides the result - the earlier measurements at 256x128 (999,791 vs
+1,004,706) agree. Pick either.
+
+**Report RSS.** The quota is a ceiling, not consumption: the server asked for
+100G and used 17.4G. That 17.4G is the *index* - caching it is what dropped
+amplification from 1.57 to 1.06 and took throughput from 691K to over 1M.
+Raising the quota past ~20G changes nothing, because the index already fits.
+
+**The ceiling is CPU, not the wire.** Running the client on the server itself,
+removing the network entirely, was *slower* - 778K - because the client then
+competes for CPU. Profiling shows 43.8% of CPU is syscall overhead (sendmsg
+13%, io_uring_enter 13%, epoll 12%), which is why fewer, deeper connections
+help.
 
 ## Reading the numbers
 
