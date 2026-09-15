@@ -148,6 +148,42 @@ not what decides the result - the earlier measurements at 256x128 (999,791 vs
 amplification from 1.57 to 1.06 and took throughput from 691K to over 1M.
 Raising the quota past ~20G changes nothing, because the index already fits.
 
+### Data block size: 4 KB vs 1 KB
+
+`--data-block-size` sets `SeqTreeBlockSize`, the blocks holding document
+values. It is a write-time property, so changing it needs a fresh load. With
+1 KB values, the 4 KB default reads four times the bytes it returns.
+
+Both loaded as 200M x 1KB, same everything else, measured at 64x512:
+
+| | 4 KB | 1 KB |
+|---|---|---|
+| Throughput | 1,015,831/s | **1,099,550/s** (+8.2%) |
+| Disk bandwidth | 4842 MB/s | **1754 MB/s** (-64%) |
+| Bytes per disk read | 4.46 KB | 1.56 KB |
+| Reads per GET | 1.055 | 1.02 |
+| CPU | 61.0 cores | 67.4 cores |
+| **CPU per op** | **60.0 us** | **61.3 us** |
+| p50 latency | 32.1 ms | **15.7 ms** |
+| p99 latency | **37.4 ms** | 105.8 ms |
+| NIC | 9.56 Gbit/s | 10.20 Gbit/s |
+| Dataset on disk | 233 G | 273 G (+17%) |
+
+Cutting the block size cut disk bandwidth by nearly two thirds and halved
+median latency, for 8% more throughput - and the throughput gain is probably
+understated, because at 10.20 Gbit/s the link is full and the disk has
+headroom it cannot use.
+
+**CPU per op did not move: 60.0us to 61.3us.** Reading a quarter of the bytes
+changed nothing, which says the cost is per-operation and not per-byte. CRC
+and memcpy are not what is expensive here; syscalls and scheduling are. Block
+sizing will not reduce the core count.
+
+The cost is the tail: p99 went from 37ms to 106ms and p999 to 182ms. Median
+improves, the spread gets much worse - consistent with running fully
+NIC-saturated, where queueing dominates. If p99 matters, 1 KB blocks are a
+regression at this load point.
+
 **The ceiling is CPU, not the wire.** Running the client on the server itself,
 removing the network entirely, was *slower* - 778K - because the client then
 competes for CPU. Profiling shows 43.8% of CPU is syscall overhead (sendmsg
