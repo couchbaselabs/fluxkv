@@ -148,6 +148,84 @@ not what decides the result - the earlier measurements at 256x128 (999,791 vs
 amplification from 1.57 to 1.06 and took throughput from 691K to over 1M.
 Raising the quota past ~20G changes nothing, because the index already fits.
 
+### Tuned configuration: 1.11M GET/s at 33 cores
+
+25M x 1KB keys (31G on disk), 8 shards, 40G quota, 1KB data blocks, client on
+a separate node at 64 conns x 256 pipeline x 64 batch:
+
+```
+MAGMA_FLUSH_DELAY_US=100 fluxkv_server \
+  --shards 8 --vbuckets 256 --mem-quota 42949672960 \
+  --io-threads 6 --readers 40 --writers 8 --flushers 8 \
+  --write-queue-mem 1073741824 --no-compression --index-compression-lz4 \
+  --data-block-size 1024 --io-queue-depth 16
+```
+
+| | value |
+|---|---|
+| Throughput | **1,114,493 ops/s, zero errors** |
+| CPU | **32.6 cores** (user 23.3, sys 9.3) |
+| CPU per op | **29.3 us** |
+| Disk | 1,126,101 reads/s |
+| Network | 10.23 Gbit/s - saturated |
+| RSS | 1.75 GB |
+| Latency | p50 8.3ms, p99 44.6ms |
+
+### What each setting is worth
+
+Each row reverts exactly one setting from the configuration above, same
+dataset and client. The delta is that setting's contribution.
+
+| configuration | throughput | CPU | Δ CPU |
+|---|---|---|---|
+| tuned (all on) | 1,114,493/s | **32.6** | - |
+| readers 64 (was 40) | 1,115,651/s | 49.0 | **+16.4** |
+| io-threads 32 (was 6) | 1,114,533/s | 41.6 | **+9.0** |
+| flush-delay 0 (was 100us) | 1,094,721/s | 36.0 | **+3.4** |
+| dispatch-batch 1 (was 16) | 1,114,729/s | 34.1 | **+1.5** |
+| shards 32 (was 8) | 1,049,695/s | 32.1 | -0.5, but -5.8% throughput |
+
+Two thirds of the saving is simply running fewer threads. The flush delay is
+the only change that improved throughput and CPU together, and it is almost
+entirely system time (sys 12.3 -> 9.3) because it removes sendmsg calls.
+
+8 shards is not a CPU win; it is a throughput win at the same CPU - 29.3 us
+per op against 30.6.
+
+### Why fewer reader threads cost less CPU
+
+Not contention, and not idle threads burning cycles - that was the first guess
+and it was wrong.
+
+A reader takes ownership of a vbucket queue and sweeps whatever has
+accumulated. Fewer readers means requests pile up longer before anyone gets to
+them, so each sweep is bigger and the fixed per-sweep cost - FetchBuffer setup,
+building the OperationsList, the GetDocs call and its coroutine fanout, the
+dispatch flush, releaseVBQueue - is amortised over more requests.
+
+| readers | throughput | CPU | avg batch | ops/core |
+|---|---|---|---|---|
+| 64 | 1,115,246/s | 49.1 | 11.5 | 22,714 |
+| 40 | 1,115,013/s | 32.9 | 31.8 | 33,891 |
+| 24 | 924,986/s | 22.2 | 51.5 | **41,666** |
+| 16 | 671,625/s | 17.0 | 40.7 | 39,507 |
+
+At 64 readers the work is identical (72.2M vs 71.8M items) but split across
+2.8x as many batches - 6.27M against 2.26M. The extra 4M batches per second at
+roughly 4 us each accounts for ~16 cores, which is what was measured.
+
+40 is the knee: same throughput as 64 for two thirds of the CPU. Below it,
+throughput falls sharply because a reader owns one vbucket at a time while it
+waits on IO, so too few readers cannot keep the disk busy.
+
+Note the rule is not "fewer readers, bigger batches". Batch size follows queue
+depth, which is arrival rate over readers. At 16 readers throughput had already
+collapsed, so batches got *smaller* again (40.7) - starvation dominates. Batches
+grow as readers are removed only while throughput holds.
+
+If the goal is efficiency rather than peak throughput, 24 readers is 23% better
+per core and gives up 17% of throughput.
+
 ### Data block size: 4 KB vs 1 KB
 
 `--data-block-size` sets `SeqTreeBlockSize`, the blocks holding document
