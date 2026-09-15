@@ -489,24 +489,36 @@ Bucket::Bucket(const std::string& name,
     // so each shard's pool only sees tasks for its own vbuckets. This kills
     // the central-MPMC contention that was the bottleneck preventing
     // aqu-sz from climbing past ~130 at high reader counts.
+    // Honest thread budget: shard i gets floor(N/S) + (i < N%S ? 1 : 0), min 1.
+    // The previous max(1, N/S) floored the count and dropped the remainder, so
+    // with 32 shards every --readers between 16 and 63 produced the same 32
+    // threads. One reader owns one vbucket at a time, so the real reader count
+    // *is* the read concurrency - the flag has to mean what it says, or a
+    // sweep over it measures nothing.
     size_t writersPerShard = std::max<size_t>(1, numWriters / numShards);
     size_t readersPerShard = std::max<size_t>(1, numReaders / numShards);
+    size_t writersRem = numWriters > numShards ? numWriters % numShards : 0;
+    size_t readersRem = numReaders > numShards ? numReaders % numShards : 0;
     // Per-shard queue size — total queue capacity stays roughly the same.
     size_t perShardQueueSize = std::max<size_t>(64, 65536 / numShards);
-    for (auto& shard : shards_) {
-        shard->CreatePools(writersPerShard,
-                           readersPerShard,
-                           perShardQueueSize,
-                           this);
+    size_t totalWriters = 0, totalReaders = 0;
+    for (size_t i = 0; i < shards_.size(); i++) {
+        size_t w = writersPerShard + (i < writersRem ? 1 : 0);
+        size_t r = readersPerShard + (i < readersRem ? 1 : 0);
+        totalWriters += w;
+        totalReaders += r;
+        shards_[i]->CreatePools(w, r, perShardQueueSize, this);
     }
+    // Print the totals actually created, not the per-shard figure times the
+    // shard count, so the log cannot claim a budget that was never allocated.
     spdlog::info(
-            "Sharded pools: {} shards × {} writers + {} readers each "
+            "Sharded pools: {} shards × ~{} writers + ~{} readers each "
             "(total {} writers, {} readers)",
             numShards,
             writersPerShard,
             readersPerShard,
-            writersPerShard * numShards,
-            readersPerShard * numShards);
+            totalWriters,
+            totalReaders);
 }
 
 Bucket::~Bucket() {
