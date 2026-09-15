@@ -67,6 +67,24 @@ inline void hotStatSub(std::atomic<uint64_t>& s, uint64_t v = 1) {
     }
 }
 
+// Response-dispatch micro-batching.
+//
+// Measured 2026-09-14, networked 1 KB GETs: kvserver issued 0.93 epoll_wait and
+// 0.83 sendmsg PER GET, against Garnet's 0.015 and 0.016 -- ~34x more network
+// syscalls. Connection::scheduleFlush already coalesces responses into one
+// write per event-loop iteration, but the reader thread posts ONE
+// runInEventBaseThread per completed op, and each post wakes the target loop.
+// One wakeup per request means one loop iteration per request, so the
+// coalescing never has more than a single response to coalesce.
+//
+// Grouping a few completions into one post amortises both the wakeup and the
+// write. We deliberately do NOT revert to dispatching at end-of-GetDocs: that
+// was the intra-batch head-of-line blocking fixed in c0a9af9d8. Flushing every
+// gDispatchBatch completions caps the added wait at (gDispatchBatch-1) ops
+// within the same IO wave.
+// 1 = previous behaviour (dispatch per completion).
+extern size_t gDispatchBatch;
+
 // A single KV request flowing through the engine.
 // Uses intrusive linked list for lock-free per-vb write queues.
 struct Request {

@@ -1,4 +1,6 @@
 #include "engine.h"
+
+#include <algorithm>
 #include "connection.h"
 #include "include/libmagma/operations.h"
 
@@ -155,6 +157,65 @@ void WriterPool::Shutdown() {
         }
     }
 }
+
+size_t gDispatchBatch = 16;
+
+namespace {
+// Groups completed requests by target EventBase so one runInEventBaseThread
+// carries several responses. Reused per reader thread; no per-batch alloc in
+// steady state.
+class DispatchAccum {
+public:
+    void Add(Request* req) {
+        if (gDispatchBatch <= 1) {
+            auto* conn = req->conn;
+            req->evb->runInEventBaseThread(
+                    [conn, req]() { conn->sendGetResponse(req); });
+            return;
+        }
+        auto& vec = slotFor(req->evb);
+        vec.push_back(req);
+        if (vec.size() >= gDispatchBatch) {
+            post(req->evb, vec);
+        }
+    }
+
+    void FlushAll() {
+        for (auto& g : groups_) {
+            if (!g.second.empty()) {
+                post(g.first, g.second);
+            }
+        }
+        groups_.clear();
+    }
+
+private:
+    // A GetDocs batch spans few distinct EventBases, so linear scan beats a map.
+    std::vector<Request*>& slotFor(folly::EventBase* evb) {
+        for (auto& g : groups_) {
+            if (g.first == evb) {
+                return g.second;
+            }
+        }
+        groups_.emplace_back(evb, std::vector<Request*>{});
+        groups_.back().second.reserve(gDispatchBatch);
+        return groups_.back().second;
+    }
+
+    static void post(folly::EventBase* evb, std::vector<Request*>& vec) {
+        std::vector<Request*> batch;
+        batch.swap(vec);
+        evb->runInEventBaseThread([batch = std::move(batch)]() mutable {
+            for (auto* r : batch) {
+                r->conn->sendGetResponse(r);
+            }
+        });
+    }
+
+    std::vector<std::pair<folly::EventBase*, std::vector<Request*>>> groups_;
+};
+} // namespace
+
 
 void WriterPool::workerLoop() {
     // Exit on the sentinel only, never on the shutdown flag. Testing the flag
@@ -403,10 +464,11 @@ void ReaderPool::executeRead(ReadTask& task) {
         for (auto* req : batch) {
             getOps.Add(Magma::GetOperation(req->key, req));
         }
+        thread_local DispatchAccum accum;
         shard->GetMagma()->GetDocs(
                 task.vbid,
                 getOps,
-                [](Status s,
+                [&accum](Status s,
                    const Magma::GetOperation& op,
                    const Slice& meta,
                    const Slice& value) {
@@ -448,10 +510,9 @@ void ReaderPool::executeRead(ReadTask& task) {
                     // after its completion callback fires, so releasing the
                     // request from the evb thread before GetDocs returns is
                     // safe.
-                    auto* conn = req->conn;
-                    req->evb->runInEventBaseThread(
-                            [conn, req]() { conn->sendGetResponse(req); });
+                    accum.Add(req);
                 });
+        accum.FlushAll();
     }
 
     releaseVBQueue(vbq, taskQueue_, ReadTask{shard, task.vbid});

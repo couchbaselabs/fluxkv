@@ -160,6 +160,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"index-compression-lz4", no_argument, nullptr, 1012},
             {"no-value-ptr-read", no_argument, nullptr, 1013},
             {"data-block-size", required_argument, nullptr, 1008},
+            {"dispatch-batch", required_argument, nullptr, 1018},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
 
@@ -256,6 +257,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1008:
             cfg.dataBlockSize = strtoull(optarg, nullptr, 10);
+            break;
+        case 1018:
+            magma::kvserver::gDispatchBatch = strtoull(optarg, nullptr, 10);
             break;
         case 'h':
         default:
