@@ -104,6 +104,26 @@ void Shard::Close() {
 
 // ---- WriterPool ----
 
+// Release ownership of a per-vbucket queue and hand any work that arrived in
+// the meantime to the pool. MUST be the only way a worker clears `scheduled`.
+//
+// The store is seq_cst on purpose. Pushers do `insertHead(); if
+// (!scheduled.exchange(true)) submit`. If our store(false) were only `release`,
+// x86 may reorder it after the list.empty() load below (store-buffer
+// forwarding), letting us see a stale empty head while the pusher still sees
+// scheduled==true - a lost wakeup that parks every worker on an empty task
+// queue with requests stranded in the lists (observed live: 16,384 stranded,
+// all threads in blockingRead). The recheck after the store closes the window
+// in which a push landed between our sweep and our release.
+template <class Q, class Task>
+static inline void releaseVBQueue(VBQueue& vbq, Q& taskQueue, Task retask) {
+    vbq.scheduled.store(false, std::memory_order_seq_cst);
+    if (!vbq.list.empty() &&
+        !vbq.scheduled.exchange(true, std::memory_order_acq_rel)) {
+        taskQueue.blockingWrite(std::move(retask));
+    }
+}
+
 WriterPool::WriterPool(size_t numThreads, size_t queueSize, Bucket* bucket)
     : taskQueue_(queueSize), bucket_(bucket) {
     for (size_t i = 0; i < numThreads; i++) {
@@ -162,7 +182,7 @@ void WriterPool::executePersist(PersistTask& task) {
     vbq.list.sweep([&](Request* req) { batch.push_back(req); });
 
     if (batch.empty()) {
-        vbq.scheduled.store(false, std::memory_order_release);
+        releaseVBQueue(vbq, taskQueue_, PersistTask{shard, task.vbid});
         return;
     }
     std::reverse(batch.begin(), batch.end());
@@ -237,13 +257,7 @@ void WriterPool::executePersist(PersistTask& task) {
 
     // Re-sweep immediately — items accumulated during WriteDocs.
     // If we got more, loop back via the queue for fairness with other vbs.
-    vbq.scheduled.store(false, std::memory_order_release);
-    if (!vbq.list.empty()) {
-        if (!vbq.scheduled.exchange(true, std::memory_order_acq_rel)) {
-            PersistTask retask{shard, task.vbid};
-            taskQueue_.blockingWrite(std::move(retask));
-        }
-    }
+    releaseVBQueue(vbq, taskQueue_, PersistTask{shard, task.vbid});
 }
 
 // ---- ReaderPool ----
@@ -329,21 +343,23 @@ void ReaderPool::executeRead(ReadTask& task) {
     vbq.list.sweep([&](Request* req) { batch.push_back(req); });
 
     if (batch.empty()) {
-        vbq.scheduled.store(false, std::memory_order_release);
+        releaseVBQueue(vbq, taskQueue_, ReadTask{shard, task.vbid});
         return;
     }
     std::reverse(batch.begin(), batch.end());
 
-    // If we swept more than kMaxReadBatch, push excess back and
-    // immediately re-schedule so another reader thread can pick them up.
+    // If we swept more than kMaxReadBatch, push the excess back onto the list.
+    // Do NOT submit a second task here: that created a SECOND concurrent owner
+    // of this vbucket, and the two owners race on the scheduled-flag release,
+    // losing a wakeup - 16,384 requests stranded with every worker parked on an
+    // empty task queue. The excess is instead left in the list and picked up by
+    // the single re-submit releaseVBQueue() does at the tail of this function,
+    // preserving the invariant of exactly one owner per vbucket at a time.
     if (batch.size() > kMaxReadBatch) {
         for (size_t i = kMaxReadBatch; i < batch.size(); i++) {
             vbq.list.insertHead(batch[i]);
         }
         batch.resize(kMaxReadBatch);
-        // Re-schedule immediately for the excess items
-        ReadTask retask{shard, task.vbid};
-        taskQueue_.blockingWrite(std::move(retask));
     }
 
     hotStatAdd(gDispStats.readBatches);
@@ -438,13 +454,7 @@ void ReaderPool::executeRead(ReadTask& task) {
                 });
     }
 
-    vbq.scheduled.store(false, std::memory_order_release);
-    if (!vbq.list.empty()) {
-        if (!vbq.scheduled.exchange(true, std::memory_order_acq_rel)) {
-            ReadTask retask{shard, task.vbid};
-            taskQueue_.blockingWrite(std::move(retask));
-        }
-    }
+    releaseVBQueue(vbq, taskQueue_, ReadTask{shard, task.vbid});
 }
 
 // ---- Bucket ----
