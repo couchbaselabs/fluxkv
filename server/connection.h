@@ -6,6 +6,7 @@
 #include <folly/io/IOBufQueue.h>
 #include <folly/io/async/AsyncSocket.h>
 #include <folly/io/async/EventBase.h>
+#include <folly/io/async/AsyncTimeout.h>
 
 #include <list>
 #include <memory>
@@ -107,6 +108,19 @@ private:
     };
     FlushLoopCb flushCb_;
     bool flushScheduled_{false};
+    // Deferred flush (MAGMA_FLUSH_DELAY_US > 0): instead of flushing at the tail
+    // of every EventBase iteration (~1.6 responses per sendmsg at 1.1M GET/s,
+    // O45), arm a high-res timer and let responses from many reader threads
+    // coalesce into one write. Flushes early once pendingWriteBuf_ reaches
+    // MAGMA_FLUSH_BYTES. Queueing latency at 16K in-flight is ~15 ms, so a
+    // 50-200 us delay is invisible to the client.
+    class FlushTimeout : public folly::AsyncTimeout {
+    public:
+        explicit FlushTimeout(folly::EventBase* evb) : folly::AsyncTimeout(evb) {}
+        Connection* conn{nullptr};
+        void timeoutExpired() noexcept override;
+    };
+    std::unique_ptr<FlushTimeout> flushTimeout_;
 
     // Per-Connection Request freelist. Requests flow IO-thread → engine-thread
     // → IO-thread; we touch the pool only from the IO thread (this Connection's

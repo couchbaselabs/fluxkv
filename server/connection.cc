@@ -10,6 +10,24 @@
 #include <sys/socket.h>
 #include <cstdlib>
 
+namespace {
+int flushDelayUs() {
+    static const int v = [] {
+        const char* e = std::getenv("MAGMA_FLUSH_DELAY_US");
+        return e ? std::atoi(e) : 0;
+    }();
+    return v;
+}
+size_t flushBytes() {
+    static const size_t v = [] {
+        const char* e = std::getenv("MAGMA_FLUSH_BYTES");
+        return e ? static_cast<size_t>(std::atoll(e)) : size_t(64 * 1024);
+    }();
+    return v;
+}
+} // namespace
+
+
 namespace magma {
 namespace kvserver {
 
@@ -148,7 +166,14 @@ void Connection::readDataAvailable(size_t len) noexcept {
     readBuf_.postallocate(len);
     while (!closing_ && parseAndDispatch()) {
     }
-    flushPending();
+    if (flushDelayUs() > 0) {
+        // Let synchronous responses ride the same deferred flush.
+        if (!pendingWriteBuf_.empty()) {
+            scheduleFlush();
+        }
+    } else {
+        flushPending();
+    }
 }
 
 void Connection::flushPending() {
@@ -162,14 +187,41 @@ void Connection::flushPending() {
 }
 
 void Connection::scheduleFlush() {
-    if (flushScheduled_ || closing_) {
+    if (closing_) {
+        return;
+    }
+    if (flushScheduled_) {
+        // Timer armed but the buffer is already big enough: flush now.
+        if (flushTimeout_ && flushTimeout_->isScheduled() &&
+            pendingWriteBuf_.size() >= flushBytes()) {
+            flushTimeout_->cancelTimeout();
+            flushScheduled_ = false;
+            flushPending();
+        }
         return;
     }
     flushScheduled_ = true;
     if (!flushCb_.conn) {
         flushCb_.conn = this;
     }
+    if (flushDelayUs() > 0 && pendingWriteBuf_.size() < flushBytes()) {
+        if (!flushTimeout_) {
+            flushTimeout_ = std::make_unique<FlushTimeout>(socket_->getEventBase());
+            flushTimeout_->conn = this;
+        }
+        flushTimeout_->scheduleTimeoutHighRes(
+                std::chrono::microseconds(flushDelayUs()));
+        return;
+    }
     socket_->getEventBase()->runInLoop(&flushCb_, /*thisIteration=*/true);
+}
+
+void Connection::FlushTimeout::timeoutExpired() noexcept {
+    if (!conn) {
+        return;
+    }
+    conn->flushScheduled_ = false;
+    conn->flushPending();
 }
 
 void Connection::FlushLoopCb::runLoopCallback() noexcept {
