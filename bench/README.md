@@ -90,12 +90,37 @@ one disk read, so this is genuinely served from disk rather than from cache.
 
 ### What each setting is worth
 
+Only one setting actually moved the number:
+
 | change | result |
 |---|---|
 | quota 64G -> 100G | 691K -> **1,005K** ops/s |
-| 64 conns x 512 pipeline | 1,012K -> **1,028K** (vs 256x128, same in-flight) |
-| io-threads 32 -> 16 | **476K** - starves this many connections |
-| `--no-hot-stats` | **545K** - halves throughput, cause unknown |
+| 64 conns x 512 pipeline | 1,012K -> 1,028K (vs 256x128, same in-flight) |
+
+Everything else lands within ~2% of 1.01M, because the system is saturated on
+three resources at once and no single knob moves a saturated system. Measured
+back to back, libaio at 64x512, identical warmup:
+
+| config | throughput |
+|---|---|
+| baseline (io-threads 32) | 1,015,831/s |
+| `--no-hot-stats` | 1,018,889/s |
+| io-threads 16 | 1,009,747/s |
+| io_uring | 1,028,000/s |
+
+**A single sample is not a measurement.** Earlier runs recorded io-threads 16
+at 476K and `--no-hot-stats` at 545K, and both were written up as real
+regressions. Neither reproduced: re-measured under controlled conditions they
+are 1,009,747 and 1,018,889. Something transient - most likely background
+compaction left over from repeated dataset reloads - was interfering during
+that window.
+
+The `--no-hot-stats` claim should have been caught by reading the code rather
+than trusting the number. The flag sets one boolean that makes `hotStatAdd` and
+`hotStatSub` skip an atomic increment. The counters it skips are written and
+never read except by the stats endpoint, so the flag can only remove work. A
+result contradicting that was evidence of a bad measurement, not a surprising
+finding.
 
 ### libaio vs io_uring
 

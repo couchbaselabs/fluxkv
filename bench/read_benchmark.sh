@@ -17,7 +17,7 @@
 # All three resources are at their limit together, which is what a saturated
 # system looks like.
 #
-# What the settings below are worth, measured on the same dataset:
+# Only the memory quota actually moved the number:
 #
 #   quota 64G -> 100G        691K -> 1,005K ops/s. The cache holds the index,
 #                            not the data: amplification fell 1.57 -> 1.06.
@@ -25,12 +25,17 @@
 #   64 conns x 512 pipeline  1,012K -> 1,028K vs 256x128 at the same in-flight
 #                            depth. Fewer sockets, fewer syscalls - 43.8% of
 #                            CPU is syscall overhead.
-#   io_uring                 1,004K. No different from libaio here.
-#   io-threads 16            476K. Starves this many connections; the "lean is
-#                            better" comment in main.cc is for a lighter load.
-#   --no-hot-stats           545K. Halves throughput for reasons not yet
-#                            understood - the counters it skips are only
-#                            reported, never used for decisions. Leave it off.
+#
+# Everything else sits within ~2% of 1.01M, measured back to back on libaio:
+# baseline 1,015,831/s, --no-hot-stats 1,018,889/s, io-threads 16 1,009,747/s,
+# io_uring 1,028,000/s. Nothing moves a system that is saturated on network,
+# CPU and disk simultaneously.
+#
+# Take more than one sample. Earlier single runs put io-threads 16 at 476K and
+# --no-hot-stats at 545K, and neither reproduced - transient interference,
+# probably leftover compaction. --no-hot-stats in particular could not have
+# done that: it sets one boolean that skips an atomic increment on counters
+# nothing reads.
 #
 # Usage:
 #   CLIENT_HOST=root@10.0.0.2 DATA_DIR=/data/fluxkv-1k KEYS=200000000 \
