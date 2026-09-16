@@ -334,10 +334,20 @@ Loopback removes the NIC and the same server does 2.5x more. It also puts the
 client on the same 80 cores, so read the server's own CPU, not box load.
 
 **Per-op cost rises with thread count**, 0.54us at 16 IO threads to 0.76us at
-64. That is contention, not work: the remaining per-lookup costs are the
-cache shard's SharedMutex (two atomic RMWs, and readers of the same shard
-share the line) and the memcmp that ends every F14 lookup. A lock-free read
-path is what would flatten this.
+64, and the cause is still open. The obvious suspect - readers sharing a
+cache shard's SharedMutex line - was tested and ruled out: raising the shard
+count 128x (256 -> 32768, about one shard per 760 items) moved efficiency by
+-4%, the wrong way, presumably because more shard structs cost locality.
+
+| shards | io=16 | io=64 |
+|---|---|---|
+| 256 | 27.4M, 1.71M ops/core | 70.8M, 1.18M ops/core |
+| 4096 | 26.5M, 1.65M ops/core | 69.1M, 1.14M ops/core |
+| 32768 | 24.6M, 1.54M ops/core | 68.5M, 1.13M ops/core |
+
+What is left to check: the memcmp ending every F14 lookup (5% of CPU in an
+earlier profile), and plain memory/LLC pressure from 70M random lookups a
+second into a 25M-entry map - which no locking change would fix.
 
 Pipeline depth matters more than batch: at 192 sessions, depth 256 gives
 44.1M and depth 512 gives 78.6M. Depth 1024 adds nothing.
