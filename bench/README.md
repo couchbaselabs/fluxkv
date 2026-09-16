@@ -268,6 +268,40 @@ competes for CPU. Profiling shows 43.8% of CPU is syscall overhead (sendmsg
 13%, io_uring_enter 13%, epoll 12%), which is why fewer, deeper connections
 help.
 
+### Document cache: 1.11M GET/s at 3.7 cores when it hits
+
+`--cache-size N` puts a write-through document cache (server/cache, S3-FIFO)
+in front of magma. A hit is answered on the IO thread with no reader-thread
+hop; a miss takes the normal path and fills the cache. Measured with
+`cache_bench.sh` on the 25M x 1KB dataset, tuned configuration, 8 GiB cache,
+client on a second machine at 64x256, batch 64:
+
+| GET keyspace | cache | Throughput | CPU | Disk reads/s | RSS | Hit ratio |
+|---|---|---|---|---|---|---|
+| 4M of 25M | off | 1,114,992/s | 32.5 cores | 1,126,592 | 0.6 GB | - |
+| 4M of 25M | 8 GiB | 1,116,313/s | **3.7 cores** | **5** | 4.8 GB | 100% |
+| 25M | off | 1,115,211/s | 32.7 cores | 1,126,415 | 1.7 GB | - |
+| 25M | 8 GiB | 1,116,422/s | 30.4 cores | 496,808 | 10.4 GB | 50.7% |
+
+Fully cached, the same NIC-bound 1.11M GET/s costs **8.8x less CPU** - 3.3us
+per op against 29.2 - and the disk is idle. 4.0M items occupy 4.49 GB
+(~1.12 KB per 1 KB document), so the byte budget tracks RSS.
+
+**Half cached, the CPU barely moves.** Disk reads halve but CPU drops 7%,
+where a linear model predicts ~18 cores. The counters say why: the average
+read batch collapsed from 31.8 to 4.55. Misses now arrive at half the rate,
+spread across 40 readers x 256 vbuckets, so each reader wakes for a handful
+of keys and the per-batch cost dominates - the same mechanism that made 64
+readers cost 16 cores more than 40 (above). Each miss also fills: 75M
+PutIfAbsent and 67M evictions over the run. Two things to try, in order:
+fewer readers with the cache on, and filling only on a second miss (the
+ghost queue already knows) so a near-uniform miss stream stops churning the
+cache.
+
+The 50.7% is worth a caveat: 8 GiB holds 30% of the keyspace, and a uniform
+client would hit about that often. echobench2's key selection is evidently
+not uniform, so a real skewed generator is needed for the second workload.
+
 ## Reading the numbers
 
 **Check the errors before believing the rate.** A GET for a key that was
