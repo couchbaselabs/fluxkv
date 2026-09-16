@@ -352,6 +352,56 @@ second into a 25M-entry map - which no locking change would fix.
 Pipeline depth matters more than batch: at 192 sessions, depth 256 gives
 44.1M and depth 512 gives 78.6M. Depth 1024 adds nothing.
 
+### Auto-tuning: the hand-tuned numbers without the sweep
+
+Every result above came from a sweep over `--io-threads` and `--readers`.
+`--auto-tune` replaces the sweep: the flags become starting points, and a
+tuner thread (server/tuner.cc) resizes both pools at run time. Reader
+threads are added and retired through the shared task queue; IO threads are
+added and retired by moving live connections between event loops
+(`Connection::migrateTo`), which waits for a connection's requests in
+flight to be answered and then detaches and re-attaches the socket.
+
+The tuner works by trial. A pool whose threads are mostly busy gets more;
+a pool whose threads are mostly idle, or that just showed growth buys
+nothing, gets fewer. Every change is judged two windows later against
+throughput: a grow must raise it, a shrink must not lower it below the best
+steady value seen. A change that fails is undone and that direction backs
+off until the load changes. Busy fraction alone is not enough: a pool
+blocked on disk with a backlog reads 100% busy at any size (the 1 KB
+readers below), and only the failed-grow signal tells it to try fewer.
+
+Measured with `autotune_bench.sh`, which prints a line every 10 s:
+
+| workload | start | converged to | time | throughput | server cores | hand-tuned |
+|---|---|---|---|---|---|---|
+| 8 B GET, loopback, 192x512x64 | io=6, readers=40 | io=63, readers=8 | 150 s | 77.0-77.5M/s | 59.8 | 79.1M at io=64, 59.8 cores |
+| 1 KB GET, networked, 64x256x64 | io=16, readers=64 | io=4, readers=40 | 140 s | 1.1164M/s | 31.9 | 1.114M at io=6/40, 32.8 cores |
+
+The 8 B case stopped at 63 because the loopback client shares the box:
+78, 70, 66 and 64 threads were each tried and each cost or gained nothing.
+The 1 KB case is link-bound, so the tuner's only job is to find the fewest
+threads that still hold 1.11M - it shed 12 IO threads and 24 readers with
+no loss, and rejected 32 readers (-1.5%) five times with doubling gaps.
+Both runs finished with zero client errors and no connection dropped.
+
+Things learned building it, in the order they cost time:
+
+- **Thread churn breaks round-robin counter slots.** Pools that grow and
+  shrink create hundreds of threads over a run; with slots handed out
+  round-robin, two busy IO threads soon shared a counter cache line and the
+  8 B case lost 10-15%. Slots are now leased to the least-occupied index
+  and returned on thread exit (server/statslot.cc).
+- **Balance is everything for pinned connections.** A loop with 7
+  connections next to loops with 3 runs at 100% while they idle at 64%,
+  and the pool's mean busy hides it. Rebalancing levels max-to-min until
+  every loop is within one connection.
+- **Steps must scale with the pool.** Adding one thread to 51 cannot show
+  a 2% gain, so the tuner stalled. Steps are 1/8 of the pool, 1/4 when
+  saturated, and a failed step is retried at half size before backing off.
+- **Judge over two windows.** A single 2 s window let a -3% shrink pass on
+  a lucky reading; averaging two did not.
+
 ## Reading the numbers
 
 **Check the errors before believing the rate.** A GET for a key that was
