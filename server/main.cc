@@ -440,8 +440,13 @@ int main(int argc, char* argv[]) {
     // Install signal handlers
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
-    signal(SIGSEGV, crashHandler);
-    signal(SIGABRT, crashHandler);
+    // crashHandler prints a backtrace and then _exit()s, so the kernel never
+    // writes a core. Set FLUXKV_NO_CRASH_HANDLER=1 to leave the default
+    // dispositions in place and get a core for post-mortem analysis.
+    if (std::getenv("FLUXKV_NO_CRASH_HANDLER") == nullptr) {
+        signal(SIGSEGV, crashHandler);
+        signal(SIGABRT, crashHandler);
+    }
 
     // Start server (blocks on accept loop)
     Server server(&bucket,
