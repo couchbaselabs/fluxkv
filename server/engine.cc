@@ -14,6 +14,15 @@ namespace magma {
 namespace kvserver {
 
 DispatcherStats gDispStats;
+
+// Hand each thread its own counter slot on first use, round-robin. Threads are
+// created once and live for the process, so this never runs on the hot path.
+size_t statSlot() {
+    static std::atomic<size_t> next{0};
+    thread_local const size_t slot =
+            next.fetch_add(1, std::memory_order_relaxed) % kStatShards;
+    return slot;
+}
 DocCache* gDocCache = nullptr;
 // Runtime-tunable read-batch cap (--max-read-batch). 128 matches the
 // libaio + IOQueueDepth=16 sweet spot; lower (8-16) is better for sync
@@ -24,39 +33,39 @@ bool gStatsHotPath = true;
 
 std::string DispatcherStats::toJson() const {
     nlohmann::json j;
-    j["cmd_set"] = cmdSet.load(std::memory_order_relaxed);
-    j["cmd_get"] = cmdGet.load(std::memory_order_relaxed);
-    j["cmd_delete"] = cmdDelete.load(std::memory_order_relaxed);
-    j["cmd_set_resp"] = cmdSetResp.load(std::memory_order_relaxed);
-    j["cmd_get_resp"] = cmdGetResp.load(std::memory_order_relaxed);
-    j["cmd_set_resp_err"] = cmdSetRespErr.load(std::memory_order_relaxed);
-    j["cmd_get_resp_miss"] = cmdGetRespMiss.load(std::memory_order_relaxed);
+    j["cmd_set"] = cmdSet.Sum();
+    j["cmd_get"] = cmdGet.Sum();
+    j["cmd_delete"] = cmdDelete.Sum();
+    j["cmd_set_resp"] = cmdSetResp.Sum();
+    j["cmd_get_resp"] = cmdGetResp.Sum();
+    j["cmd_set_resp_err"] = cmdSetRespErr.Sum();
+    j["cmd_get_resp_miss"] = cmdGetRespMiss.Sum();
     j["connect_accept"] = connectAccept.load(std::memory_order_relaxed);
     j["connect_close"] = connectClose.load(std::memory_order_relaxed);
-    j["write_batches"] = writeBatches.load(std::memory_order_relaxed);
-    j["write_batch_items"] = writeBatchItems.load(std::memory_order_relaxed);
-    j["read_batches"] = readBatches.load(std::memory_order_relaxed);
-    j["read_batch_items"] = readBatchItems.load(std::memory_order_relaxed);
+    j["write_batches"] = writeBatches.Sum();
+    j["write_batch_items"] = writeBatchItems.Sum();
+    j["read_batches"] = readBatches.Sum();
+    j["read_batch_items"] = readBatchItems.Sum();
     j["tmp_fails"] = tmpFails.load(std::memory_order_relaxed);
-    j["queued_gets"] = queuedGets.load(std::memory_order_relaxed);
+    j["queued_gets"] = queuedGets.Sum();
     j["bad_magic"] = badMagic.load(std::memory_order_relaxed);
     j["bad_opcode"] = badOpcode.load(std::memory_order_relaxed);
-    auto wBatches = writeBatches.load(std::memory_order_relaxed);
+    auto wBatches = writeBatches.Sum();
     j["avg_write_batch"] =
             wBatches > 0
-                    ? (double)writeBatchItems.load(std::memory_order_relaxed) /
+                    ? (double)writeBatchItems.Sum() /
                               wBatches
                     : 0.0;
-    auto rBatches = readBatches.load(std::memory_order_relaxed);
+    auto rBatches = readBatches.Sum();
     j["avg_read_batch"] =
             rBatches > 0
-                    ? (double)readBatchItems.load(std::memory_order_relaxed) /
+                    ? (double)readBatchItems.Sum() /
                               rBatches
                     : 0.0;
-    j["outstanding_requests"] = (int64_t)cmdSet.load() + cmdGet.load() +
-                                cmdDelete.load() - cmdSetResp.load() -
-                                cmdGetResp.load() - cmdSetRespErr.load() -
-                                cmdGetRespMiss.load();
+    j["outstanding_requests"] = (int64_t)cmdSet.Sum() + cmdGet.Sum() +
+                                cmdDelete.Sum() - cmdSetResp.Sum() -
+                                cmdGetResp.Sum() - cmdSetRespErr.Sum() -
+                                cmdGetRespMiss.Sum();
     if (gDocCache) {
         auto c = gDocCache->GetStats();
         j["cache_hits"] = c.hits;

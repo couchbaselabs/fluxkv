@@ -24,23 +24,60 @@ namespace kvserver {
 class Connection;
 class Bucket;
 
+// Per-counter sharding for the hot path.
+//
+// One global atomic per counter was the single most expensive thing in the GET
+// path: two fetch_adds per request cost more than the parse, the cache lookup
+// and the response combined, because every increment moves a cache line
+// between cores - and it got worse with more threads. Spreading each counter
+// over cache-line-aligned per-thread slots keeps increments local; readers sum
+// the slots. Values stay exact, only the layout changes.
+inline constexpr size_t kStatShards = 64;
+
+struct alignas(64) ShardedCounter {
+    std::atomic<uint64_t> v{0};
+};
+
+// One counter, sharded. Sum() is O(kStatShards) and only runs when stats are
+// scraped.
+struct HotCounter {
+    std::array<ShardedCounter, kStatShards> slots;
+
+    uint64_t Sum() const {
+        uint64_t t = 0;
+        for (const auto& s : slots) {
+            t += s.v.load(std::memory_order_relaxed);
+        }
+        return t;
+    }
+    void Add(uint64_t v, size_t slot) {
+        slots[slot].v.fetch_add(v, std::memory_order_relaxed);
+    }
+    void Sub(uint64_t v, size_t slot) {
+        slots[slot].v.fetch_sub(v, std::memory_order_relaxed);
+    }
+};
+
+// Stable per-thread slot, assigned on first use.
+size_t statSlot();
+
 // Server-side dispatcher counters
 struct DispatcherStats {
-    std::atomic<uint64_t> cmdSet{0};
-    std::atomic<uint64_t> cmdGet{0};
-    std::atomic<uint64_t> cmdDelete{0};
-    std::atomic<uint64_t> cmdSetResp{0};
-    std::atomic<uint64_t> cmdGetResp{0};
-    std::atomic<uint64_t> cmdSetRespErr{0};
-    std::atomic<uint64_t> cmdGetRespMiss{0};
+    HotCounter cmdSet;
+    HotCounter cmdGet;
+    HotCounter cmdDelete;
+    HotCounter cmdSetResp;
+    HotCounter cmdGetResp;
+    HotCounter cmdSetRespErr;
+    HotCounter cmdGetRespMiss;
     std::atomic<uint64_t> connectAccept{0};
     std::atomic<uint64_t> connectClose{0};
-    std::atomic<uint64_t> writeBatches{0};
-    std::atomic<uint64_t> writeBatchItems{0};
-    std::atomic<uint64_t> readBatches{0};
-    std::atomic<uint64_t> readBatchItems{0};
+    HotCounter writeBatches;
+    HotCounter writeBatchItems;
+    HotCounter readBatches;
+    HotCounter readBatchItems;
     std::atomic<uint64_t> tmpFails{0};
-    std::atomic<uint64_t> queuedGets{0};
+    HotCounter queuedGets;
     std::atomic<uint64_t> badMagic{0};
     std::atomic<uint64_t> badOpcode{0};
 
@@ -59,7 +96,8 @@ extern size_t gMaxReadBatch;
 // Disabled with --no-hot-stats; coarse counters (connectAccept/Close,
 // badMagic, tmpFails, writeBatches) still update unconditionally.
 extern bool gStatsHotPath;
-// Inline-fast wrapper used at hot-path call sites.
+
+// Inline-fast wrappers used at hot-path call sites.
 inline void hotStatAdd(std::atomic<uint64_t>& s, uint64_t v = 1) {
     if (gStatsHotPath) {
         s.fetch_add(v, std::memory_order_relaxed);
@@ -70,12 +108,22 @@ inline void hotStatSub(std::atomic<uint64_t>& s, uint64_t v = 1) {
         s.fetch_sub(v, std::memory_order_relaxed);
     }
 }
+inline void hotStatAdd(HotCounter& c, uint64_t v = 1) {
+    if (gStatsHotPath) {
+        c.Add(v, statSlot());
+    }
+}
+inline void hotStatSub(HotCounter& c, uint64_t v = 1) {
+    if (gStatsHotPath) {
+        c.Sub(v, statSlot());
+    }
+}
 
 // Response-dispatch micro-batching.
 //
 // Measured 2026-09-14, networked 1 KB GETs: kvserver issued 0.93 epoll_wait and
-// 0.83 sendmsg PER GET, against Garnet's 0.015 and 0.016 -- ~34x more network
-// syscalls. Connection::scheduleFlush already coalesces responses into one
+// 0.83 sendmsg PER GET - one network syscall per request, where a well
+// batched server needs ~1 per 60. Connection::scheduleFlush already coalesces responses into one
 // write per event-loop iteration, but the reader thread posts ONE
 // runInEventBaseThread per completed op, and each post wakes the target loop.
 // One wakeup per request means one loop iteration per request, so the
