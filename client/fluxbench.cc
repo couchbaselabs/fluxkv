@@ -7,6 +7,12 @@
 // One thread per connection. Each thread keeps `pipeline` requests in flight:
 // it sends a batch, then reads the matching responses, timing each request
 // from its own send to its own response.
+//
+// -pregen switches to a throughput mode that builds the request bytes once at
+// startup and then only sends buffers and counts responses. The default path
+// formats every request and timestamps every operation inside the loop, which
+// costs more CPU on the client than the server spends answering - past a few
+// million ops/s it measures the load generator, not the server.
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -47,6 +53,15 @@ struct Options {
     bool randvals = false;
     uint64_t seed = 1;
     std::chrono::seconds runtime{30};
+    // Pre-generate mode: build `pregen` request buffers per connection up
+    // front, each holding `batch` requests. 0 keeps the latency-measuring path.
+    size_t pregen = 0;
+    size_t batch = 0; // requests per pre-generated buffer; 0 => pipeline
+    // Fixed key length. Every byte of key is a byte on the wire in both
+    // directions, so a variable-length "key_123" costs throughput once the
+    // link saturates: at 8-byte values the request IS mostly key and header.
+    // 0 keeps the original variable-length keys.
+    size_t keylen = 0;
 };
 
 // Couchbase vbucket mapping: CRC32 of the key, high bits masked, modulo the
@@ -79,8 +94,20 @@ uint16_t vbucketFor(const std::string& key, uint16_t vbuckets) {
                                  vbuckets);
 }
 
+size_t gKeyLen = 0;
+
 std::string keyFor(size_t index) {
-    return "key_" + std::to_string(index);
+    if (gKeyLen == 0) {
+        return "key_" + std::to_string(index);
+    }
+    // Zero-padded decimal, so every key is exactly gKeyLen bytes and distinct
+    // indices stay distinct as long as the width holds the key space.
+    std::string k(gKeyLen, '0');
+    for (size_t i = gKeyLen; i-- > 0 && index > 0;) {
+        k[i] = static_cast<char>('0' + (index % 10));
+        index /= 10;
+    }
+    return k;
 }
 
 void putU16(uint8_t* p, uint16_t v) {
@@ -218,6 +245,138 @@ struct Result {
     std::vector<uint32_t> latenciesUs;
 };
 
+// Streaming response counter for pre-generate mode. Walks the mcbp framing in
+// whatever chunks recv() hands back, without copying or even looking at
+// bodies: a GET response is header + extras + value, and all we need is the
+// status and how far to skip.
+class ResponseCounter {
+public:
+    // Returns false if the stream is not mcbp - a desync we must not paper
+    // over, since a client that miscounts reports a throughput that is not
+    // real.
+    bool Feed(const uint8_t* p, size_t n, Result& r) {
+        while (n > 0) {
+            if (bodyRemaining_ > 0) {
+                const size_t take = std::min(n, bodyRemaining_);
+                p += take;
+                n -= take;
+                bodyRemaining_ -= take;
+                continue;
+            }
+            const size_t take = std::min(n, kHeaderSize - haveHeader_);
+            std::memcpy(header_ + haveHeader_, p, take);
+            haveHeader_ += take;
+            p += take;
+            n -= take;
+            if (haveHeader_ < kHeaderSize) {
+                return true;
+            }
+            haveHeader_ = 0;
+            if (header_[0] != kResponseMagic) {
+                return false;
+            }
+            const uint16_t status = getU16(header_ + 6);
+            bodyRemaining_ = getU32(header_ + 8);
+            r.statusCounts[status]++;
+            if (status == 0) {
+                r.ops++;
+            } else {
+                r.errors++;
+            }
+            completed_++;
+        }
+        return true;
+    }
+    // Responses seen since the last call; the caller uses this to decide how
+    // many more request buffers it may put on the wire.
+    uint64_t TakeCompleted() {
+        const uint64_t c = completed_;
+        completed_ = 0;
+        return c;
+    }
+
+private:
+    uint8_t header_[kHeaderSize];
+    size_t haveHeader_ = 0;
+    size_t bodyRemaining_ = 0;
+    uint64_t completed_ = 0;
+};
+
+// Builds one buffer of `batch` GET requests. Keys are drawn up front so the
+// run-time loop touches nothing but the socket.
+std::vector<uint8_t> buildGetBuffer(const Options& opts,
+                                    std::mt19937_64& rng,
+                                    size_t batch) {
+    std::vector<uint8_t> buf;
+    buf.reserve(batch * (kHeaderSize + 24));
+    for (size_t i = 0; i < batch; i++) {
+        const std::string key = keyFor(rng() % opts.keys);
+        appendRequest(buf,
+                      kOpGet,
+                      key,
+                      vbucketFor(key, opts.vbuckets),
+                      static_cast<uint32_t>(i),
+                      nullptr);
+    }
+    return buf;
+}
+
+// Throughput path: send pre-built buffers, keep `pipeline` requests in
+// flight, count responses. No formatting and no clock reads per operation.
+void runConnectionPregen(const Options& opts,
+                         size_t threadIndex,
+                         std::atomic<bool>& stop,
+                         Result& result) {
+    int fd = connectTo(opts.host, opts.port);
+    if (fd < 0) {
+        result.errors++;
+        return;
+    }
+    // Big socket buffers: at a few million ops/s the default sizes turn into
+    // extra wakeups on both ends.
+    int bufSize = 8 << 20;
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufSize, sizeof(bufSize));
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufSize, sizeof(bufSize));
+
+    std::mt19937_64 rng(opts.seed + threadIndex);
+    const size_t batch = opts.batch ? opts.batch : opts.pipeline;
+    std::vector<std::vector<uint8_t>> buffers;
+    buffers.reserve(opts.pregen);
+    for (size_t i = 0; i < opts.pregen; i++) {
+        buffers.push_back(buildGetBuffer(opts, rng, batch));
+    }
+
+    ResponseCounter counter;
+    std::vector<uint8_t> rx(1 << 20);
+    const uint64_t window = std::max<uint64_t>(opts.pipeline, batch);
+    uint64_t outstanding = 0;
+    size_t next = 0;
+
+    while (!stop.load(std::memory_order_relaxed)) {
+        while (outstanding < window) {
+            const auto& b = buffers[next++ % buffers.size()];
+            if (!writeFully(fd, b.data(), b.size())) {
+                result.errors++;
+                ::close(fd);
+                return;
+            }
+            outstanding += batch;
+        }
+        const ssize_t n = ::recv(fd, rx.data(), rx.size(), 0);
+        if (n <= 0) {
+            result.errors++;
+            break;
+        }
+        if (!counter.Feed(rx.data(), static_cast<size_t>(n), result)) {
+            result.errors++;
+            break;
+        }
+        const uint64_t done = counter.TakeCompleted();
+        outstanding = (done >= outstanding) ? 0 : outstanding - done;
+    }
+    ::close(fd);
+}
+
 void runConnection(const Options& opts,
                    size_t threadIndex,
                    std::atomic<bool>& stop,
@@ -251,12 +410,32 @@ void runConnection(const Options& opts,
     std::vector<uint8_t> body;
     result.latenciesUs.reserve(1 << 16);
 
+    // SET walks the keyspace in a stride, so one load pass writes every key
+    // exactly once and a later GET pass can demand a zero-miss result.
+    // Choosing keys at random instead leaves part of the keyspace unwritten,
+    // and the misses that follow are cheap - which inflates the read rate.
+    size_t setCursor = threadIndex;
+
     while (!stop.load(std::memory_order_relaxed)) {
         sendBuf.clear();
-        const auto batch = opts.pipeline;
+        auto batch = opts.pipeline;
+        if (doSet) {
+            if (setCursor >= opts.keys) {
+                break; // this connection's share of the keyspace is written
+            }
+            const size_t remaining = (opts.keys - setCursor + opts.conns - 1) /
+                                     opts.conns;
+            batch = std::min(batch, remaining);
+        }
 
         for (size_t i = 0; i < batch; i++) {
-            const size_t keyIndex = rng() % opts.keys;
+            size_t keyIndex;
+            if (doSet) {
+                keyIndex = setCursor;
+                setCursor += opts.conns;
+            } else {
+                keyIndex = rng() % opts.keys;
+            }
             const std::string key = keyFor(keyIndex);
             appendRequest(sendBuf,
                           doSet ? kOpSet : kOpGet,
@@ -336,6 +515,14 @@ void usage(const char* prog) {
             << "  -conns N          connections, one thread each (default 8)\n"
             << "  -pipeline N       requests in flight per connection "
                "(default 8)\n"
+            << "  -pregen N         pre-generate N request buffers per "
+               "connection and measure throughput only (no per-op latency); "
+               "use this above ~1M ops/s or the client is what you measure\n"
+            << "  -batch N          requests per pre-generated buffer "
+               "(default: -pipeline)\n"
+            << "  -keylen N         fixed key length, zero-padded (default: "
+               "variable-length key_N). Shorter keys mean fewer bytes on the "
+               "wire, which matters once the link saturates\n"
             << "  -keys N           key space size (default 1000000)\n"
             << "  -vbuckets N       vbucket count, must match the server "
                "(default 256)\n"
@@ -373,6 +560,12 @@ int main(int argc, char** argv) {
             opts.conns = std::stoul(next());
         } else if (arg == "-pipeline") {
             opts.pipeline = std::stoul(next());
+        } else if (arg == "-pregen") {
+            opts.pregen = std::stoul(next());
+        } else if (arg == "-batch") {
+            opts.batch = std::stoul(next());
+        } else if (arg == "-keylen") {
+            opts.keylen = std::stoul(next());
         } else if (arg == "-keys") {
             opts.keys = std::stoul(next());
         } else if (arg == "-vbuckets") {
@@ -412,12 +605,18 @@ int main(int argc, char** argv) {
 
     std::vector<Result> results(opts.conns);
     std::vector<std::thread> threads;
+    gKeyLen = opts.keylen;
     std::atomic<bool> stop{false};
 
     const auto start = std::chrono::steady_clock::now();
     for (size_t i = 0; i < opts.conns; i++) {
-        threads.emplace_back(
-                [&, i]() { runConnection(opts, i, stop, results[i]); });
+        threads.emplace_back([&, i]() {
+            if (opts.pregen > 0) {
+                runConnectionPregen(opts, i, stop, results[i]);
+            } else {
+                runConnection(opts, i, stop, results[i]);
+            }
+        });
     }
 
     std::this_thread::sleep_for(opts.runtime);
