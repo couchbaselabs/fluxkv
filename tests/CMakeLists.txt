@@ -27,7 +27,16 @@ if(FLUXKV_BUILD_SERVER)
                          TIMEOUT 180
                          ENVIRONMENT "FLUXKV_TEST_CACHE_SIZE=67108864")
 
+    add_test(NAME smoke_autotune
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/smoke_test.sh
+                     $<TARGET_FILE:fluxkv_server>
+                     $<TARGET_FILE:fluxbench>)
+    set_tests_properties(smoke_autotune PROPERTIES
+                         TIMEOUT 300
+                         ENVIRONMENT "FLUXKV_TEST_AUTO_TUNE=1")
+
     # The server tests bind a fixed port, so they cannot share the machine.
     set_tests_properties(smoke_cache PROPERTIES DEPENDS smoke)
-    set_tests_properties(durability PROPERTIES DEPENDS smoke_cache)
+    set_tests_properties(smoke_autotune PROPERTIES DEPENDS smoke_cache)
+    set_tests_properties(durability PROPERTIES DEPENDS smoke_autotune)
 endif()

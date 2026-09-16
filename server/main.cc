@@ -12,8 +12,10 @@
 #include <cstring>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <algorithm>
 #include <iostream>
 #include <string>
+#include <thread>
 
 using namespace magma;
 using namespace magma::kvserver;
@@ -89,6 +91,11 @@ struct Config {
     size_t cacheSize = 0;
     size_t cacheShards = 256;
     std::string cachePolicy = "s3fifo";
+    // Size IO threads and readers from load at run time. --io-threads and
+    // --readers become the starting points; these are the ceilings.
+    bool autoTune = false;
+    size_t maxIoThreads = 0; // 0 = hardware threads
+    size_t maxReaders = 0; // 0 = 4 x hardware threads
 };
 
 static void printUsage(const char* prog) {
@@ -133,6 +140,12 @@ static void printUsage(const char* prog) {
               << "  --cache-shards N      lock shards in the cache (default "
                  "256)\n"
               << "  --cache-policy NAME   eviction policy: s3fifo (default)\n"
+              << "  --auto-tune           size IO threads and readers from "
+                 "load; --io-threads/--readers are the starting points\n"
+              << "  --max-io-threads N    ceiling for --auto-tune (default: "
+                 "hardware threads)\n"
+              << "  --max-readers N       ceiling for --auto-tune (default: "
+                 "4 x hardware threads)\n"
               << "  --help            Show this help\n";
 }
 
@@ -173,6 +186,9 @@ static Config parseArgs(int argc, char* argv[]) {
             {"cache-size", required_argument, nullptr, 1020},
             {"cache-shards", required_argument, nullptr, 1021},
             {"cache-policy", required_argument, nullptr, 1022},
+            {"auto-tune", no_argument, nullptr, 1030},
+            {"max-io-threads", required_argument, nullptr, 1031},
+            {"max-readers", required_argument, nullptr, 1032},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
 
@@ -281,6 +297,15 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1022:
             cfg.cachePolicy = optarg;
+            break;
+        case 1030:
+            cfg.autoTune = true;
+            break;
+        case 1031:
+            cfg.maxIoThreads = strtoull(optarg, nullptr, 10);
+            break;
+        case 1032:
+            cfg.maxReaders = strtoull(optarg, nullptr, 10);
             break;
         case 'h':
         default:
@@ -491,6 +516,22 @@ int main(int argc, char* argv[]) {
                   cfg.vbuckets,
                   cfg.statsPort);
     gServer = &server;
+
+    if (cfg.autoTune) {
+        const size_t hw = std::max(1u, std::thread::hardware_concurrency());
+        ThreadTuner::Bounds io{1, cfg.maxIoThreads ? cfg.maxIoThreads : hw};
+        // Readers move in whole shards; the floor is one per shard.
+        ThreadTuner::Bounds rd{cfg.shards,
+                               cfg.maxReaders ? cfg.maxReaders : 4 * hw};
+        io.max = std::max(io.max, static_cast<size_t>(cfg.ioThreads));
+        rd.max = std::max(rd.max, static_cast<size_t>(cfg.readers));
+        server.EnableAutoTune(TunerConfig{}, io, rd);
+        spdlog::info("  auto-tune: io-threads {}..{} readers {}..{}",
+                     io.min,
+                     io.max,
+                     rd.min,
+                     rd.max);
+    }
 
     server.Start(); // blocks until Stop() is called
 
