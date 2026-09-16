@@ -4,6 +4,8 @@
 #include "cache/doccache.h"
 #include "metadata.h"
 #include "protocol.h"
+#include "statslot.h"
+#include "tuner.h"
 
 #include <folly/AtomicIntrusiveLinkedList.h>
 #include <folly/MPMCQueue.h>
@@ -32,7 +34,7 @@ class Bucket;
 // between cores - and it got worse with more threads. Spreading each counter
 // over cache-line-aligned per-thread slots keeps increments local; readers sum
 // the slots. Values stay exact, only the layout changes.
-inline constexpr size_t kStatShards = 64;
+inline constexpr size_t kStatShards = kStatSlots;
 
 struct alignas(64) ShardedCounter {
     std::atomic<uint64_t> v{0};
@@ -57,9 +59,6 @@ struct HotCounter {
         slots[slot].v.fetch_sub(v, std::memory_order_relaxed);
     }
 };
-
-// Stable per-thread slot, assigned on first use.
-size_t statSlot();
 
 // Server-side dispatcher counters
 struct DispatcherStats {
@@ -211,6 +210,9 @@ struct PersistTask {
 struct ReadTask {
     class Shard* shard{nullptr};
     uint16_t vbid{0};
+    // Stamped by Submit; the gap to dequeue is how long work waited for a
+    // thread, which the tuner reports.
+    uint64_t enqueuedNs{0};
 };
 
 class WriterPool;
@@ -313,14 +315,50 @@ public:
     void Submit(ReadTask task);
     void Shutdown();
 
-private:
-    void workerLoop();
-    void executeRead(ReadTask& task);
+    // Run-time sizing, driven by the tuner. Grow starts threads now; Shrink
+    // queues one retire sentinel per thread and the workers that pick them
+    // up exit after their current task. Reap joins them.
+    size_t Size() const {
+        return live_.load(std::memory_order_relaxed);
+    }
+    void Grow(size_t n);
+    void Shrink(size_t n);
+    void Reap();
 
-    std::vector<std::thread> threads_;
+    // Work done since the previous call. Busy time is measured around
+    // executeRead only: the idle spin in workerLoop must not count as work.
+    struct Sample {
+        uint64_t busyNs{0};
+        uint64_t waitNs{0};
+        uint64_t tasks{0};
+        uint64_t items{0};
+    };
+    Sample TakeSample();
+
+private:
+    struct Worker {
+        std::thread thread;
+        std::atomic<bool> done{false};
+    };
+    struct alignas(64) Acct {
+        std::atomic<uint64_t> busyNs{0};
+        std::atomic<uint64_t> waitNs{0};
+        std::atomic<uint64_t> tasks{0};
+        std::atomic<uint64_t> items{0};
+    };
+
+    void spawn();
+    void workerLoop(Worker* self);
+    // Returns the number of requests served.
+    size_t executeRead(ReadTask& task);
+
+    std::vector<std::unique_ptr<Worker>> workers_;
+    std::atomic<size_t> live_{0};
     folly::MPMCQueue<ReadTask> taskQueue_;
     std::atomic<bool> shutdown_{false};
     Bucket* bucket_;
+    Acct acct_[kStatShards];
+    Sample lastSample_;
 };
 
 // Container of shards. Routes requests to the correct shard.
@@ -386,6 +424,17 @@ public:
     // Synchronous — returns when every compaction finishes.
     void CompactAll();
 
+    size_t NumShards() const {
+        return numShards_;
+    }
+    std::vector<ReaderPool*> ReaderPools() {
+        std::vector<ReaderPool*> v;
+        for (auto& s : shards_) {
+            v.push_back(s->GetReaderPool());
+        }
+        return v;
+    }
+
     // Public for writer pool access
     std::atomic<size_t> queuedBytes_{0};
 
@@ -402,6 +451,29 @@ private:
     std::vector<std::unique_ptr<Shard>> shards_;
     // Per-shard pools live inside each Shard now (sharded). Bucket holds
     // no global pools — EnqueueRead/EnqueueWrite route to the shard's own.
+};
+
+// The per-shard reader pools presented to the tuner as one pool. Every shard
+// carries the same share of vbuckets, so they are always kept the same size:
+// Size() is the total and Step() is the shard count.
+class ReaderPoolGroup : public ElasticPool {
+public:
+    explicit ReaderPoolGroup(Bucket* bucket) : pools_(bucket->ReaderPools()) {
+    }
+    const char* Name() const override {
+        return "readers";
+    }
+    size_t Size() const override;
+    size_t Step() const override {
+        return pools_.size();
+    }
+    void Grow(size_t n) override;
+    void Shrink(size_t n) override;
+    PoolSample Sample(double wallSec) override;
+    void Reap() override;
+
+private:
+    std::vector<ReaderPool*> pools_;
 };
 
 } // namespace kvserver

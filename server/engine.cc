@@ -15,14 +15,6 @@ namespace kvserver {
 
 DispatcherStats gDispStats;
 
-// Hand each thread its own counter slot on first use, round-robin. Threads are
-// created once and live for the process, so this never runs on the hot path.
-size_t statSlot() {
-    static std::atomic<size_t> next{0};
-    thread_local const size_t slot =
-            next.fetch_add(1, std::memory_order_relaxed) % kStatShards;
-    return slot;
-}
 DocCache* gDocCache = nullptr;
 // Runtime-tunable read-batch cap (--max-read-batch). 128 matches the
 // libaio + IOQueueDepth=16 sweet spot; lower (8-16) is better for sync
@@ -385,10 +377,22 @@ inline void fillCache(Bucket* bucket,
 }
 } // namespace
 
+namespace {
+inline uint64_t nowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+}
+// Sentinels travel through the task queue with a null shard: vbid 0 stops a
+// worker for shutdown, vbid 1 retires one worker for Shrink.
+constexpr uint16_t kStopSentinel = 0;
+constexpr uint16_t kRetireSentinel = 1;
+} // namespace
+
 ReaderPool::ReaderPool(size_t numThreads, size_t queueSize, Bucket* bucket)
     : taskQueue_(queueSize), bucket_(bucket) {
     for (size_t i = 0; i < numThreads; i++) {
-        threads_.emplace_back([this]() { workerLoop(); });
+        spawn();
     }
 }
 
@@ -397,24 +401,76 @@ ReaderPool::~ReaderPool() {
 }
 
 void ReaderPool::Submit(ReadTask task) {
+    task.enqueuedNs = nowNs();
     taskQueue_.blockingWrite(std::move(task));
+}
+
+void ReaderPool::spawn() {
+    auto w = std::make_unique<Worker>();
+    auto* self = w.get();
+    w->thread = std::thread([this, self]() { workerLoop(self); });
+    workers_.push_back(std::move(w));
+    live_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ReaderPool::Grow(size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        spawn();
+    }
+}
+
+void ReaderPool::Shrink(size_t n) {
+    n = std::min(n, live_.load(std::memory_order_relaxed));
+    live_.fetch_sub(n, std::memory_order_relaxed);
+    for (size_t i = 0; i < n; i++) {
+        taskQueue_.blockingWrite(ReadTask{nullptr, kRetireSentinel, 0});
+    }
+}
+
+void ReaderPool::Reap() {
+    for (auto it = workers_.begin(); it != workers_.end();) {
+        if ((*it)->done.load(std::memory_order_acquire)) {
+            (*it)->thread.join();
+            it = workers_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+ReaderPool::Sample ReaderPool::TakeSample() {
+    Sample total;
+    for (const auto& a : acct_) {
+        total.busyNs += a.busyNs.load(std::memory_order_relaxed);
+        total.waitNs += a.waitNs.load(std::memory_order_relaxed);
+        total.tasks += a.tasks.load(std::memory_order_relaxed);
+        total.items += a.items.load(std::memory_order_relaxed);
+    }
+    Sample delta{total.busyNs - lastSample_.busyNs,
+                 total.waitNs - lastSample_.waitNs,
+                 total.tasks - lastSample_.tasks,
+                 total.items - lastSample_.items};
+    lastSample_ = total;
+    return delta;
 }
 
 void ReaderPool::Shutdown() {
     if (shutdown_.exchange(true)) {
         return;
     }
-    for (size_t i = 0; i < threads_.size(); i++) {
-        taskQueue_.blockingWrite(ReadTask{nullptr, 0});
+    for (size_t i = 0; i < workers_.size(); i++) {
+        taskQueue_.blockingWrite(ReadTask{nullptr, kStopSentinel, 0});
     }
-    for (auto& t : threads_) {
-        if (t.joinable()) {
-            t.join();
+    for (auto& w : workers_) {
+        if (w->thread.joinable()) {
+            w->thread.join();
         }
     }
+    workers_.clear();
+    live_.store(0, std::memory_order_relaxed);
 }
 
-void ReaderPool::workerLoop() {
+void ReaderPool::workerLoop(Worker* self) {
     // Brief busy-spin before parking. At moderate rates (e.g. 300K ops/s with
     // 64 readers → ~3 ops/reader/ms) the inter-arrival gap is shorter than
     // the cost of waking from intel_idle (10-50µs). Spinning keeps the thread
@@ -442,13 +498,22 @@ void ReaderPool::workerLoop() {
             taskQueue_.blockingRead(task);
         }
         if (!task.shard) {
+            // Stop, or retire this one worker. Either way this thread ends.
             break;
         }
-        executeRead(task);
+        auto& acct = acct_[statSlot()];
+        const uint64_t t0 = nowNs();
+        const size_t served = executeRead(task);
+        const uint64_t t1 = nowNs();
+        acct.busyNs.fetch_add(t1 - t0, std::memory_order_relaxed);
+        acct.waitNs.fetch_add(t0 - task.enqueuedNs, std::memory_order_relaxed);
+        acct.tasks.fetch_add(1, std::memory_order_relaxed);
+        acct.items.fetch_add(served, std::memory_order_relaxed);
     }
+    self->done.store(true, std::memory_order_release);
 }
 
-void ReaderPool::executeRead(ReadTask& task) {
+size_t ReaderPool::executeRead(ReadTask& task) {
     auto* shard = task.shard;
     auto& vbq = shard->GetVBReadQueue(task.vbid);
     Magma::FetchBuffer idxBuf, seqBuf;
@@ -466,8 +531,8 @@ void ReaderPool::executeRead(ReadTask& task) {
     vbq.list.sweep([&](Request* req) { batch.push_back(req); });
 
     if (batch.empty()) {
-        releaseVBQueue(vbq, taskQueue_, ReadTask{shard, task.vbid});
-        return;
+        releaseVBQueue(vbq, taskQueue_, ReadTask{shard, task.vbid, nowNs()});
+        return 0;
     }
     std::reverse(batch.begin(), batch.end());
 
@@ -580,7 +645,61 @@ void ReaderPool::executeRead(ReadTask& task) {
         accum.FlushAll();
     }
 
-    releaseVBQueue(vbq, taskQueue_, ReadTask{shard, task.vbid});
+    releaseVBQueue(vbq, taskQueue_, ReadTask{shard, task.vbid, nowNs()});
+    return batch.size();
+}
+
+// ---- ReaderPoolGroup ----
+
+size_t ReaderPoolGroup::Size() const {
+    size_t n = 0;
+    for (auto* p : pools_) {
+        n += p->Size();
+    }
+    return n;
+}
+
+void ReaderPoolGroup::Grow(size_t n) {
+    const size_t per = std::max<size_t>(1, n / pools_.size());
+    for (auto* p : pools_) {
+        p->Grow(per);
+    }
+}
+
+void ReaderPoolGroup::Shrink(size_t n) {
+    const size_t per = std::max<size_t>(1, n / pools_.size());
+    for (auto* p : pools_) {
+        p->Shrink(per);
+    }
+}
+
+void ReaderPoolGroup::Reap() {
+    for (auto* p : pools_) {
+        p->Reap();
+    }
+}
+
+PoolSample ReaderPoolGroup::Sample(double wallSec) {
+    PoolSample s;
+    uint64_t busyNs = 0, waitNs = 0, tasks = 0, items = 0;
+    for (auto* p : pools_) {
+        const auto d = p->TakeSample();
+        busyNs += d.busyNs;
+        waitNs += d.waitNs;
+        tasks += d.tasks;
+        items += d.items;
+        s.size += p->Size();
+        if (p->Size() > 0 && wallSec > 0) {
+            s.busyMax = std::max(s.busyMax,
+                                 d.busyNs / (wallSec * 1e9 * p->Size()));
+        }
+    }
+    if (s.size > 0 && wallSec > 0) {
+        s.busyMean = busyNs / (wallSec * 1e9 * s.size);
+    }
+    s.avgBatch = tasks > 0 ? static_cast<double>(items) / tasks : 0;
+    s.waitUs = tasks > 0 ? waitNs / 1e3 / tasks : 0;
+    return s;
 }
 
 // ---- Bucket ----

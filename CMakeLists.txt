@@ -34,7 +34,8 @@ if(FLUXKV_BUILD_SERVER)
     # without the rest of the server.
     add_library(fluxkv_cache STATIC
                 server/cache/doccache.cc
-                server/cache/s3fifo_cache.cc)
+                server/cache/s3fifo_cache.cc
+                server/statslot.cc)
     target_include_directories(fluxkv_cache PUBLIC
                                "${CMAKE_CURRENT_SOURCE_DIR}/server"
                                ${CBMAGMA_INCLUDE_DIRS})
@@ -46,7 +47,8 @@ if(FLUXKV_BUILD_SERVER)
                    server/server.cc
                    server/connection.cc
                    server/protocol.cc
-                   server/engine.cc)
+                   server/engine.cc
+                   server/tuner.cc)
 
     target_include_directories(fluxkv_server PRIVATE
                                "${CMAKE_CURRENT_SOURCE_DIR}/server"

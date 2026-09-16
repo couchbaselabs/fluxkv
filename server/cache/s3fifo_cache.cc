@@ -1,4 +1,5 @@
 #include "s3fifo_cache.h"
+#include "statslot.h"
 
 #include <folly/SharedMutex.h>
 #include <folly/container/F14Map.h>
@@ -29,8 +30,6 @@ enum Queue : uint8_t { kSmall = 0, kMain = 1 };
 // Read-path counters, one cache-line-aligned slot per thread. A single atomic
 // per shard is still a contended RMW on every lookup; giving each thread its
 // own slot keeps the line local. GetStats sums them.
-constexpr size_t kStatSlots = 64;
-
 struct alignas(64) ReadStatSlot {
     std::atomic<uint64_t> hits{0};
     std::atomic<uint64_t> misses{0};
@@ -41,10 +40,7 @@ struct alignas(64) ReadStatSlot {
 ReadStatSlot gReadStats[kStatSlots];
 
 inline size_t readStatSlot() {
-    static std::atomic<size_t> next{0};
-    thread_local const size_t slot =
-            next.fetch_add(1, std::memory_order_relaxed) % kStatSlots;
-    return slot;
+    return statSlot();
 }
 } // namespace
 
