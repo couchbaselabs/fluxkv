@@ -70,6 +70,22 @@ public:
                      std::string_view key,
                      const std::function<void(const CachedDoc&)>& fn) = 0;
 
+    // Copy-out variant of Get for the hot path. Get()'s callback is a
+    // std::function through this interface - an indirect call that cannot be
+    // inlined, and measured at ~30% of server CPU at high GET rates. Copying
+    // the value into a caller-supplied buffer is cheaper for small values.
+    //
+    // Returns Miss, Tombstone (key deleted; `out` metadata is valid, no
+    // value), or Hit with the value length written to *valueLen. A value
+    // larger than bufCap reports TooLarge and the caller falls back to Get().
+    enum class GetResult { Miss, Hit, Tombstone, TooLarge };
+    virtual GetResult GetCopy(uint16_t vbid,
+                              std::string_view key,
+                              CachedDoc* out,
+                              void* buf,
+                              size_t bufCap,
+                              size_t* valueLen) = 0;
+
     // Write-through insert; see the contract above.
     virtual void Put(uint16_t vbid,
                      std::string_view key,

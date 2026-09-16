@@ -34,6 +34,12 @@ public:
     bool Get(uint16_t vbid,
              std::string_view key,
              const std::function<void(const CachedDoc&)>& fn) override;
+    GetResult GetCopy(uint16_t vbid,
+                      std::string_view key,
+                      CachedDoc* out,
+                      void* buf,
+                      size_t bufCap,
+                      size_t* valueLen) override;
     void Put(uint16_t vbid,
              std::string_view key,
              std::string_view value,
