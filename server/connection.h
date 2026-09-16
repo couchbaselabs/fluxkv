@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine.h"
+#include "iothread.h"
 #include "protocol.h"
 
 #include <folly/io/IOBufQueue.h>
@@ -24,11 +25,21 @@ public:
                const std::string& errorMap);
     ~Connection();
 
-    void start();
+    void start(IOThread* owner);
 
     // Called from engine threads via evb->runInEventBaseThread
     void sendWriteResponse(Request* req);
     void sendGetResponse(Request* req);
+
+    // Move this connection to another loop. Called on the owning loop thread.
+    // Reading stops at once; once every request in flight has been answered
+    // and every write has completed, the socket is detached and re-attached
+    // on the target, where reading resumes with whatever was already
+    // buffered. Responses to requests in flight are still posted to the old
+    // loop, which is why the connection waits for them before leaving.
+    // Returns false if the connection is closing or already migrating, in
+    // which case the caller's reservation on the target is not consumed.
+    bool migrateTo(IOThread* target);
 
 private:
     // folly::AsyncSocket::ReadCallback
@@ -41,6 +52,9 @@ private:
     void writeSuccess() noexcept override {
         if (!inflightBufs_.empty()) {
             inflightBufs_.pop_front();
+        }
+        if (migrating_ && inflightBufs_.empty()) {
+            scheduleMigrateCheck();
         }
     }
     void writeErr(size_t bytesWritten,
@@ -69,12 +83,23 @@ private:
     void sendUnknownCommand(const McbpHeader& hdr);
     void destroy();
 
+    // Migration steps; see migrateTo.
+    void scheduleMigrateCheck();
+    void tryFinishMigrate();
+    void finishAttach(IOThread* target);
+    // Called when the last request in flight has been answered.
+    void onDrained();
+
     folly::AsyncSocket::UniquePtr socket_;
     folly::IOBufQueue readBuf_{folly::IOBufQueue::cacheChainLength()};
     Bucket* bucket_;
     const std::string& clusterConfig_;
     const std::string& errorMap_;
+    IOThread* owner_{nullptr};
+    IOThread* migrateTarget_{nullptr};
     bool closing_{false};
+    bool migrating_{false};
+    bool migrateCheckPending_{false};
     std::atomic<int> outstandingRequests_{0};
 
     // SCRAM auth state

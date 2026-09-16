@@ -134,8 +134,12 @@ void Connection::releaseRequest(Request* req) {
     }
 }
 
-void Connection::start() {
+void Connection::start(IOThread* owner) {
     gDispStats.connectAccept.fetch_add(1, std::memory_order_relaxed);
+    owner_ = owner;
+    if (owner_) {
+        owner_->Add(this);
+    }
     socket_->setReadCB(this);
 }
 
@@ -149,12 +153,124 @@ void Connection::destroy() {
         flushCb_.cancelLoopCallback();
     }
     flushScheduled_ = false;
+    if (owner_) {
+        owner_->Remove(this);
+        owner_ = nullptr;
+    }
     socket_->setReadCB(nullptr);
     socket_->close();
     // Defer delete to next event loop iteration to avoid use-after-free
     // when destroy() is called from within a read/write callback.
-    if (outstandingRequests_.load() == 0) {
+    if (outstandingRequests_.load() == 0 && evb) {
         evb->runInEventBaseThread([this]() { delete this; });
+    }
+}
+
+// ---- Migration between IO threads ----
+
+bool Connection::migrateTo(IOThread* target) {
+    if (closing_ || migrating_ || target == nullptr || target == owner_) {
+        return false;
+    }
+    migrating_ = true;
+    migrateTarget_ = target;
+    // No new requests from here on; the ones in flight drain first.
+    socket_->setReadCB(nullptr);
+    scheduleMigrateCheck();
+    return true;
+}
+
+// The checks run as their own loop callback, never from inside a socket
+// callback: detaching the socket from within its own write completion would
+// pull the EventBase out from under AsyncSocket mid-call.
+void Connection::scheduleMigrateCheck() {
+    if (migrateCheckPending_ || !migrating_) {
+        return;
+    }
+    auto* evb = socket_->getEventBase();
+    if (!evb) {
+        return;
+    }
+    migrateCheckPending_ = true;
+    evb->runInEventBaseThread([this]() {
+        migrateCheckPending_ = false;
+        tryFinishMigrate();
+    });
+}
+
+void Connection::tryFinishMigrate() {
+    if (!migrating_) {
+        return;
+    }
+    if (closing_) {
+        migrating_ = false;
+        if (migrateTarget_) {
+            migrateTarget_->Unreserve();
+            migrateTarget_ = nullptr;
+        }
+        return;
+    }
+    if (outstandingRequests_.load(std::memory_order_acquire) != 0) {
+        return; // onDrained() schedules the next check
+    }
+    if (!pendingWriteBuf_.empty()) {
+        if (flushTimeout_ && flushTimeout_->isScheduled()) {
+            flushTimeout_->cancelTimeout();
+        }
+        if (flushCb_.isLoopCallbackScheduled()) {
+            flushCb_.cancelLoopCallback();
+        }
+        flushScheduled_ = false;
+        // writeSuccess() schedules the next check, whether it fires inside
+        // this write() or later. Never detach in the same call as a write.
+        flushPending();
+        return;
+    }
+    if (!inflightBufs_.empty()) {
+        return;
+    }
+    // Quiescent: nothing in flight in either direction.
+    if (flushCb_.isLoopCallbackScheduled()) {
+        flushCb_.cancelLoopCallback();
+    }
+    flushScheduled_ = false;
+    flushTimeout_.reset(); // bound to the old loop; recreated lazily
+    if (owner_) {
+        owner_->Remove(this);
+        owner_ = nullptr;
+    }
+    IOThread* target = migrateTarget_;
+    migrateTarget_ = nullptr;
+    socket_->detachEventBase();
+    target->evb->runInEventBaseThread([this, target]() { finishAttach(target); });
+}
+
+void Connection::finishAttach(IOThread* target) {
+    socket_->attachEventBase(target->evb.get());
+    owner_ = target;
+    owner_->Add(this);
+    migrating_ = false;
+    socket_->setReadCB(this);
+    // Requests that arrived before reading stopped may still be buffered
+    // and the client may be waiting on them.
+    while (!closing_ && parseAndDispatch()) {
+    }
+    if (flushDelayUs() > 0) {
+        if (!pendingWriteBuf_.empty()) {
+            scheduleFlush();
+        }
+    } else {
+        flushPending();
+    }
+}
+
+void Connection::onDrained() {
+    if (closing_) {
+        delete this;
+        return;
+    }
+    if (migrating_) {
+        scheduleMigrateCheck();
     }
 }
 
@@ -902,9 +1018,8 @@ void Connection::sendWriteResponse(Request* req) {
         scheduleFlush();
     }
     releaseRequest(req);
-    if (outstandingRequests_.fetch_sub(1, std::memory_order_acq_rel) == 1 &&
-        closing_) {
-        delete this;
+    if (outstandingRequests_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        onDrained();
     }
 }
 
@@ -931,9 +1046,8 @@ void Connection::sendGetResponse(Request* req) {
         scheduleFlush();
     }
     releaseRequest(req);
-    if (outstandingRequests_.fetch_sub(1, std::memory_order_acq_rel) == 1 &&
-        closing_) {
-        delete this;
+    if (outstandingRequests_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        onDrained();
     }
 }
 
