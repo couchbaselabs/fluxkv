@@ -302,6 +302,46 @@ The 50.7% is worth a caveat: 8 GiB holds 30% of the keyspace, and a uniform
 client would hit about that often. echobench2's key selection is evidently
 not uniform, so a real skewed generator is needed for the second workload.
 
+### Small values: 79M GET/s on loopback
+
+With 8-byte values the protocol is the payload - an mcbp GET is a 32-byte
+request and a 36-byte response - so this measures the request path, not the
+store. Dataset is 25M x 8B, 8-byte keys, entirely in the document cache.
+`small_value_bench.sh` runs one point; sweep it over io-threads and sessions.
+
+Client on a second machine over 10 GbE:
+
+| io-threads | sessions | batch | Throughput | CPU | us/op | NIC |
+|---|---|---|---|---|---|---|
+| 16 | 128 | 64 | 25,734,224 | 13.6 | 0.53 | tx 8.24 Gbit/s |
+| 32 | 256 | 64 | **31,335,655** | 24.9 | 0.80 | tx 10.16 Gbit/s |
+| 48 | 256 | 64 | 31,307,206 | 25.4 | 0.81 | tx 10.15 Gbit/s |
+
+**The link, not the server.** Three configurations land within 0.1% of each
+other with tx pinned at 10.15-10.16 Gbit/s. A 36-byte response caps mcbp at
+about 32.6M ops/s on a 10 GbE link, and at 31.3M we are touching it. Note the
+binding direction is transmit: the response is larger than the request.
+
+Client on the server itself, loopback, same binary:
+
+| io-threads | sessions | pipeline | Throughput | CPU | us/op | ops/core |
+|---|---|---|---|---|---|---|
+| 16 | 128 | 256 | 29,359,002 | 15.8 | **0.54** | 1.86M |
+| 32 | 256 | 512 | 49,815,021 | 32.0 | 0.64 | 1.56M |
+| 64 | 192 | 512 | **79,143,698** | 59.8 | 0.76 | 1.32M |
+
+Loopback removes the NIC and the same server does 2.5x more. It also puts the
+client on the same 80 cores, so read the server's own CPU, not box load.
+
+**Per-op cost rises with thread count**, 0.54us at 16 IO threads to 0.76us at
+64. That is contention, not work: the remaining per-lookup costs are the
+cache shard's SharedMutex (two atomic RMWs, and readers of the same shard
+share the line) and the memcmp that ends every F14 lookup. A lock-free read
+path is what would flatten this.
+
+Pipeline depth matters more than batch: at 192 sessions, depth 256 gives
+44.1M and depth 512 gives 78.6M. Depth 1024 adds nothing.
+
 ## Reading the numbers
 
 **Check the errors before believing the rate.** A GET for a key that was
