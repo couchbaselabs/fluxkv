@@ -15,7 +15,11 @@ SERVER_BIN=${1:?usage: smoke_test.sh <server-binary> <client-binary>}
 CLIENT_BIN=${2:?usage: smoke_test.sh <server-binary> <client-binary>}
 
 PORT=${FLUXKV_TEST_PORT:-12399}
+STATS_PORT=${FLUXKV_TEST_STATS_PORT:-12398}
 VBUCKETS=64
+# Non-zero runs the same test through the document cache and additionally
+# requires the read pass to have been served from it.
+CACHE_SIZE=${FLUXKV_TEST_CACHE_SIZE:-0}
 
 # The load here is deliberately light: one connection, one request in flight.
 # This is a correctness check, not a benchmark. Heavy concurrent writes make
@@ -49,6 +53,8 @@ echo "# data dir: ${DATA_DIR}"
     --writers 4 \
     --io-threads 4 \
     --mem-quota 268435456 \
+    --stats-port "${STATS_PORT}" \
+    --cache-size "${CACHE_SIZE}" \
     > "${LOG}" 2>&1 &
 SERVER_PID=$!
 
@@ -115,5 +121,30 @@ check "set" "${set_out}"
 
 get_out=$(run_phase get)
 check "get" "${get_out}"
+
+if (( CACHE_SIZE > 0 )); then
+    # Every key was written through the cache and the cache is larger than
+    # the dataset, so the read pass must have been answered entirely from it.
+    stats=$(curl -s --max-time 5 "http://127.0.0.1:${STATS_PORT}/stats/dispatcher")
+    hits=$(sed -n 's/.*"cache_hits": \([0-9]*\).*/\1/p' <<<"${stats}" | head -1)
+    misses=$(sed -n 's/.*"cache_misses": \([0-9]*\).*/\1/p' <<<"${stats}" | head -1)
+    pending=$(sed -n 's/.*"cache_pending_items": \([0-9]*\).*/\1/p' <<<"${stats}" | head -1)
+    if [[ -z "${hits}" || "${hits}" == 0 ]]; then
+        echo "FAIL: cache: no hits recorded" >&2
+        echo "${stats}" >&2
+        exit 1
+    fi
+    if [[ "${misses}" != 0 ]]; then
+        echo "FAIL: cache: ${misses} misses on a fully cached dataset" >&2
+        echo "${stats}" >&2
+        exit 1
+    fi
+    if [[ "${pending}" != 0 ]]; then
+        echo "FAIL: cache: ${pending} items still pinned after writes drained" >&2
+        echo "${stats}" >&2
+        exit 1
+    fi
+    echo "# cache: hits=${hits} misses=${misses} pending=${pending}"
+fi
 
 echo "PASS"

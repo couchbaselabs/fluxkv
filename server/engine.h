@@ -1,6 +1,7 @@
 #pragma once
 
 #include "include/libmagma/magma.h"
+#include "cache/doccache.h"
 #include "metadata.h"
 #include "protocol.h"
 
@@ -48,6 +49,9 @@ struct DispatcherStats {
 
 // Global singleton
 extern DispatcherStats gDispStats;
+// The bucket's document cache, or null. Published by Bucket::SetCache so the
+// stats endpoint can report it alongside the dispatcher counters.
+extern DocCache* gDocCache;
 // Runtime read-batch cap (set from main via --max-read-batch).
 extern size_t gMaxReadBatch;
 // Master switch for per-op hot-path stat increments. At 1 M ops/s the cache-
@@ -320,6 +324,16 @@ public:
     }
     std::string GetStatsJson();
 
+    // Document cache in front of magma (--cache-size). Null when disabled.
+    // Set before Open(); the IO threads read it without synchronisation.
+    void SetCache(std::unique_ptr<DocCache> cache) {
+        cache_ = std::move(cache);
+        gDocCache = cache_.get();
+    }
+    DocCache* GetCache() {
+        return cache_.get();
+    }
+
     // Trigger full compaction of every kvstore (all shards × all vbuckets).
     // Synchronous — returns when every compaction finishes.
     void CompactAll();
@@ -336,6 +350,7 @@ private:
     size_t writeQueueMemLimit_;
     size_t echoGetSize_;
     std::string echoGetValue_;
+    std::unique_ptr<DocCache> cache_;
     std::vector<std::unique_ptr<Shard>> shards_;
     // Per-shard pools live inside each Shard now (sharded). Bucket holds
     // no global pools — EnqueueRead/EnqueueWrite route to the shard's own.

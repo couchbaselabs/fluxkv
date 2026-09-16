@@ -85,6 +85,10 @@ struct Config {
     // KeyTreeBlockSize stays at magma's 4096 default: shrinking it too adds
     // key-index reads (IO/GET 1.13 -> 1.35) and cost 7-11% throughput.
     size_t dataBlockSize = 0; // 0 = magma default (4096) -> SeqTreeBlockSize
+    // Document cache in front of magma (server/cache). 0 = disabled.
+    size_t cacheSize = 0;
+    size_t cacheShards = 256;
+    std::string cachePolicy = "s3fifo";
 };
 
 static void printUsage(const char* prog) {
@@ -124,6 +128,11 @@ static void printUsage(const char* prog) {
                  "(data/compacted follow --no-compression)\n"
               << "  --no-value-ptr-read   disable magma's value-pointer "
                  "fast path (forces a full seqIndex lookup per GET)\n"
+              << "  --cache-size N        document cache budget in bytes "
+                 "(default 0 = off); write-through, read-fill\n"
+              << "  --cache-shards N      lock shards in the cache (default "
+                 "256)\n"
+              << "  --cache-policy NAME   eviction policy: s3fifo (default)\n"
               << "  --help            Show this help\n";
 }
 
@@ -161,6 +170,9 @@ static Config parseArgs(int argc, char* argv[]) {
             {"no-value-ptr-read", no_argument, nullptr, 1013},
             {"data-block-size", required_argument, nullptr, 1008},
             {"dispatch-batch", required_argument, nullptr, 1018},
+            {"cache-size", required_argument, nullptr, 1020},
+            {"cache-shards", required_argument, nullptr, 1021},
+            {"cache-policy", required_argument, nullptr, 1022},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
 
@@ -260,6 +272,15 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1018:
             magma::kvserver::gDispatchBatch = strtoull(optarg, nullptr, 10);
+            break;
+        case 1020:
+            cfg.cacheSize = strtoull(optarg, nullptr, 10);
+            break;
+        case 1021:
+            cfg.cacheShards = strtoull(optarg, nullptr, 10);
+            break;
+        case 1022:
+            cfg.cachePolicy = optarg;
             break;
         case 'h':
         default:
@@ -429,6 +450,20 @@ int main(int argc, char* argv[]) {
                  cfg.echoGetSize > 0
                          ? fmt::format(" echo-get={}B", cfg.echoGetSize)
                          : "");
+    if (cfg.cacheSize > 0) {
+        std::string err;
+        auto cache = CreateDocCache(
+                cfg.cachePolicy, cfg.cacheSize, cfg.cacheShards, &err);
+        if (!cache) {
+            spdlog::error("{}", err);
+            return 1;
+        }
+        spdlog::info("  cache: policy={} size={}MB shards={}",
+                     cache->Policy(),
+                     cfg.cacheSize / (1024 * 1024),
+                     cfg.cacheShards);
+        bucket.SetCache(std::move(cache));
+    }
     auto status = bucket.Open();
     if (!status.IsOK()) {
         spdlog::error("Failed to open bucket: {}", status.String());

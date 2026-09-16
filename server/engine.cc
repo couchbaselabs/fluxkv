@@ -14,6 +14,7 @@ namespace magma {
 namespace kvserver {
 
 DispatcherStats gDispStats;
+DocCache* gDocCache = nullptr;
 // Runtime-tunable read-batch cap (--max-read-batch). 128 matches the
 // libaio + IOQueueDepth=16 sweet spot; lower (8-16) is better for sync
 // QD=1 multi-thread parallelism.
@@ -56,6 +57,24 @@ std::string DispatcherStats::toJson() const {
                                 cmdDelete.load() - cmdSetResp.load() -
                                 cmdGetResp.load() - cmdSetRespErr.load() -
                                 cmdGetRespMiss.load();
+    if (gDocCache) {
+        auto c = gDocCache->GetStats();
+        j["cache_hits"] = c.hits;
+        j["cache_misses"] = c.misses;
+        j["cache_tombstone_hits"] = c.tombstoneHits;
+        j["cache_puts"] = c.puts;
+        j["cache_fills"] = c.fills;
+        j["cache_fills_rejected"] = c.fillsRejected;
+        j["cache_evictions"] = c.evictions;
+        j["cache_ghost_hits"] = c.ghostHits;
+        j["cache_bytes"] = c.bytes;
+        j["cache_max_bytes"] = c.maxBytes;
+        j["cache_items"] = c.items;
+        j["cache_pending_items"] = c.pendingItems;
+        uint64_t lookups = c.hits + c.misses + c.tombstoneHits;
+        j["cache_hit_ratio"] =
+                lookups ? (double)(c.hits + c.tombstoneHits) / lookups : 0.0;
+    }
     return j.dump(2);
 }
 
@@ -284,6 +303,19 @@ void WriterPool::executePersist(PersistTask& task) {
 
     auto status = shard->GetMagma()->WriteDocs(task.vbid, ops);
 
+    // Release the cache pins these writes took in handleSet/handleDelete.
+    // Done whether or not WriteDocs succeeded: a failed write is reported to
+    // the client (durable) or already lost (async), and keeping the entry
+    // pinned would only leak cache budget.
+    if (auto* cache = bucket_->GetCache()) {
+        for (auto* req : batch) {
+            cache->MarkPersisted(
+                    task.vbid,
+                    std::string_view(req->key.Data(), req->key.Len()),
+                    status.IsOK() ? req->resultSeqno : 0);
+        }
+    }
+
     // Subtract queued bytes
     size_t batchBytes = 0;
     for (auto* req : batch) {
@@ -322,6 +354,27 @@ void WriterPool::executePersist(PersistTask& task) {
 }
 
 // ---- ReaderPool ----
+
+namespace {
+// Read-miss fill. PutIfAbsent, never Put: a key with a queued write is pinned
+// in the cache, so a fill can only land for keys whose disk version is
+// current (see kvcache.h).
+inline void fillCache(Bucket* bucket,
+                      uint16_t vbid,
+                      const Request* req,
+                      const DocMeta& dm,
+                      const Slice& value) {
+    if (auto* cache = bucket->GetCache()) {
+        cache->PutIfAbsent(vbid,
+                           std::string_view(req->key.Data(), req->key.Len()),
+                           std::string_view(value.Data(), value.Len()),
+                           dm.seqno,
+                           dm.flags,
+                           dm.expiry,
+                           dm.datatype);
+    }
+}
+} // namespace
 
 ReaderPool::ReaderPool(size_t numThreads, size_t queueSize, Bucket* bucket)
     : taskQueue_(queueSize), bucket_(bucket) {
@@ -445,6 +498,7 @@ void ReaderPool::executeRead(ReadTask& task) {
                         reinterpret_cast<const uint8_t*>(value.Data()) +
                                 value.Len());
             }
+            fillCache(bucket_, task.vbid, req, dm, value);
             hotStatAdd(gDispStats.cmdGetResp);
         } else {
             // OkDocNotFound is treated as a miss — sendGetResponse needs
@@ -468,7 +522,7 @@ void ReaderPool::executeRead(ReadTask& task) {
         shard->GetMagma()->GetDocs(
                 task.vbid,
                 getOps,
-                [&accum](Status s,
+                [&accum, this, &task](Status s,
                    const Magma::GetOperation& op,
                    const Slice& meta,
                    const Slice& value) {
@@ -486,6 +540,8 @@ void ReaderPool::executeRead(ReadTask& task) {
                                             value.Data()) +
                                             value.Len());
                         }
+                        req->resultDatatype = dm.datatype;
+                        fillCache(bucket_, task.vbid, req, dm, value);
                         hotStatAdd(gDispStats.cmdGetResp);
                     } else {
                         // OkDocNotFound (legitimate miss) or other error.

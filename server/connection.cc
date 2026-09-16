@@ -635,12 +635,37 @@ void Connection::handleSet(McbpHeader& hdr,
                            hdr.bodyLen - hdr.extrasLen - hdr.keyLen);
     }
 
+    // Write-through: cache before queueing so the entry is pinned by the time
+    // any reader could fill over it (see cache/doccache.h).
+    auto* cache = bucket_->GetCache();
+    if (cache) {
+        cache->Put(req->vbucket,
+                   std::string_view(req->key.Data(), req->key.Len()),
+                   std::string_view(req->value.Data(), req->value.Len()),
+                   req->flags,
+                   req->expiry,
+                   req->datatype,
+                   false);
+    }
+
     if (bucket_->IsDurable()) {
         // Durable: track outstanding, wait for WriteDocs completion
         outstandingRequests_.fetch_add(1, std::memory_order_relaxed);
         req->conn = this;
         req->evb = socket_->getEventBase();
-        bucket_->EnqueueWrite(req);
+        if (!bucket_->EnqueueWrite(req)) {
+            // Refused: answer now and undo the cache entry, which would
+            // otherwise stay pinned forever waiting for a MarkPersisted that
+            // never comes.
+            gDispStats.tmpFails.fetch_add(1, std::memory_order_relaxed);
+            if (cache) {
+                cache->Erase(req->vbucket,
+                             std::string_view(req->key.Data(),
+                                              req->key.Len()));
+            }
+            req->resultStatus = Status(Status::Code::Internal, "tmpfail");
+            sendWriteResponse(req);
+        }
     } else {
         // Async: enqueue and respond immediately. Append into pendingWriteBuf_
         // so the response is coalesced with any others produced in this
@@ -658,6 +683,12 @@ void Connection::handleSet(McbpHeader& hdr,
                                 McbpStatus::TmpFail,
                                 hdr.opaque,
                                 0);
+            if (cache) {
+                // The store will never see this write; do not serve it.
+                cache->Erase(req->vbucket,
+                             std::string_view(req->key.Data(),
+                                              req->key.Len()));
+            }
             releaseRequest(req);
         }
     }
@@ -680,11 +711,33 @@ void Connection::handleDelete(McbpHeader& hdr,
         req->key = Slice(p + hdr.extrasLen, hdr.keyLen);
     }
 
+    // Write-through tombstone: a GET after this answers KeyNotFound from the
+    // cache and cannot be filled with the pre-delete value from disk.
+    auto* cache = bucket_->GetCache();
+    if (cache) {
+        cache->Put(req->vbucket,
+                   std::string_view(req->key.Data(), req->key.Len()),
+                   std::string_view(),
+                   0,
+                   0,
+                   0,
+                   true);
+    }
+
     if (bucket_->IsDurable()) {
         outstandingRequests_.fetch_add(1, std::memory_order_relaxed);
         req->conn = this;
         req->evb = socket_->getEventBase();
-        bucket_->EnqueueWrite(req);
+        if (!bucket_->EnqueueWrite(req)) {
+            gDispStats.tmpFails.fetch_add(1, std::memory_order_relaxed);
+            if (cache) {
+                cache->Erase(req->vbucket,
+                             std::string_view(req->key.Data(),
+                                              req->key.Len()));
+            }
+            req->resultStatus = Status(Status::Code::Internal, "tmpfail");
+            sendWriteResponse(req);
+        }
     } else {
         if (bucket_->EnqueueWrite(req)) {
             appendEmptyResponse(pendingWriteBuf_,
@@ -693,11 +746,17 @@ void Connection::handleDelete(McbpHeader& hdr,
                                 hdr.opaque,
                                 0);
         } else {
+            gDispStats.tmpFails.fetch_add(1, std::memory_order_relaxed);
             appendEmptyResponse(pendingWriteBuf_,
                                 hdr.opcode,
                                 McbpStatus::TmpFail,
                                 hdr.opaque,
                                 0);
+            if (cache) {
+                cache->Erase(req->vbucket,
+                             std::string_view(req->key.Data(),
+                                              req->key.Len()));
+            }
             releaseRequest(req);
         }
     }
@@ -720,6 +779,36 @@ void Connection::handleGet(McbpHeader& hdr,
         // opaque is not byte-swapped by ntoh/hton — copy as-is
         memcpy(pendingWriteBuf_.data() + off + kOpaqueOffset, &hdr.opaque, 4);
         return;
+    }
+
+    // Cache hit: answered right here on the IO thread. No Request, no reader
+    // hop, no wakeup - the value is copied once, from the cache entry into
+    // the coalesced write buffer, under the cache's shared lock.
+    if (auto* cache = bucket_->GetCache(); cache && body) {
+        body->coalesce();
+        const char* p = reinterpret_cast<const char*>(body->data());
+        std::string_view key(p + hdr.extrasLen, hdr.keyLen);
+        bool hit = cache->Get(hdr.specific, key, [&](const CachedDoc& doc) {
+            if (doc.deleted) {
+                appendEmptyResponse(pendingWriteBuf_,
+                                    hdr.opcode,
+                                    McbpStatus::KeyNotFound,
+                                    hdr.opaque);
+                hotStatAdd(gDispStats.cmdGetRespMiss);
+            } else {
+                appendGetResponse(pendingWriteBuf_,
+                                  hdr.opaque,
+                                  doc.seqno,
+                                  doc.flags,
+                                  doc.value.data(),
+                                  doc.value.size(),
+                                  doc.datatype);
+                hotStatAdd(gDispStats.cmdGetResp);
+            }
+        });
+        if (hit) {
+            return;
+        }
     }
 
     outstandingRequests_.fetch_add(1, std::memory_order_relaxed);
