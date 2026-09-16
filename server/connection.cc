@@ -45,6 +45,10 @@ Connection::Connection(folly::AsyncSocket::UniquePtr socket,
     // milliseconds at moderate concurrency. Critical for low-latency.
     socket_->setNoDelay(true);
 
+    // Refilled every loop iteration and never exceeds one flush, so reserve
+    // that up front instead of reallocating on the hot path.
+    pendingWriteBuf_.reserve(64 * 1024);
+
     // SO_BUSY_POLL: kernel busy-polls the socket for arriving data instead
     // of going through the softirq scheduler when packets land in the NIC
     // ring. Eliminates a major source of p99 wake-up jitter at moderate
@@ -301,6 +305,56 @@ bool Connection::parseAndDispatch() {
         readBuf_.trimStart(totalLen);
         handleGet(hdr, nullptr);
         return true;
+    }
+
+    // Fast path: a cached GET sitting contiguously in the front buffer is
+    // answered with no allocation. The generic path below splits an IOBuf per
+    // request just to read the key, which dominates at high GET rates.
+    // Pipelined reads make the contiguous case the common one.
+    if (op == Opcode::Get) {
+        if (auto* cache = bucket_->GetCache()) {
+            const folly::IOBuf* front = readBuf_.front();
+            if (front != nullptr && front->length() >= totalLen) {
+                const char* p = reinterpret_cast<const char*>(front->data());
+                std::string_view key(p + kHeaderSize + hdr.extrasLen,
+                                     hdr.keyLen);
+                CachedDoc doc;
+                size_t valueLen = 0;
+                const auto res = cache->GetCopy(hdr.specific,
+                                                key,
+                                                &doc,
+                                                valueScratch_,
+                                                sizeof(valueScratch_),
+                                                &valueLen);
+                if (res == DocCache::GetResult::Hit) {
+                    hotStatAdd(gDispStats.cmdGet);
+                    hotStatAdd(gDispStats.cmdGetResp);
+                    appendGetResponse(pendingWriteBuf_,
+                                      hdr.opaque,
+                                      doc.seqno,
+                                      doc.flags,
+                                      valueScratch_,
+                                      valueLen,
+                                      doc.datatype);
+                    readBuf_.trimStart(totalLen);
+                    scheduleFlush();
+                    return true;
+                }
+                if (res == DocCache::GetResult::Tombstone) {
+                    hotStatAdd(gDispStats.cmdGet);
+                    hotStatAdd(gDispStats.cmdGetRespMiss);
+                    appendEmptyResponse(pendingWriteBuf_,
+                                        hdr.opcode,
+                                        McbpStatus::KeyNotFound,
+                                        hdr.opaque);
+                    readBuf_.trimStart(totalLen);
+                    scheduleFlush();
+                    return true;
+                }
+                // Miss, or a value too large for the scratch buffer: fall
+                // through to the generic path.
+            }
+        }
     }
 
     // Consume header

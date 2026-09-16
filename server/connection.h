@@ -92,6 +92,9 @@ private:
     // emits one socket_->write per readDataAvailable wakeup or per LoopCallback
     // (engine-thread responses). Converts N tiny sendmsg syscalls into 1.
     std::vector<uint8_t> pendingWriteBuf_;
+    // Cache fast path copies the value here under the cache lock; larger
+    // values take the generic path.
+    uint8_t valueScratch_[4096];
     // In-flight send buffers awaiting writeSuccess. AsyncSocket::write() does
     // not own the data; we keep it alive here until the callback fires.
     std::list<std::vector<uint8_t>> inflightBufs_;
