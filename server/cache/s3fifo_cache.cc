@@ -25,6 +25,27 @@ constexpr size_t kMapSlotOverhead = 24;
 constexpr size_t kSmallPercent = 10;
 constexpr uint8_t kMaxFreq = 3;
 enum Queue : uint8_t { kSmall = 0, kMain = 1 };
+
+// Read-path counters, one cache-line-aligned slot per thread. A single atomic
+// per shard is still a contended RMW on every lookup; giving each thread its
+// own slot keeps the line local. GetStats sums them.
+constexpr size_t kStatSlots = 64;
+
+struct alignas(64) ReadStatSlot {
+    std::atomic<uint64_t> hits{0};
+    std::atomic<uint64_t> misses{0};
+    std::atomic<uint64_t> tombstoneHits{0};
+    std::atomic<uint64_t> fillsRejected{0};
+};
+
+ReadStatSlot gReadStats[kStatSlots];
+
+inline size_t readStatSlot() {
+    static std::atomic<size_t> next{0};
+    thread_local const size_t slot =
+            next.fetch_add(1, std::memory_order_relaxed) % kStatSlots;
+    return slot;
+}
 } // namespace
 
 // One allocation holds the header, the map key (vbid || key) and the value.
@@ -328,7 +349,7 @@ bool S3FifoCache::Get(uint16_t vbid,
     std::shared_lock lock(s.mu);
     auto it = s.map.find(mk.view);
     if (it == s.map.end()) {
-        s.misses.fetch_add(1, std::memory_order_relaxed);
+        gReadStats[readStatSlot()].misses.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     Entry* e = it->second;
@@ -346,12 +367,53 @@ bool S3FifoCache::Get(uint16_t vbid,
     doc.deleted = e->deleted != 0;
     doc.value = e->value();
     if (doc.deleted) {
-        s.tombstoneHits.fetch_add(1, std::memory_order_relaxed);
+        gReadStats[readStatSlot()].tombstoneHits.fetch_add(1, std::memory_order_relaxed);
     } else {
-        s.hits.fetch_add(1, std::memory_order_relaxed);
+        gReadStats[readStatSlot()].hits.fetch_add(1, std::memory_order_relaxed);
     }
     fn(doc);
     return true;
+}
+
+DocCache::GetResult S3FifoCache::GetCopy(uint16_t vbid,
+                                         std::string_view key,
+                                         CachedDoc* out,
+                                         void* buf,
+                                         size_t bufCap,
+                                         size_t* valueLen) {
+    const uint64_t h = hashKey(vbid, key);
+    auto& s = shardFor(h);
+    MapKeyBuf mk(vbid, key);
+
+    std::shared_lock lock(s.mu);
+    auto it = s.map.find(mk.view);
+    if (it == s.map.end()) {
+        gReadStats[readStatSlot()].misses.fetch_add(1, std::memory_order_relaxed);
+        return GetResult::Miss;
+    }
+    Entry* e = it->second;
+    const uint8_t f = e->freq.load(std::memory_order_relaxed);
+    if (f < kMaxFreq) {
+        e->freq.store(f + 1, std::memory_order_relaxed);
+    }
+    out->seqno = e->seqno.load(std::memory_order_relaxed);
+    out->flags = e->flags;
+    out->expiry = e->expiry;
+    out->datatype = e->datatype;
+    out->deleted = e->deleted != 0;
+    if (out->deleted) {
+        gReadStats[readStatSlot()].tombstoneHits.fetch_add(1, std::memory_order_relaxed);
+        *valueLen = 0;
+        return GetResult::Tombstone;
+    }
+    if (e->valLen > bufCap) {
+        // Caller's buffer is too small; it must fall back to Get().
+        return GetResult::TooLarge;
+    }
+    std::memcpy(buf, e->value().data(), e->valLen);
+    *valueLen = e->valLen;
+    gReadStats[readStatSlot()].hits.fetch_add(1, std::memory_order_relaxed);
+    return GetResult::Hit;
 }
 
 void S3FifoCache::Put(uint16_t vbid,
@@ -402,7 +464,7 @@ void S3FifoCache::PutIfAbsent(uint16_t vbid,
         // of misses on the same key is that the first fill already landed.
         std::shared_lock lock(s.mu);
         if (s.map.find(mk.view) != s.map.end()) {
-            s.fillsRejected.fetch_add(1, std::memory_order_relaxed);
+            gReadStats[readStatSlot()].fillsRejected.fetch_add(1, std::memory_order_relaxed);
             return;
         }
     }
@@ -410,7 +472,7 @@ void S3FifoCache::PutIfAbsent(uint16_t vbid,
             vbid, key, value, seqno, flags, expiry, datatype, false);
     std::unique_lock lock(s.mu);
     if (s.map.find(e->mapKey()) != s.map.end()) {
-        s.fillsRejected.fetch_add(1, std::memory_order_relaxed);
+        gReadStats[readStatSlot()].fillsRejected.fetch_add(1, std::memory_order_relaxed);
         Entry::destroy(e);
         return;
     }
@@ -466,12 +528,14 @@ void S3FifoCache::Erase(uint16_t vbid, std::string_view key) {
 DocCacheStats S3FifoCache::GetStats() const {
     DocCacheStats st;
     st.maxBytes = maxBytes_;
+    for (const auto& slot : gReadStats) {
+        st.hits += slot.hits.load(std::memory_order_relaxed);
+        st.misses += slot.misses.load(std::memory_order_relaxed);
+        st.tombstoneHits += slot.tombstoneHits.load(std::memory_order_relaxed);
+        st.fillsRejected += slot.fillsRejected.load(std::memory_order_relaxed);
+    }
     for (size_t i = 0; i < numShards_; i++) {
         auto& s = shards_[i];
-        st.hits += s.hits.load(std::memory_order_relaxed);
-        st.misses += s.misses.load(std::memory_order_relaxed);
-        st.tombstoneHits += s.tombstoneHits.load(std::memory_order_relaxed);
-        st.fillsRejected += s.fillsRejected.load(std::memory_order_relaxed);
         st.pendingItems += s.pendingItems.load(std::memory_order_relaxed);
         std::shared_lock lock(s.mu);
         st.puts += s.puts;
