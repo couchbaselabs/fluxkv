@@ -67,6 +67,11 @@ struct TunerConfig {
     // average the measurement over.
     size_t settleWindows{1};
     size_t measureWindows{2};
+    // A step whose expected gain is below minGain is measured over this many
+    // windows instead, since it has to be judged against a smaller margin.
+    size_t smallStepMeasureWindows{4};
+    // Floor on the gain a small step must show.
+    double minSmallGain{0.005};
     // Back-off after a change that did not pay, in windows: starts here and
     // doubles up to the cap while the load looks the same.
     size_t firstBackoffWindows{8};
@@ -127,6 +132,7 @@ private:
         size_t windowsSinceChange{0};
         double trialTputSum{0};
         size_t trialTputN{0};
+        size_t trialMeasure{0}; // windows to average for this trial
         // Set when a grow was reverted: throughput no longer responds to
         // more threads, so fewer may do. Cleared when a grow is kept.
         bool growStalled{false};
@@ -175,6 +181,10 @@ private:
     // below it, so a lighter load does not block shrinking forever.
     double steadyBest_{0};
     size_t steadyLowWindows_{0};
+    // Recent steady-window throughputs; their mean is the baseline a grow
+    // is judged against, which halves the noise of a single window.
+    std::vector<double> steadyRecent_;
+    double steadyBaseline() const;
 };
 
 } // namespace kvserver

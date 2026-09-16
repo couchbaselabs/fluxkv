@@ -106,6 +106,10 @@ void ThreadTuner::decide(double tput) {
     // A window with nothing in flight is a steady reading of the load.
     const bool steady = !anyTrial;
     if (steady) {
+        steadyRecent_.push_back(tput);
+        if (steadyRecent_.size() > 3) {
+            steadyRecent_.erase(steadyRecent_.begin());
+        }
         if (tput > steadyBest_) {
             steadyBest_ = tput;
             steadyLowWindows_ = 0;
@@ -166,7 +170,7 @@ void ThreadTuner::decide(double tput) {
             if (ps.windowsSinceChange > cfg_.settleWindows) {
                 ps.trialTputSum += tput;
                 ps.trialTputN++;
-                if (ps.trialTputN >= std::max<size_t>(1, cfg_.measureWindows)) {
+                if (ps.trialTputN >= std::max<size_t>(1, ps.trialMeasure)) {
                     evaluateTrial(ps, ps.trialTputSum / ps.trialTputN);
                 }
             }
@@ -215,12 +219,17 @@ bool ThreadTuner::startTrial(PoolState& ps, double busyMean) {
         }
         ps.trial = Trial::Grow;
         ps.sizeBefore = size;
-        ps.tputBefore = lastTput_;
+        ps.tputBefore = steadyBaseline();
         ps.busyBefore = busyMean;
         ps.inShrinkRun = false;
         ps.windowsSinceChange = 0;
         ps.trialTputSum = 0;
         ps.trialTputN = 0;
+        // A step too small to show minGain even if it pays in full gets a
+        // longer look.
+        ps.trialMeasure = static_cast<double>(n) / size < cfg_.minGain
+                                  ? cfg_.smallStepMeasureWindows
+                                  : cfg_.measureWindows;
         ps.changes++;
         ps.lastAction = "grow " + std::to_string(size) + "->" +
                         std::to_string(size + n);
@@ -274,6 +283,7 @@ bool ThreadTuner::startTrial(PoolState& ps, double busyMean) {
         ps.windowsSinceChange = 0;
         ps.trialTputSum = 0;
         ps.trialTputN = 0;
+        ps.trialMeasure = cfg_.measureWindows;
         ps.changes++;
         ps.lastAction = "shrink " + std::to_string(size) + "->" +
                         std::to_string(size - n);
@@ -320,12 +330,16 @@ bool ThreadTuner::evaluateTrial(PoolState& ps, double tput) {
 
     if (ps.trial == Trial::Grow) {
         // More threads must have bought throughput, or the limit is elsewhere.
-        // A large step has to pay for itself proportionally: a quarter of the
-        // relative growth is the least a saturated pool should return.
+        // A saturated pool returns at most the relative growth; a large step
+        // has to return at least a quarter of it, a small one (which cannot
+        // reach minGain even in full) at least half.
         const double rel = ps.sizeBefore > 0
                                    ? static_cast<double>(delta) / ps.sizeBefore
                                    : 0;
-        keep = ratio >= 1.0 + std::max(cfg_.minGain, rel / 4);
+        const double need = rel >= cfg_.minGain
+                                    ? std::max(cfg_.minGain, rel / 4)
+                                    : std::max(cfg_.minSmallGain, rel / 2);
+        keep = ratio >= 1.0 + need;
         if (keep) {
             ps.growBackoffBase = 0;
             ps.growCap = 0;
@@ -381,6 +395,17 @@ bool ThreadTuner::evaluateTrial(PoolState& ps, double tput) {
     ps.trial = Trial::None;
     ps.windowsSinceChange = 0;
     return keep;
+}
+
+double ThreadTuner::steadyBaseline() const {
+    if (steadyRecent_.empty()) {
+        return lastTput_;
+    }
+    double s = 0;
+    for (double t : steadyRecent_) {
+        s += t;
+    }
+    return s / steadyRecent_.size();
 }
 
 std::string ThreadTuner::ToJson() const {
