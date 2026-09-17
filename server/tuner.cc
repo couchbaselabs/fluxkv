@@ -102,11 +102,38 @@ double ThreadTuner::recentSteady() const {
     if (steadyRecent_.empty()) {
         return lastTput_;
     }
+    // The last three windows: the load may have moved since older ones.
+    size_t n = std::min<size_t>(3, steadyRecent_.size());
     double s = 0;
-    for (double t : steadyRecent_) {
-        s += t;
+    for (size_t i = steadyRecent_.size() - n; i < steadyRecent_.size(); i++) {
+        s += steadyRecent_[i];
     }
-    return s / steadyRecent_.size();
+    return s / n;
+}
+
+double ThreadTuner::steadyNoise() const {
+    if (steadyRecent_.size() < 3) {
+        return 0;
+    }
+    double mean = 0;
+    for (double t : steadyRecent_) {
+        mean += t;
+    }
+    mean /= steadyRecent_.size();
+    if (mean <= 0) {
+        return 0;
+    }
+    double var = 0;
+    for (double t : steadyRecent_) {
+        var += (t - mean) * (t - mean);
+    }
+    return std::sqrt(var / steadyRecent_.size()) / mean;
+}
+
+double ThreadTuner::tolerance(const PoolState& ps) const {
+    // Averaging `measure` windows divides the noise by sqrt(measure).
+    const double n = ps.measure > 0 ? static_cast<double>(ps.measure) : 1.0;
+    return std::max(cfg_.minGain, ps.noise / std::sqrt(n));
 }
 
 void ThreadTuner::decide(double tput) {
@@ -115,8 +142,17 @@ void ThreadTuner::decide(double tput) {
         steady = steady && ps.trial == Trial::None;
     }
     if (steady) {
-        steadyRecent_.push_back(tput);
-        if (steadyRecent_.size() > 3) {
+        // A window with no load, or a step change in load, is not noise.
+        // Keep the history to windows that describe the current load, or
+        // the ramp from idle would read as 100% variation.
+        if (tput <= 0 ||
+            (!steadyRecent_.empty() && tput < 0.5 * steadyRecent_.back())) {
+            steadyRecent_.clear();
+        }
+        if (tput > 0) {
+            steadyRecent_.push_back(tput);
+        }
+        if (steadyRecent_.size() > 6) {
             steadyRecent_.erase(steadyRecent_.begin());
         }
         if (tput > steadyBest_) {
@@ -159,7 +195,7 @@ void ThreadTuner::decide(double tput) {
     }
     const double a = steadyRecent_[steadyRecent_.size() - 1];
     const double b = steadyRecent_[steadyRecent_.size() - 2];
-    if (a > 0 && std::abs(a - b) / a > cfg_.minGain) {
+    if (a > 0 && std::abs(a - b) / a > std::max(cfg_.minGain, steadyNoise())) {
         return;
     }
 
@@ -256,6 +292,13 @@ bool ThreadTuner::startTrial(PoolState& ps) {
     ps.measure = static_cast<double>(n) / size < 2 * cfg_.minGain
                          ? cfg_.smallStepMeasureWindows
                          : cfg_.measureWindows;
+    // Noisy load: measure longer, up to 8 windows, so the verdict can still
+    // resolve a real change of a few percent.
+    ps.noise = steadyNoise();
+    if (ps.noise > cfg_.minGain) {
+        auto want = static_cast<size_t>(std::ceil(ps.noise / cfg_.minGain));
+        ps.measure = std::min<size_t>(8, std::max(ps.measure, want));
+    }
     ps.tputSum = 0;
     ps.tputN = 0;
     ps.windowsSinceChange = 0;
@@ -264,10 +307,13 @@ bool ThreadTuner::startTrial(PoolState& ps) {
     ps.lastAction = std::string(wantGrow ? "grow " : "shrink ") +
                     std::to_string(size) + "->" +
                     std::to_string(wantGrow ? size + n : size - n);
-    spdlog::info("tuner: {} busy={:.2f} tput={:.0f}/s: {}",
+    spdlog::info("tuner: {} busy={:.2f} tput={:.0f}/s noise={:.1f}% "
+                 "measure={}: {}",
                  pool->Name(),
                  busy,
                  lastTput_,
+                 ps.noise * 100.0,
+                 ps.measure,
                  ps.lastAction);
     if (wantGrow) {
         pool->Grow(n);
@@ -291,23 +337,29 @@ void ThreadTuner::judge(PoolState& ps, double tput) {
     // it by more. A grow that raised it only a little because another pool
     // is the next limit is still right to keep; the other pool's turn comes
     // next window.
+    // Under a noisy load the thresholds widen to what the measurement can
+    // resolve: a grow must beat the noise, a shrink may lose up to it.
+    // Shrinks stay strict: widening their allowance to the noise would let
+    // a series of them each lose a few percent for real.
+    const double tol = tolerance(ps);
     bool keep;
     if (ps.refTput == 0) {
         keep = !grew;
     } else if (grew) {
-        keep = ratio >= 1.0 + cfg_.minGain;
+        keep = ratio >= 1.0 + tol;
     } else {
-        keep = ratio >= 1.0 - cfg_.maxLoss;
+        keep = ratio >= 1.0 - std::max(cfg_.maxLoss, std::min(tol, 0.02));
     }
 
     spdlog::info("tuner: {} {} {} (tput {:.0f} -> {:.0f}/s, {:+.1f}%, "
-                 "busy={:.2f})",
+                 "tol={:.1f}%, busy={:.2f})",
                  pool->Name(),
                  ps.lastAction,
                  keep ? "kept" : "reverted",
                  ps.refTput,
                  tput,
                  (ratio - 1.0) * 100.0,
+                 tol * 100.0,
                  ps.last.busyMean);
     ps.lastAction += keep ? " kept" : " reverted";
 
@@ -364,6 +416,7 @@ std::string ThreadTuner::ToJson() const {
         p["changes"] = ps.changes;
         p["reverts"] = ps.reverts;
         p["grow_backoff"] = ps.grow.backoff;
+        p["noise"] = steadyNoise();
         p["shrink_backoff"] = ps.shrink.backoff;
         if (!ps.last.threadBusy.empty()) {
             p["thread_busy"] = ps.last.threadBusy;

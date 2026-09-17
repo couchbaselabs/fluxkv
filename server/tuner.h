@@ -130,6 +130,7 @@ private:
         double refTput{0};
         double busyBefore{0};
         size_t measure{0};
+        double noise{0}; // steadyNoise() when the trial started
         double tputSum{0};
         size_t tputN{0};
         size_t windowsSinceChange{0};
@@ -149,6 +150,12 @@ private:
     void judge(PoolState& ps, double tput);
     size_t roundToStep(size_t n, size_t step) const;
     double recentSteady() const;
+    // Window-to-window variation of steady throughput (coefficient of
+    // variation over steadyRecent_). Verdict thresholds and measurement
+    // length scale with it: a load whose throughput swings 8% between
+    // windows on its own cannot support a 1% verdict after two windows.
+    double steadyNoise() const;
+    double tolerance(const PoolState& ps) const;
 
     TunerConfig cfg_;
     std::function<uint64_t()> opsCounter_;
