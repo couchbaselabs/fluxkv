@@ -11,9 +11,13 @@ namespace kvserver {
 // Simple fixed-size metadata. No versioning, no leb128, no assertions.
 // Just a plain POD struct that can be memcpy'd to/from a Slice.
 #pragma pack(push, 1)
+// No CAS field: the seqno is what goes on the wire as the document's CAS
+// (see Connection::sendGetResponse), so storing a second 8-byte value per
+// record only inflated every byte magma writes. At 8-byte keys and values
+// that was 8 bytes of a 46-byte record, and flush and compaction cost
+// scale with it.
 struct DocMeta {
     uint64_t seqno{0};
-    uint64_t cas{0};
     uint32_t valueSize{0};
     uint32_t flags{0};
     uint32_t expiry{0};
@@ -49,7 +53,9 @@ inline bool MetaIsTombstone(const Slice& meta) {
 }
 
 inline std::chrono::seconds MetaGetHistoryTimestamp(const Slice& meta) {
-    return std::chrono::seconds(DocMeta::decode(meta).cas);
+    // Only read when magma has document history enabled, which this server
+    // never turns on. The seqno is the only monotonic value in the meta.
+    return std::chrono::seconds(DocMeta::decode(meta).seqno);
 }
 
 } // namespace kvserver
