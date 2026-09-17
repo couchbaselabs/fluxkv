@@ -48,7 +48,8 @@ if(FLUXKV_BUILD_SERVER)
                    server/connection.cc
                    server/protocol.cc
                    server/engine.cc
-                   server/tuner.cc)
+                   server/tuner.cc
+                   server/alloc.cc)
 
     target_include_directories(fluxkv_server PRIVATE
                                "${CMAKE_CURRENT_SOURCE_DIR}/server"

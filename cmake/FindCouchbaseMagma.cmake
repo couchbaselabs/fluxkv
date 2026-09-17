@@ -83,6 +83,7 @@ set(CBMAGMA_INCLUDE_DIRS
     "${_deps}/folly.exploded/include"
     "${_deps}/gflags.exploded/include"
     "${_deps}/glog.exploded/include"
+    "${_deps}/jemalloc.exploded/include"
     "${_deps}/json.exploded/include"
     "${_deps}/libevent.exploded/include"
     "${_deps}/liburing.exploded/include"
