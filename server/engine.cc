@@ -41,14 +41,19 @@ inline uint64_t steadyNowNs() {
 // First 8 key bytes, big-endian, so that ordering by this value orders by
 // key for keys of 8 bytes or fewer.
 inline uint64_t keyPrefix(const Slice& k) {
+    if (k.Len() >= 8) {
+        uint64_t v;
+        std::memcpy(&v, k.Data(), 8);
+        return __builtin_bswap64(v);
+    }
     uint64_t p = 0;
-    const size_t n = std::min<size_t>(8, k.Len());
-    for (size_t j = 0; j < n; j++) {
+    for (size_t j = 0; j < k.Len(); j++) {
         p |= static_cast<uint64_t>(static_cast<uint8_t>(k.Data()[j]))
              << (56 - 8 * j);
     }
     return p;
 }
+
 
 // Fraction of a sample of the batch that repeats an earlier sampled key.
 // Sampling with a stride rather than a prefix keeps it representative of
@@ -472,6 +477,7 @@ void WriterPool::executePersist(PersistTask& task) {
     // Build WriteOperation batch
     std::vector<Magma::WriteOperation> ops;
     ops.reserve(batch.size());
+    size_t batchBytes = 0;
     // DocMeta is packed and written to disk as-is, so the vector's storage
     // is the encoded form: one allocation per batch, not a string per op.
     std::vector<DocMeta> metas(batch.size());
@@ -493,6 +499,7 @@ void WriterPool::executePersist(PersistTask& task) {
         dm.deleted =
                 (req->opcode == static_cast<uint8_t>(Opcode::Delete)) ? 1 : 0;
 
+        batchBytes += req->key.Len() + req->value.Len() + sizeof(Request);
         Slice meta(reinterpret_cast<const char*>(&dm), sizeof(DocMeta));
 
         if (req->opcode == static_cast<uint8_t>(Opcode::Delete)) {
@@ -503,6 +510,8 @@ void WriterPool::executePersist(PersistTask& task) {
         }
     }
 
+    // batchBytes was summed in the loop above; a separate pass over the
+    // batch to add it up was another walk over cold memory.
     hotStatAdd(gDispStats.writeBatches);
     hotStatAdd(gDispStats.writeBatchItems, ops.size());
 
@@ -522,14 +531,14 @@ void WriterPool::executePersist(PersistTask& task) {
         }
     }
 
-    // Dropped duplicates are done too: same outcome as the batch.
-    batch.insert(batch.end(), dropped.begin(), dropped.end());
-
-    // Subtract queued bytes
-    size_t batchBytes = 0;
-    for (auto* req : batch) {
+    // Dropped duplicates are done too: same outcome as the batch. Their
+    // bytes were charged in StageWrite like everyone else's, so they must
+    // be returned here as well.
+    for (auto* req : dropped) {
         batchBytes += req->key.Len() + req->value.Len() + sizeof(Request);
     }
+    batch.insert(batch.end(), dropped.begin(), dropped.end());
+
     bucket_->queuedBytes_.fetch_sub(batchBytes, std::memory_order_relaxed);
 
     if (bucket_->IsDurable()) {
