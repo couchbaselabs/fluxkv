@@ -62,6 +62,9 @@ struct Options {
     // link saturates: at 8-byte values the request IS mostly key and header.
     // 0 keeps the original variable-length keys.
     size_t keylen = 0;
+    // Zipf skew for key selection. 0 = uniform. Higher values concentrate
+    // more of the load on fewer keys.
+    double zipf = 0.0;
 };
 
 // Couchbase vbucket mapping: CRC32 of the key, high bits masked, modulo the
@@ -95,6 +98,69 @@ uint16_t vbucketFor(const std::string& key, uint16_t vbuckets) {
 }
 
 size_t gKeyLen = 0;
+
+// Zipf-distributed key selection over [0, n).
+//
+// Ranks are scrambled through a hash before use, so the hot keys spread
+// across the key space instead of sitting next to each other. Without that,
+// skew would also concentrate on a few vbuckets and a per-vbucket queue
+// would be measured on that rather than on the skew itself.
+class ZipfGen {
+public:
+    ZipfGen() = default;
+    ZipfGen(size_t n, double theta) : n_(n) {
+        zetan_ = zeta(n, theta);
+        const double zeta2 = zeta(2, theta);
+        alpha_ = 1.0 / (1.0 - theta);
+        eta_ = (1 - std::pow(2.0 / static_cast<double>(n), 1 - theta)) /
+               (1 - zeta2 / zetan_);
+        half_ = std::pow(0.5, theta);
+    }
+
+    size_t Next(std::mt19937_64& rng) const {
+        const double u = std::generate_canonical<double, 53>(rng);
+        const double uz = u * zetan_;
+        size_t rank;
+        if (uz < 1.0) {
+            rank = 0;
+        } else if (uz < 1.0 + half_) {
+            rank = 1;
+        } else {
+            rank = static_cast<size_t>(static_cast<double>(n_) *
+                                       std::pow(eta_ * u - eta_ + 1, alpha_));
+            if (rank >= n_) {
+                rank = n_ - 1;
+            }
+        }
+        return scramble(rank) % n_;
+    }
+
+private:
+    static double zeta(size_t n, double theta) {
+        double s = 0;
+        for (size_t i = 1; i <= n; i++) {
+            s += 1.0 / std::pow(static_cast<double>(i), theta);
+        }
+        return s;
+    }
+    static size_t scramble(size_t x) {
+        uint64_t h = static_cast<uint64_t>(x) + 0x9e3779b97f4a7c15ULL;
+        h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        h = (h ^ (h >> 27)) * 0x94d049bb133111ebULL;
+        return static_cast<size_t>(h ^ (h >> 31));
+    }
+
+    size_t n_{1};
+    double zetan_{1}, alpha_{0}, eta_{0}, half_{0};
+};
+
+// Built once when -zipf is given; shared read-only by every connection.
+ZipfGen gZipf;
+bool gZipfOn = false;
+
+inline size_t pickKey(const Options& opts, std::mt19937_64& rng) {
+    return gZipfOn ? gZipf.Next(rng) : (rng() % opts.keys);
+}
 
 std::string keyFor(size_t index) {
     if (gKeyLen == 0) {
@@ -302,21 +368,23 @@ private:
     uint64_t completed_ = 0;
 };
 
-// Builds one buffer of `batch` GET requests. Keys are drawn up front so the
-// run-time loop touches nothing but the socket.
-std::vector<uint8_t> buildGetBuffer(const Options& opts,
-                                    std::mt19937_64& rng,
-                                    size_t batch) {
+// Builds one buffer of `batch` requests of the configured op. Keys are drawn
+// up front so the run-time loop touches nothing but the socket.
+std::vector<uint8_t> buildBuffer(const Options& opts,
+                                 std::mt19937_64& rng,
+                                 size_t batch,
+                                 const std::string* value) {
+    const bool doSet = value != nullptr;
     std::vector<uint8_t> buf;
-    buf.reserve(batch * (kHeaderSize + 24));
+    buf.reserve(batch * (kHeaderSize + 24 + (doSet ? opts.valsize : 0)));
     for (size_t i = 0; i < batch; i++) {
-        const std::string key = keyFor(rng() % opts.keys);
+        const std::string key = keyFor(pickKey(opts, rng));
         appendRequest(buf,
-                      kOpGet,
+                      doSet ? kOpSet : kOpGet,
                       key,
                       vbucketFor(key, opts.vbuckets),
                       static_cast<uint32_t>(i),
-                      nullptr);
+                      value);
     }
     return buf;
 }
@@ -340,10 +408,22 @@ void runConnectionPregen(const Options& opts,
 
     std::mt19937_64 rng(opts.seed + threadIndex);
     const size_t batch = opts.batch ? opts.batch : opts.pipeline;
+    std::string value;
+    if (opts.mode == "set") {
+        value.resize(opts.valsize);
+        if (opts.randvals) {
+            for (auto& c : value) {
+                c = static_cast<char>(rng() & 0xFF);
+            }
+        } else {
+            std::fill(value.begin(), value.end(), 'x');
+        }
+    }
     std::vector<std::vector<uint8_t>> buffers;
     buffers.reserve(opts.pregen);
     for (size_t i = 0; i < opts.pregen; i++) {
-        buffers.push_back(buildGetBuffer(opts, rng, batch));
+        buffers.push_back(buildBuffer(
+                opts, rng, batch, value.empty() ? nullptr : &value));
     }
 
     ResponseCounter counter;
@@ -419,7 +499,7 @@ void runConnection(const Options& opts,
     while (!stop.load(std::memory_order_relaxed)) {
         sendBuf.clear();
         auto batch = opts.pipeline;
-        if (doSet) {
+        if (doSet && !gZipfOn) {
             if (setCursor >= opts.keys) {
                 break; // this connection's share of the keyspace is written
             }
@@ -430,11 +510,11 @@ void runConnection(const Options& opts,
 
         for (size_t i = 0; i < batch; i++) {
             size_t keyIndex;
-            if (doSet) {
+            if (doSet && !gZipfOn) {
                 keyIndex = setCursor;
                 setCursor += opts.conns;
             } else {
-                keyIndex = rng() % opts.keys;
+                keyIndex = pickKey(opts, rng);
             }
             const std::string key = keyFor(keyIndex);
             appendRequest(sendBuf,
@@ -529,6 +609,9 @@ void usage(const char* prog) {
             << "  -valsize N        value size in bytes for set (default 1024)\n"
             << "  -mode get|set     operation (default get)\n"
             << "  -randvals         random, incompressible values\n"
+            << "  -zipf THETA       Zipf key selection (e.g. 0.99); default "
+               "uniform. With -mode set this also switches SET from the "
+               "one-pass stride load to sustained random writes\n"
             << "  -seed N           RNG seed (default 1)\n"
             << "  -runtime Ns       run duration in seconds (default 30s)\n";
 }
@@ -574,6 +657,8 @@ int main(int argc, char** argv) {
             opts.valsize = std::stoul(next());
         } else if (arg == "-mode") {
             opts.mode = next();
+        } else if (arg == "-zipf") {
+            opts.zipf = std::stod(next());
         } else if (arg == "-randvals") {
             opts.randvals = true;
         } else if (arg == "-seed") {
@@ -606,6 +691,19 @@ int main(int argc, char** argv) {
     std::vector<Result> results(opts.conns);
     std::vector<std::thread> threads;
     gKeyLen = opts.keylen;
+    if (opts.zipf > 0.0) {
+        // Summing the series over the whole key space takes a few seconds at
+        // 100M+ keys, so do it once here rather than per connection.
+        const auto t0 = std::chrono::steady_clock::now();
+        gZipf = ZipfGen(opts.keys, opts.zipf);
+        gZipfOn = true;
+        std::cerr << "zipf theta=" << opts.zipf << " over " << opts.keys
+                  << " keys (setup "
+                  << std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count()
+                  << "s)\n";
+    }
     std::atomic<bool> stop{false};
 
     const auto start = std::chrono::steady_clock::now();
