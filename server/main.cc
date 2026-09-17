@@ -125,6 +125,14 @@ struct Config {
     size_t minWriteBatch = 64;
     std::string batchSort = "auto"; // auto | always | never
     double sortDupThreshold = 0.05;
+    // LSM shape. 0 = magma's default. Compaction CPU is set by how often
+    // sstables are rewritten, so table size, base level size and the L0
+    // table count are the knobs that matter for a write-only workload.
+    size_t lsmSSTableSize = 0;
+    size_t lsmBaseLevelSize = 0;
+    size_t lsmLevel0Tables = 0;
+    size_t lsmMinCompactSize = 0;
+    int lsmLevelMultiplier = 0;
 };
 
 static void printUsage(const char* prog) {
@@ -202,6 +210,16 @@ static void printUsage(const char* prog) {
                  "(default auto)\n"
               << "  --sort-dup-threshold F  duplicate fraction at which auto "
                  "sorts (default 0.05)\n"
+              << "  --lsm-sstable-size N     max sstable bytes (magma "
+                 "default 2MB)\n"
+              << "  --lsm-base-level-size N  max bytes in the base level "
+                 "(default 4MB)\n"
+              << "  --lsm-level0-tables N    L0 tables before compacting "
+                 "(default 16)\n"
+              << "  --lsm-min-compact-size N bytes a compaction tries to "
+                 "cover (default 4MB)\n"
+              << "  --lsm-level-multiplier N size ratio between levels "
+                 "(default 10)\n"
               << "  --help            Show this help\n";
 }
 
@@ -258,6 +276,11 @@ static Config parseArgs(int argc, char* argv[]) {
             {"min-write-batch", required_argument, nullptr, 1049},
             {"batch-sort", required_argument, nullptr, 1051},
             {"sort-dup-threshold", required_argument, nullptr, 1052},
+            {"lsm-sstable-size", required_argument, nullptr, 1053},
+            {"lsm-base-level-size", required_argument, nullptr, 1054},
+            {"lsm-level0-tables", required_argument, nullptr, 1055},
+            {"lsm-min-compact-size", required_argument, nullptr, 1056},
+            {"lsm-level-multiplier", required_argument, nullptr, 1057},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
 
@@ -415,6 +438,21 @@ static Config parseArgs(int argc, char* argv[]) {
         case 1052:
             cfg.sortDupThreshold = strtod(optarg, nullptr);
             break;
+        case 1053:
+            cfg.lsmSSTableSize = strtoull(optarg, nullptr, 10);
+            break;
+        case 1054:
+            cfg.lsmBaseLevelSize = strtoull(optarg, nullptr, 10);
+            break;
+        case 1055:
+            cfg.lsmLevel0Tables = strtoull(optarg, nullptr, 10);
+            break;
+        case 1056:
+            cfg.lsmMinCompactSize = strtoull(optarg, nullptr, 10);
+            break;
+        case 1057:
+            cfg.lsmLevelMultiplier = atoi(optarg);
+            break;
         case 'h':
         default:
             printUsage(argv[0]);
@@ -566,6 +604,23 @@ int main(int argc, char* argv[]) {
                 o.NumChunks,
                 o.ChunkSize / (1024 * 1024),
                 o.SyncOnCommit);
+    }
+
+    if (cfg.lsmSSTableSize > 0) {
+        magmaCfg.LSMMaxSSTableSize = cfg.lsmSSTableSize;
+        magmaCfg.LSMLSDMaxSSTableSize = cfg.lsmSSTableSize;
+    }
+    if (cfg.lsmBaseLevelSize > 0) {
+        magmaCfg.LSMMaxBaseLevelSize = cfg.lsmBaseLevelSize;
+    }
+    if (cfg.lsmLevel0Tables > 0) {
+        magmaCfg.LSMMaxNumLevel0Tables = cfg.lsmLevel0Tables;
+    }
+    if (cfg.lsmMinCompactSize > 0) {
+        magmaCfg.LSMMinCompactSize = cfg.lsmMinCompactSize;
+    }
+    if (cfg.lsmLevelMultiplier > 0) {
+        magmaCfg.LSMLevelSizeMultiplier = cfg.lsmLevelMultiplier;
     }
 
     magmaCfg.LogLevel = "info";
