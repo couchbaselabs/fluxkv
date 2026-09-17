@@ -362,28 +362,31 @@ added and retired by moving live connections between event loops
 (`Connection::migrateTo`), which waits for a connection's requests in
 flight to be answered and then detaches and re-attaches the socket.
 
-The tuner works by trial. A pool whose threads are mostly busy gets more;
-a pool whose threads are mostly idle, or that just showed growth buys
-nothing, gets fewer. Every change is judged two windows later against
-throughput: a grow must raise it, a shrink must not lower it below the best
-steady value seen. A change that fails is undone and that direction backs
-off until the load changes. Busy fraction alone is not enough: a pool
-blocked on disk with a backlog reads 100% busy at any size (the 1 KB
-readers below), and only the failed-grow signal tells it to try fewer.
+The tuner works by trial. Busy fraction picks the direction: a pool whose
+threads are mostly busy is offered more; otherwise fewer are tried, and
+fewer are also tried on a busy pool once growing it has failed. Every change
+is a quarter of the pool, the tuner waits for it to take effect, and keeps it
+only if throughput responded: up by more than 1% for a grow, down by less
+than 0.5% for a shrink (the asymmetry stops it cycling at the boundary). A
+failed step is undone and retried at half size; once the smallest step fails
+that direction backs off until the load changes. Busy fraction alone cannot
+size a pool blocked on disk with a backlog - 64 readers and 40 readers both
+read 100% busy - and only the failed grow tells it to try fewer.
 
-Measured with `autotune_bench.sh`, which prints a line every 10 s:
+Measured with `autotune_bench.sh` from the floor of one IO thread and one
+reader per shard, so nothing is inherited from the hand tuning:
 
-| workload | start | converged to | time | throughput | server cores | hand-tuned |
-|---|---|---|---|---|---|---|
-| 8 B GET, loopback, 192x512x64 | io=6, readers=40 | io=63, readers=8 | 150 s | 77.0-77.5M/s | 59.8 | 79.1M at io=64, 59.8 cores |
-| 1 KB GET, networked, 64x256x64 | io=16, readers=64 | io=4, readers=40 | 140 s | 1.1164M/s | 31.9 | 1.114M at io=6/40, 32.8 cores |
+| workload | converged to | time | throughput | server cores | hand-tuned |
+|---|---|---|---|---|---|
+| 8 B GET, loopback, 192x512x64 | io=64, readers=8 | 380 s | 76.7-79.1M/s | 60.2 | 79.1M at io=64, 59.8 cores |
+| 1 KB GET, networked, 64x256x64 | io=3, readers=40 | 80 s | 1.1163-1.1168M/s | 31.6-33.0 | 1.114M at io=6/40, 32.8 cores |
 
-The 8 B case stopped at 63 because the loopback client shares the box:
-78, 70, 66 and 64 threads were each tried and each cost or gained nothing.
-The 1 KB case is link-bound, so the tuner's only job is to find the fewest
-threads that still hold 1.11M - it shed 12 IO threads and 24 readers with
-no loss, and rejected 32 readers (-1.5%) five times with doubling gaps.
-Both runs finished with zero client errors and no connection dropped.
+The 8 B run reached 78 loops at 200 s (a grow judged while the previous size
+was still ramping) and shrank back to 64 over the next three minutes; the
+1 KB run is link-bound and the tuner's job there is only to find the fewest
+threads that hold 1.11M. Both runs finished with zero client errors and no
+connection dropped, with connections moved between loops hundreds of times
+under 512-deep pipelines.
 
 Things learned building it, in the order they cost time:
 
@@ -392,15 +395,22 @@ Things learned building it, in the order they cost time:
   round-robin, two busy IO threads soon shared a counter cache line and the
   8 B case lost 10-15%. Slots are now leased to the least-occupied index
   and returned on thread exit (server/statslot.cc).
+- **A saturated loop does not drain its cross-thread queue.** A plan posted
+  with `runInEventBaseThread` to a loop with 192 always-ready sockets ran
+  18 s later, with 2.6 ms iterations. Work for a loop now goes into a
+  mailbox flagged so the read path schedules it as a loop callback within
+  one iteration (`IOThread::Post`).
 - **Balance is everything for pinned connections.** A loop with 7
   connections next to loops with 3 runs at 100% while they idle at 64%,
   and the pool's mean busy hides it. Rebalancing levels max-to-min until
-  every loop is within one connection.
-- **Steps must scale with the pool.** Adding one thread to 51 cannot show
-  a 2% gain, so the tuner stalled. Steps are 1/8 of the pool, 1/4 when
-  saturated, and a failed step is retried at half size before backing off.
-- **Judge over two windows.** A single 2 s window let a -3% shrink pass on
-  a lucky reading; averaging two did not.
+  every loop is within one connection, and reruns whenever no move is in
+  flight.
+- **Judge a change only after it has taken effect**, and only against a
+  stable baseline. Pools report `Settled()`; the tuner waits for it, then
+  averages two windows (four for a step under 2%).
+- **Two pools that are both bottlenecks** each show only a small gain when
+  grown alone. Any rule demanding a gain proportional to the step deadlocks
+  them at 1 IO thread and 8 readers; plain "more than 1%" does not.
 
 ## Reading the numbers
 
