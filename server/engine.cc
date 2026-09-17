@@ -6,6 +6,7 @@
 #include "connection.h"
 #include "include/libmagma/operations.h"
 
+#include <folly/container/F14Set.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <algorithm>
@@ -60,6 +61,7 @@ std::string DispatcherStats::toJson() const {
     j["connect_close"] = connectClose.load(std::memory_order_relaxed);
     j["write_batches"] = writeBatches.Sum();
     j["write_batch_items"] = writeBatchItems.Sum();
+    j["write_dedups"] = writeDedups.Sum();
     j["read_batches"] = readBatches.Sum();
     j["read_batch_items"] = readBatchItems.Sum();
     j["tmp_fails"] = tmpFails.load(std::memory_order_relaxed);
@@ -351,6 +353,32 @@ void WriterPool::executePersist(PersistTask& task) {
     }
     std::reverse(batch.begin(), batch.end());
 
+    // Keep only the newest write per key. Repeats within one batch are
+    // common under skewed keys (Zipf 0.99: the top key alone is ~5% of all
+    // writes) and every one costs a memtable insert, log bytes and a flush
+    // and compaction pass before GC removes it. Non-blind magma rejects
+    // duplicates outright. Dropped requests are answered/recycled with the
+    // survivors below.
+    std::vector<Request*> dropped;
+    if (batch.size() > 1) {
+        folly::F14FastSet<std::string_view> seen;
+        seen.reserve(batch.size());
+        size_t w = batch.size();
+        for (size_t i = batch.size(); i-- > 0;) {
+            auto* req = batch[i];
+            if (seen.insert(std::string_view(req->key.Data(), req->key.Len()))
+                        .second) {
+                batch[--w] = req;
+            } else {
+                dropped.push_back(req);
+            }
+        }
+        if (w > 0) {
+            batch.erase(batch.begin(), batch.begin() + w);
+            hotStatAdd(gDispStats.writeDedups, dropped.size());
+        }
+    }
+
     // Build WriteOperation batch
     std::vector<Magma::WriteOperation> ops;
     ops.reserve(batch.size());
@@ -404,6 +432,9 @@ void WriterPool::executePersist(PersistTask& task) {
         }
     }
 
+    // Dropped duplicates are done too: same outcome as the batch.
+    batch.insert(batch.end(), dropped.begin(), dropped.end());
+
     // Subtract queued bytes
     size_t batchBytes = 0;
     for (auto* req : batch) {
@@ -433,9 +464,12 @@ void WriterPool::executePersist(PersistTask& task) {
         } else {
             hotStatAdd(gDispStats.cmdSetRespErr, batch.size());
         }
-        for (auto* req : batch) {
-            req->reset();
-            if (!shard->RecycleRequest(req)) {
+        for (size_t i = 0; i < batch.size(); i++) {
+            batch[i]->reset();
+            batch[i]->hook.next = i + 1 < batch.size() ? batch[i + 1] : nullptr;
+        }
+        if (!shard->RecycleRequests(batch[0])) {
+            for (auto* req : batch) {
                 delete req;
             }
         }
@@ -993,6 +1027,55 @@ std::string Bucket::GetStatsJson() {
     merged["bucket"] = name_;
     merged["numShards"] = numShards_;
     return merged.dump(2);
+}
+
+namespace {
+// Per-IO-thread staging of writes by vbucket, flushed once per socket wake.
+struct StagedVB {
+    Request* first{nullptr}; // newest
+    Request* last{nullptr}; // oldest
+    uint32_t count{0};
+};
+struct StagingTable {
+    std::array<StagedVB, Shard::kMaxVBuckets> vbs{};
+    std::vector<uint16_t> touched;
+};
+thread_local StagingTable tlsStaging;
+} // namespace
+
+bool Bucket::StageWrite(Request* req) {
+    size_t itemSize = req->key.Len() + req->value.Len() + sizeof(Request);
+    if (queuedBytes_.load(std::memory_order_relaxed) + itemSize >
+        writeQueueMemLimit_) {
+        return false; // TMPFAIL — over memory limit
+    }
+    queuedBytes_.fetch_add(itemSize, std::memory_order_relaxed);
+
+    auto& st = tlsStaging.vbs[req->vbucket];
+    if (st.count == 0) {
+        tlsStaging.touched.push_back(req->vbucket);
+        st.last = req;
+    }
+    req->hook.next = st.first;
+    st.first = req;
+    st.count++;
+    return true;
+}
+
+void Bucket::FlushStaged() {
+    auto& t = tlsStaging;
+    for (uint16_t vbid : t.touched) {
+        auto& st = t.vbs[vbid];
+        auto& shard = GetShard(vbid);
+        auto& vbq = shard.GetVBWriteQueue(vbid);
+        vbq.list.insertChain(st.first, st.last);
+        vbq.pending.fetch_add(st.count, std::memory_order_relaxed);
+        st = StagedVB{};
+        if (!vbq.scheduled.exchange(true, std::memory_order_acq_rel)) {
+            shard.GetWriterPool()->SubmitOrDefer({&shard, vbid}, vbq);
+        }
+    }
+    t.touched.clear();
 }
 
 bool Bucket::EnqueueWrite(Request* req) {

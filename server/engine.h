@@ -73,6 +73,7 @@ struct DispatcherStats {
     std::atomic<uint64_t> connectClose{0};
     HotCounter writeBatches;
     HotCounter writeBatchItems;
+    HotCounter writeDedups; // older duplicates dropped within a batch
     HotCounter readBatches;
     HotCounter readBatchItems;
     std::atomic<uint64_t> tmpFails{0};
@@ -219,9 +220,54 @@ struct Request {
     }
 };
 
-// Per-vbucket queue using lock-free MPSC list
-struct VBQueue {
-    folly::AtomicIntrusiveLinkedList<Request, &Request::hook> list;
+// Lock-free multi-producer stack of Requests linked through Request::hook.
+// Same shape as folly::AtomicIntrusiveLinkedList (LIFO; sweep and reverse for
+// arrival order) plus insertChain(), so an IO thread can hand over every
+// request it parsed for one vbucket in a single CAS. With 12 IO threads and
+// Zipf traffic the per-request CAS on a hot vbucket's head was a third of
+// IO-thread CPU.
+class RequestStack {
+public:
+    // Returns true if the stack was empty.
+    bool insertHead(Request* r) {
+        return insertChain(r, r);
+    }
+    // first..last are already linked first -> ... -> last via hook.next and
+    // ordered newest first, so a sweep yields newest-to-oldest as usual.
+    bool insertChain(Request* first, Request* last) {
+        Request* old = head_.load(std::memory_order_relaxed);
+        do {
+            last->hook.next = old;
+        } while (!head_.compare_exchange_weak(old,
+                                              first,
+                                              std::memory_order_acq_rel,
+                                              std::memory_order_relaxed));
+        return old == nullptr;
+    }
+    bool empty() const {
+        return head_.load(std::memory_order_acquire) == nullptr;
+    }
+    // Single consumer. Repeats until a grab finds nothing, like folly's.
+    template <class F>
+    void sweep(F&& fn) {
+        while (Request* h = head_.exchange(nullptr, std::memory_order_acq_rel)) {
+            while (h) {
+                Request* next = h->hook.next;
+                h->hook.next = nullptr;
+                fn(h);
+                h = next;
+            }
+        }
+    }
+
+private:
+    std::atomic<Request*> head_{nullptr};
+};
+
+// Per-vbucket queue. One cache line each: IO threads push and the owning
+// worker sweeps, and neighbouring vbuckets must not share the line.
+struct alignas(64) VBQueue {
+    RequestStack list;
     std::atomic<bool> scheduled{false};
     // Write queues only: items pushed but not yet swept, and when the last
     // WriteDocs for this vbucket finished. Both drive write coalescing.
@@ -305,12 +351,15 @@ public:
     static constexpr uint16_t kMaxVBuckets = 1024;
 
     // Finished write Requests come back here instead of being deleted on a
-    // writer thread. IO threads take from it before allocating. False when
-    // full; the caller deletes.
-    bool RecycleRequest(Request* req) {
-        return freeRequests_.write(req);
+    // writer thread. A whole batch is handed over as one chain linked through
+    // hook.next, so the queue sees one operation per batch rather than one
+    // per request (the per-request pop was 28% of IO-thread CPU). IO threads
+    // take a chain into a thread-local free list before allocating. False
+    // when full; the caller deletes the chain.
+    bool RecycleRequests(Request* chain) {
+        return freeRequests_.write(chain);
     }
-    Request* TakeRequest() {
+    Request* TakeRequests() {
         Request* r{nullptr};
         return freeRequests_.read(r) ? r : nullptr;
     }
@@ -448,6 +497,12 @@ public:
 
     // Returns true if enqueued, false if over memory limit (TMPFAIL)
     bool EnqueueWrite(Request* req);
+    // Two-phase enqueue for IO threads: StageWrite does the admission check
+    // and links the request into a per-thread, per-vbucket chain; FlushStaged
+    // pushes every chain with one CAS each and schedules the writers. Call
+    // FlushStaged before returning to the event loop.
+    bool StageWrite(Request* req);
+    void FlushStaged();
     void EnqueueRead(Request* req);
     bool IsDurable() const {
         return durable_;
