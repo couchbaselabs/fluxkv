@@ -44,56 +44,51 @@ public:
     virtual PoolSample Sample(double wallSec) = 0;
     // Finish any asynchronous Shrink (join exited threads). Called each tick.
     virtual void Reap() {}
+    // False while a Grow or Shrink is still taking effect (threads starting,
+    // work moving). The tuner does not judge a change before this is true.
+    virtual bool Settled() const {
+        return true;
+    }
 };
 
 struct TunerConfig {
     std::chrono::milliseconds sampleInterval{250};
-    // Decisions are made once per this many samples; the window has to be
-    // long enough for a throughput reading to be stable.
+    // A decision window is this many samples; throughput is averaged over it.
     size_t samplesPerDecision{8};
-    // Above this mean busy fraction the pool is short of threads.
+    // Above this mean busy fraction the pool is offered more threads.
     double highBusy{0.80};
-    // Above this the pool is saturated and grows in larger steps.
-    double saturatedBusy{0.93};
-    // Below this the pool has more threads than the load needs.
-    double lowBusy{0.55};
-    // A grow is kept only if throughput rose by at least this fraction;
-    // absorbs run-to-run noise.
-    double minGain{0.02};
-    // A shrink is kept only if throughput stayed within this fraction of the
-    // best steady value seen, so losses cannot stack across steps or pools.
-    double maxLoss{0.01};
-    // Windows to wait after a change before measuring it, and windows to
-    // average the measurement over.
+    // A grow is kept if throughput rose by more than minGain; a shrink if it
+    // fell by less than maxLoss. maxLoss is the smaller so that no step can
+    // be kept in both directions, which would cycle at the boundary.
+    double minGain{0.01};
+    double maxLoss{0.005};
+    // Windows to skip after a change, then windows to average before judging
+    // it; a step too small to show the tolerance in full gets the longer look.
     size_t settleWindows{1};
     size_t measureWindows{2};
-    // A step whose expected gain is below minGain is measured over this many
-    // windows instead, since it has to be judged against a smaller margin.
     size_t smallStepMeasureWindows{4};
-    // Floor on the gain a small step must show.
-    double minSmallGain{0.005};
-    // Back-off after a change that did not pay, in windows: starts here and
-    // doubles up to the cap while the load looks the same.
+    // Longest to wait for a pool to report a change has taken effect.
+    size_t maxSettleWindows{15};
+    // After a reverted change that direction waits this many windows before
+    // trying again, doubling each time up to the cap - unless the load
+    // changes first (throughput or busy fraction move by these amounts).
     size_t firstBackoffWindows{8};
     size_t maxBackoffWindows{256};
-    // A back-off ends early when throughput moves by this fraction, or the
-    // busy fraction by this much, from when the change was reverted.
-    double conditionChangeTput{0.10};
-    double conditionChangeBusy{0.15};
+    double loadChangeTput{0.10};
+    double loadChangeBusy{0.15};
 };
 
-// Sizes the registered pools from their own busy fraction and the server's
-// throughput.
+// Sizes the registered pools by trial.
 //
-// A pool whose threads are mostly busy is short of threads; a pool whose
-// threads are mostly idle has more than the load needs, and fewer threads
-// batch better. Neither signal alone is safe to act on: a saturated pool
-// gains nothing from growth when something else (the client, the network) is
-// the limit, and a lightly loaded pool may still be at the count that carries
-// the load. So every change is a trial: the tuner changes one pool by one
-// step, waits, and keeps the change only if throughput responded the way the
-// change predicted. A failed trial is undone and that direction backs off
-// exponentially until the busy signal changes.
+// Every decision window the tuner changes one pool by a quarter of its size
+// - up if its threads are mostly busy, down otherwise - waits for the change
+// to take effect, and keeps it only if throughput responded: up by more than
+// minGain for a grow, down by less than maxLoss for a shrink. A failed
+// change is undone and retried at half the step; once the smallest step
+// fails, that direction backs off until the load changes. Busy fraction
+// only chooses the direction to try; throughput decides. That is what lets
+// it shrink a pool blocked on IO with a backlog, which reads 100% busy at
+// any size: growing it fails, so shrinking is tried, and holds.
 class ThreadTuner {
 public:
     struct Bounds {
@@ -113,48 +108,34 @@ public:
 private:
     enum class Trial { None, Grow, Shrink };
 
+    // Retry state for one direction of one pool.
+    struct Direction {
+        size_t cap{0}; // largest step to try next; 0 = unlimited
+        size_t backoff{0}; // windows left before trying again
+        size_t nextBackoff{0}; // what the next failure will cost
+        double tputAtFail{0};
+        double busyAtFail{0};
+    };
+
     struct PoolState {
         ElasticPool* pool{nullptr};
         Bounds bounds;
-        // Window accumulators.
-        double busySum{0};
-        double busyMaxSeen{0};
-        double batchSum{0};
-        double waitSum{0};
+        // Window accumulators and the last completed window.
+        double busySum{0}, busyMaxSeen{0}, batchSum{0}, waitSum{0};
         size_t samples{0};
-        // Last completed window, for the stats endpoint.
         PoolSample last;
         // Trial in flight.
         Trial trial{Trial::None};
         size_t sizeBefore{0};
-        double tputBefore{0};
+        double refTput{0};
         double busyBefore{0};
+        size_t measure{0};
+        double tputSum{0};
+        size_t tputN{0};
         size_t windowsSinceChange{0};
-        double trialTputSum{0};
-        size_t trialTputN{0};
-        size_t trialMeasure{0}; // windows to average for this trial
-        // Set when a grow was reverted: throughput no longer responds to
-        // more threads, so fewer may do. Cleared when a grow is kept.
-        bool growStalled{false};
-        // Consecutive kept shrinks are judged against the throughput at the
-        // start of the run, so a sequence of small losses cannot add up.
-        bool inShrinkRun{false};
-        double shrinkRunRef{0};
-        // Back-off, in decision windows, per direction. A reverted change is
-        // not retried while the load looks the same; the back-off is cleared
-        // early when throughput or busy fraction move materially.
-        size_t growBackoff{0};
-        size_t shrinkBackoff{0};
-        size_t growBackoffBase{0}; // 0 = cfg.firstBackoffWindows
-        size_t shrinkBackoffBase{0};
-        double growRevertTput{0};
-        double growRevertBusy{0};
-        double shrinkRevertTput{0};
-        double shrinkRevertBusy{0};
-        // After a reverted step the next attempt in that direction is half
-        // as large; the smallest step backs off instead. 0 = no cap.
-        size_t growCap{0};
-        size_t shrinkCap{0};
+        size_t settledWindows{0}; // windows since the pool reported Settled
+        Direction grow, shrink;
+        // For the stats endpoint.
         std::string lastAction{"none"};
         uint64_t changes{0};
         uint64_t reverts{0};
@@ -163,9 +144,11 @@ private:
     void run();
     void sample(double wallSec);
     void decide(double tput);
-    bool evaluateTrial(PoolState& ps, double tput);
-    bool startTrial(PoolState& ps, double busyMean);
+    void closeWindow(PoolState& ps, double tput, bool steady);
+    bool startTrial(PoolState& ps);
+    void judge(PoolState& ps, double tput);
     size_t roundToStep(size_t n, size_t step) const;
+    double recentSteady() const;
 
     TunerConfig cfg_;
     std::function<uint64_t()> opsCounter_;
@@ -176,15 +159,13 @@ private:
     size_t nextPool_{0};
     double lastTput_{0};
     uint64_t lastOps_{0};
-    // Best throughput seen in a window with no trial in flight. Shrinks are
-    // judged against it. It follows the load down after a few steady windows
-    // below it, so a lighter load does not block shrinking forever.
+    // Throughput in windows with no trial in flight: the last few (a grow is
+    // judged against their mean) and the best (a shrink is judged against
+    // it, so a run of small losses cannot add up). The best follows the load
+    // down after a few steady windows below it.
+    std::vector<double> steadyRecent_;
     double steadyBest_{0};
     size_t steadyLowWindows_{0};
-    // Recent steady-window throughputs; their mean is the baseline a grow
-    // is judged against, which halves the noise of a single window.
-    std::vector<double> steadyRecent_;
-    double steadyBaseline() const;
 };
 
 } // namespace kvserver

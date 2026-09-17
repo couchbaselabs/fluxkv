@@ -45,9 +45,9 @@ void ThreadTuner::Stop() {
 void ThreadTuner::run() {
     using clock = std::chrono::steady_clock;
     auto lastSample = clock::now();
-    size_t samples = 0;
     auto windowStart = lastSample;
     uint64_t windowOps = lastOps_;
+    size_t samples = 0;
 
     while (running_.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(cfg_.sampleInterval);
@@ -66,13 +66,12 @@ void ThreadTuner::run() {
         }
         samples = 0;
         const uint64_t ops = opsCounter_();
-        const double windowSec =
+        const double sec =
                 std::chrono::duration<double>(now - windowStart).count();
-        const double tput = windowSec > 0 ? (ops - windowOps) / windowSec : 0;
+        lastTput_ = sec > 0 ? (ops - windowOps) / sec : 0;
         windowStart = now;
         windowOps = ops;
-        lastTput_ = tput;
-        decide(tput);
+        decide(lastTput_);
     }
 }
 
@@ -92,312 +91,10 @@ void ThreadTuner::sample(double wallSec) {
 }
 
 size_t ThreadTuner::roundToStep(size_t n, size_t step) const {
-    if (step == 0) {
-        return n;
-    }
-    return (n / step) * step;
+    return step > 0 ? (n / step) * step : n;
 }
 
-void ThreadTuner::decide(double tput) {
-    bool anyTrial = false;
-    for (auto& ps : pools_) {
-        anyTrial = anyTrial || ps.trial != Trial::None;
-    }
-    // A window with nothing in flight is a steady reading of the load.
-    const bool steady = !anyTrial;
-    if (steady) {
-        steadyRecent_.push_back(tput);
-        if (steadyRecent_.size() > 3) {
-            steadyRecent_.erase(steadyRecent_.begin());
-        }
-        if (tput > steadyBest_) {
-            steadyBest_ = tput;
-            steadyLowWindows_ = 0;
-        } else if (tput < steadyBest_ * (1.0 - 2 * cfg_.maxLoss)) {
-            if (++steadyLowWindows_ >= 3) {
-                steadyBest_ = tput; // the load itself went down
-                steadyLowWindows_ = 0;
-            }
-        } else {
-            steadyLowWindows_ = 0;
-        }
-    }
-
-    // Close out the window for every pool.
-    for (auto& ps : pools_) {
-        if (ps.samples > 0) {
-            ps.last.busyMean = ps.busySum / ps.samples;
-            ps.last.busyMax = ps.busyMaxSeen;
-            ps.last.avgBatch = ps.batchSum / ps.samples;
-            ps.last.waitUs = ps.waitSum / ps.samples;
-        }
-        ps.busySum = ps.busyMaxSeen = ps.batchSum = ps.waitSum = 0;
-        ps.samples = 0;
-        ps.windowsSinceChange++;
-        // Back-offs count down, and end at once if the situation the failed
-        // change was judged in no longer holds. Only a steady window can say
-        // so: a dip caused by some other trial is not a change in load.
-        auto changed = [&](double t0, double b0) {
-            if (!steady || ps.windowsSinceChange < 2) {
-                return false;
-            }
-            const double dt = t0 > 0 ? std::abs(tput - t0) / t0 : 0;
-            return dt > cfg_.conditionChangeTput ||
-                   std::abs(ps.last.busyMean - b0) > cfg_.conditionChangeBusy;
-        };
-        if (ps.growBackoff > 0) {
-            ps.growBackoff--;
-            if (changed(ps.growRevertTput, ps.growRevertBusy)) {
-                ps.growBackoff = 0;
-                ps.growBackoffBase = 0;
-            }
-        }
-        if (ps.shrinkBackoff > 0) {
-            ps.shrinkBackoff--;
-            if (changed(ps.shrinkRevertTput, ps.shrinkRevertBusy)) {
-                ps.shrinkBackoff = 0;
-                ps.shrinkBackoffBase = 0;
-            }
-        }
-    }
-
-    // A trial in flight owns the window: nothing else changes until it has
-    // been judged, or the effect could not be attributed. The verdict is
-    // taken on the mean of several windows so one noisy reading cannot pass
-    // a bad change.
-    for (auto& ps : pools_) {
-        if (ps.trial != Trial::None) {
-            if (ps.windowsSinceChange > cfg_.settleWindows) {
-                ps.trialTputSum += tput;
-                ps.trialTputN++;
-                if (ps.trialTputN >= std::max<size_t>(1, ps.trialMeasure)) {
-                    evaluateTrial(ps, ps.trialTputSum / ps.trialTputN);
-                }
-            }
-            return;
-        }
-    }
-
-    if (pools_.empty()) {
-        return;
-    }
-    // One change per window, pools taken in turn so neither starves.
-    for (size_t i = 0; i < pools_.size(); i++) {
-        auto& ps = pools_[(nextPool_ + i) % pools_.size()];
-        // Give a kept change one quiet window before the same pool moves
-        // again in the other direction.
-        if (ps.windowsSinceChange < 2) {
-            continue;
-        }
-        if (startTrial(ps, ps.last.busyMean)) {
-            nextPool_ = (nextPool_ + i + 1) % pools_.size();
-            return;
-        }
-    }
-}
-
-bool ThreadTuner::startTrial(PoolState& ps, double busyMean) {
-    auto* pool = ps.pool;
-    const size_t size = pool->Size();
-    const size_t step = std::max<size_t>(1, pool->Step());
-
-    if (busyMean > cfg_.highBusy && ps.growBackoff == 0 &&
-        size < ps.bounds.max) {
-        // Steps scale with the pool: a single thread added to a large pool
-        // cannot move throughput enough to be judged. Saturated pools take
-        // larger steps to catch up in fewer windows.
-        size_t n = std::max(step, roundToStep(size / 8, step));
-        if (busyMean > cfg_.saturatedBusy) {
-            n = std::max(step, roundToStep(size / 4, step));
-        }
-        if (ps.growCap > 0) {
-            n = std::min(n, ps.growCap);
-        }
-        n = std::min(n, ps.bounds.max - size);
-        if (n == 0) {
-            return false;
-        }
-        ps.trial = Trial::Grow;
-        ps.sizeBefore = size;
-        ps.tputBefore = steadyBaseline();
-        ps.busyBefore = busyMean;
-        ps.inShrinkRun = false;
-        ps.windowsSinceChange = 0;
-        ps.trialTputSum = 0;
-        ps.trialTputN = 0;
-        // A step too small to show minGain even if it pays in full gets a
-        // longer look.
-        ps.trialMeasure = static_cast<double>(n) / size < cfg_.minGain
-                                  ? cfg_.smallStepMeasureWindows
-                                  : cfg_.measureWindows;
-        ps.changes++;
-        ps.lastAction = "grow " + std::to_string(size) + "->" +
-                        std::to_string(size + n);
-        spdlog::info("tuner: {} busy={:.2f} tput={:.0f}/s: {}",
-                     pool->Name(),
-                     busyMean,
-                     lastTput_,
-                     ps.lastAction);
-        pool->Grow(n);
-        return true;
-    }
-
-    // Shrink when the threads are not all needed. Two ways to know: the
-    // busy fraction says so directly, or a grow was just reverted - the
-    // throughput is limited elsewhere, so the pool may be oversized however
-    // busy its threads look (a pool blocked on IO with a backlog reads 100%
-    // busy at any size).
-    const bool idle = busyMean < cfg_.highBusy;
-    if ((idle || ps.growStalled) && ps.shrinkBackoff == 0 &&
-        size > ps.bounds.min) {
-        size_t n = step;
-        if (busyMean < cfg_.lowBusy / 2) {
-            n = std::max(step, roundToStep(size / 4, step));
-        } else if (busyMean < cfg_.lowBusy) {
-            n = std::max(step, roundToStep(size / 8, step));
-        }
-        if (ps.shrinkCap > 0) {
-            n = std::min(n, ps.shrinkCap);
-        }
-        n = std::min(n, size - ps.bounds.min);
-        // Do not shrink into the range where the next window would want to
-        // grow again - unless growth has already been shown not to help.
-        auto predicted = [&](size_t m) {
-            return busyMean * static_cast<double>(size) /
-                   static_cast<double>(size - m);
-        };
-        while (n > step && predicted(n) >= cfg_.highBusy) {
-            n -= step;
-        }
-        if (n == 0 || (!ps.growStalled && predicted(n) >= cfg_.highBusy)) {
-            return false;
-        }
-        ps.trial = Trial::Shrink;
-        ps.sizeBefore = size;
-        // The reference only rises within a run: a shrink kept at a lower
-        // throughput must not lower the bar for the next one.
-        ps.shrinkRunRef = ps.inShrinkRun ? std::max(ps.shrinkRunRef, lastTput_)
-                                         : lastTput_;
-        ps.tputBefore = std::max(ps.shrinkRunRef, steadyBest_);
-        ps.busyBefore = busyMean;
-        ps.windowsSinceChange = 0;
-        ps.trialTputSum = 0;
-        ps.trialTputN = 0;
-        ps.trialMeasure = cfg_.measureWindows;
-        ps.changes++;
-        ps.lastAction = "shrink " + std::to_string(size) + "->" +
-                        std::to_string(size - n);
-        spdlog::info("tuner: {} busy={:.2f} tput={:.0f}/s: {}",
-                     pool->Name(),
-                     busyMean,
-                     lastTput_,
-                     ps.lastAction);
-        pool->Shrink(n);
-        return true;
-    }
-    return false;
-}
-
-bool ThreadTuner::evaluateTrial(PoolState& ps, double tput) {
-    auto* pool = ps.pool;
-    const size_t size = pool->Size();
-    const size_t step = std::max<size_t>(1, pool->Step());
-    const size_t delta = size > ps.sizeBefore ? size - ps.sizeBefore
-                                              : ps.sizeBefore - size;
-    const double ratio = ps.tputBefore > 0 ? tput / ps.tputBefore : 1.0;
-    bool keep = false;
-
-    // A reverted step is retried at half the size before this direction
-    // backs off: the right count may sit between the two sizes tried.
-    auto halve = [&](size_t& cap,
-                     size_t& backoff,
-                     size_t& base,
-                     double& revTput,
-                     double& revBusy) {
-        if (delta > step) {
-            cap = std::max(step, roundToStep(delta / 2, step));
-        } else {
-            cap = step;
-            if (base == 0) {
-                base = cfg_.firstBackoffWindows;
-            }
-            backoff = base;
-            base = std::min(base * 2, cfg_.maxBackoffWindows);
-            revTput = ps.tputBefore;
-            revBusy = ps.busyBefore;
-        }
-    };
-
-    if (ps.trial == Trial::Grow) {
-        // More threads must have bought throughput, or the limit is elsewhere.
-        // A saturated pool returns at most the relative growth; a large step
-        // has to return at least a quarter of it, a small one (which cannot
-        // reach minGain even in full) at least half.
-        const double rel = ps.sizeBefore > 0
-                                   ? static_cast<double>(delta) / ps.sizeBefore
-                                   : 0;
-        const double need = rel >= cfg_.minGain
-                                    ? std::max(cfg_.minGain, rel / 4)
-                                    : std::max(cfg_.minSmallGain, rel / 2);
-        keep = ratio >= 1.0 + need;
-        if (keep) {
-            ps.growBackoffBase = 0;
-            ps.growCap = 0;
-            ps.growStalled = false;
-        } else {
-            halve(ps.growCap,
-                  ps.growBackoff,
-                  ps.growBackoffBase,
-                  ps.growRevertTput,
-                  ps.growRevertBusy);
-            ps.growStalled = true;
-        }
-    } else {
-        // Fewer threads must not have cost throughput, nor newly saturated
-        // the rest (a pool that was already saturated tells us nothing).
-        // With no load to measure against, fewer idle threads is simply fine.
-        keep = (ps.tputBefore == 0 || ratio >= 1.0 - cfg_.maxLoss) &&
-               (ps.last.busyMax < cfg_.saturatedBusy ||
-                ps.busyBefore >= cfg_.saturatedBusy);
-        if (keep) {
-            ps.shrinkBackoffBase = 0;
-            ps.shrinkCap = 0;
-            ps.inShrinkRun = ps.tputBefore > 0;
-        } else {
-            halve(ps.shrinkCap,
-                  ps.shrinkBackoff,
-                  ps.shrinkBackoffBase,
-                  ps.shrinkRevertTput,
-                  ps.shrinkRevertBusy);
-            ps.inShrinkRun = false;
-        }
-    }
-
-    const char* verdict = keep ? "kept" : "reverted";
-    spdlog::info("tuner: {} {} {} (tput {:.0f} -> {:.0f}/s, {:+.1f}%, "
-                 "busy={:.2f})",
-                 pool->Name(),
-                 ps.lastAction,
-                 verdict,
-                 ps.tputBefore,
-                 tput,
-                 (ratio - 1.0) * 100.0,
-                 ps.last.busyMean);
-    ps.lastAction += keep ? " kept" : " reverted";
-    if (!keep) {
-        ps.reverts++;
-        if (size > ps.sizeBefore) {
-            pool->Shrink(size - ps.sizeBefore);
-        } else if (size < ps.sizeBefore) {
-            pool->Grow(ps.sizeBefore - size);
-        }
-    }
-    ps.trial = Trial::None;
-    ps.windowsSinceChange = 0;
-    return keep;
-}
-
-double ThreadTuner::steadyBaseline() const {
+double ThreadTuner::recentSteady() const {
     if (steadyRecent_.empty()) {
         return lastTput_;
     }
@@ -406,6 +103,238 @@ double ThreadTuner::steadyBaseline() const {
         s += t;
     }
     return s / steadyRecent_.size();
+}
+
+void ThreadTuner::decide(double tput) {
+    bool steady = true;
+    for (auto& ps : pools_) {
+        steady = steady && ps.trial == Trial::None;
+    }
+    if (steady) {
+        steadyRecent_.push_back(tput);
+        if (steadyRecent_.size() > 3) {
+            steadyRecent_.erase(steadyRecent_.begin());
+        }
+        if (tput > steadyBest_) {
+            steadyBest_ = tput;
+            steadyLowWindows_ = 0;
+        } else if (tput < steadyBest_ * (1.0 - 2 * cfg_.minGain) &&
+                   ++steadyLowWindows_ >= 3) {
+            steadyBest_ = tput; // the load itself went down
+            steadyLowWindows_ = 0;
+        }
+    }
+    for (auto& ps : pools_) {
+        closeWindow(ps, tput, steady);
+    }
+
+    // A trial in flight owns the window, so its effect can be attributed.
+    // Measurement starts once the pool says the change has taken effect
+    // (connections moved, threads started) plus the settle windows.
+    for (auto& ps : pools_) {
+        if (ps.trial == Trial::None) {
+            continue;
+        }
+        if (ps.settledWindows == 0 && !ps.pool->Settled() &&
+            ps.windowsSinceChange < cfg_.maxSettleWindows) {
+            return;
+        }
+        if (++ps.settledWindows > cfg_.settleWindows) {
+            ps.tputSum += tput;
+            if (++ps.tputN >= ps.measure) {
+                judge(ps, ps.tputSum / ps.tputN);
+            }
+        }
+        return;
+    }
+
+    // Start nothing while throughput is still moving: the baseline for the
+    // next verdict would be wrong.
+    if (steadyRecent_.size() < 2) {
+        return;
+    }
+    const double a = steadyRecent_[steadyRecent_.size() - 1];
+    const double b = steadyRecent_[steadyRecent_.size() - 2];
+    if (a > 0 && std::abs(a - b) / a > cfg_.minGain) {
+        return;
+    }
+
+    // One change per window, pools taken in turn. A pool rests one window
+    // after a kept change before moving again.
+    for (size_t i = 0; i < pools_.size(); i++) {
+        auto& ps = pools_[(nextPool_ + i) % pools_.size()];
+        if (ps.windowsSinceChange >= 2 && startTrial(ps)) {
+            nextPool_ = (nextPool_ + i + 1) % pools_.size();
+            return;
+        }
+    }
+}
+
+void ThreadTuner::closeWindow(PoolState& ps, double tput, bool steady) {
+    if (ps.samples > 0) {
+        ps.last.busyMean = ps.busySum / ps.samples;
+        ps.last.busyMax = ps.busyMaxSeen;
+        ps.last.avgBatch = ps.batchSum / ps.samples;
+        ps.last.waitUs = ps.waitSum / ps.samples;
+    }
+    ps.busySum = ps.busyMaxSeen = ps.batchSum = ps.waitSum = 0;
+    ps.samples = 0;
+    ps.windowsSinceChange++;
+
+    // Back-offs count down, and end early when a steady window shows the
+    // load is no longer what the failed change was judged in.
+    for (Direction* d : {&ps.grow, &ps.shrink}) {
+        if (d->backoff == 0) {
+            continue;
+        }
+        d->backoff--;
+        const bool moved =
+                (d->tputAtFail > 0 &&
+                 std::abs(tput - d->tputAtFail) / d->tputAtFail >
+                         cfg_.loadChangeTput) ||
+                std::abs(ps.last.busyMean - d->busyAtFail) > cfg_.loadChangeBusy;
+        if (steady && ps.windowsSinceChange >= 2 && moved) {
+            d->backoff = 0;
+            d->nextBackoff = 0;
+        }
+    }
+}
+
+bool ThreadTuner::startTrial(PoolState& ps) {
+    auto* pool = ps.pool;
+    const size_t size = pool->Size();
+    const size_t step = std::max<size_t>(1, pool->Step());
+    const double busy = ps.last.busyMean;
+
+    // Direction: busy threads ask for more; otherwise probe fewer. The probe
+    // also runs on a busy pool once growing it has failed - the limit is
+    // elsewhere, so the threads may not all be needed however busy they look.
+    const bool wantGrow = busy > cfg_.highBusy && ps.grow.backoff == 0 &&
+                          size < ps.bounds.max;
+    const bool wantShrink = !wantGrow && ps.shrink.backoff == 0 &&
+                            size > ps.bounds.min &&
+                            (busy <= cfg_.highBusy || ps.grow.backoff > 0);
+    if (!wantGrow && !wantShrink) {
+        return false;
+    }
+    Direction& dir = wantGrow ? ps.grow : ps.shrink;
+
+    // A quarter of the pool, halved after each failure, never below a step.
+    size_t n = std::max(step, roundToStep(size / 4, step));
+    if (dir.cap > 0) {
+        n = std::min(n, dir.cap);
+    }
+    if (wantGrow) {
+        n = std::min(n, ps.bounds.max - size);
+    } else {
+        n = std::min(n, size - ps.bounds.min);
+        // Do not shrink into the range that would just ask to grow again,
+        // unless growing has already been shown not to help.
+        if (ps.grow.backoff == 0) {
+            while (n > step && busy * size / (size - n) >= cfg_.highBusy) {
+                n -= step;
+            }
+            if (busy * size / (size - n) >= cfg_.highBusy) {
+                return false;
+            }
+        }
+    }
+    if (n == 0) {
+        return false;
+    }
+
+    ps.trial = wantGrow ? Trial::Grow : Trial::Shrink;
+    ps.sizeBefore = size;
+    // A grow must beat the current steady level; a shrink must hold the best
+    // steady level seen, so consecutive shrinks cannot each lose a little.
+    ps.refTput = wantGrow ? recentSteady() : std::max(steadyBest_, lastTput_);
+    ps.busyBefore = busy;
+    ps.measure = static_cast<double>(n) / size < 2 * cfg_.minGain
+                         ? cfg_.smallStepMeasureWindows
+                         : cfg_.measureWindows;
+    ps.tputSum = 0;
+    ps.tputN = 0;
+    ps.windowsSinceChange = 0;
+    ps.settledWindows = 0;
+    ps.changes++;
+    ps.lastAction = std::string(wantGrow ? "grow " : "shrink ") +
+                    std::to_string(size) + "->" +
+                    std::to_string(wantGrow ? size + n : size - n);
+    spdlog::info("tuner: {} busy={:.2f} tput={:.0f}/s: {}",
+                 pool->Name(),
+                 busy,
+                 lastTput_,
+                 ps.lastAction);
+    if (wantGrow) {
+        pool->Grow(n);
+    } else {
+        pool->Shrink(n);
+    }
+    return true;
+}
+
+void ThreadTuner::judge(PoolState& ps, double tput) {
+    auto* pool = ps.pool;
+    const size_t size = pool->Size();
+    const size_t step = std::max<size_t>(1, pool->Step());
+    const bool grew = ps.trial == Trial::Grow;
+    const size_t delta = grew ? size - ps.sizeBefore : ps.sizeBefore - size;
+    const double ratio = ps.refTput > 0 ? tput / ps.refTput : 1.0;
+
+    // With no load to measure against, fewer idle threads is simply fine
+    // and more is not. Otherwise throughput alone decides: a grow must have
+    // raised it by more than minGain, a shrink must not have lowered
+    // it by more. A grow that raised it only a little because another pool
+    // is the next limit is still right to keep; the other pool's turn comes
+    // next window.
+    bool keep;
+    if (ps.refTput == 0) {
+        keep = !grew;
+    } else if (grew) {
+        keep = ratio >= 1.0 + cfg_.minGain;
+    } else {
+        keep = ratio >= 1.0 - cfg_.maxLoss;
+    }
+
+    spdlog::info("tuner: {} {} {} (tput {:.0f} -> {:.0f}/s, {:+.1f}%, "
+                 "busy={:.2f})",
+                 pool->Name(),
+                 ps.lastAction,
+                 keep ? "kept" : "reverted",
+                 ps.refTput,
+                 tput,
+                 (ratio - 1.0) * 100.0,
+                 ps.last.busyMean);
+    ps.lastAction += keep ? " kept" : " reverted";
+
+    Direction& dir = grew ? ps.grow : ps.shrink;
+    if (keep) {
+        dir.cap = 0;
+        dir.nextBackoff = 0;
+    } else {
+        ps.reverts++;
+        if (grew) {
+            pool->Shrink(delta);
+        } else {
+            pool->Grow(delta);
+        }
+        // Retry at half the step; once the smallest step fails, back off.
+        if (delta > step) {
+            dir.cap = std::max(step, roundToStep(delta / 2, step));
+        } else {
+            dir.cap = step;
+            if (dir.nextBackoff == 0) {
+                dir.nextBackoff = cfg_.firstBackoffWindows;
+            }
+            dir.backoff = dir.nextBackoff;
+            dir.nextBackoff =
+                    std::min(dir.nextBackoff * 2, cfg_.maxBackoffWindows);
+            dir.tputAtFail = ps.refTput;
+            dir.busyAtFail = ps.busyBefore;
+        }
+    }
+    ps.trial = Trial::None;
+    ps.windowsSinceChange = 0;
 }
 
 std::string ThreadTuner::ToJson() const {
@@ -430,8 +359,8 @@ std::string ThreadTuner::ToJson() const {
         p["last_action"] = ps.lastAction;
         p["changes"] = ps.changes;
         p["reverts"] = ps.reverts;
-        p["grow_backoff"] = ps.growBackoff;
-        p["shrink_backoff"] = ps.shrinkBackoff;
+        p["grow_backoff"] = ps.grow.backoff;
+        p["shrink_backoff"] = ps.shrink.backoff;
         if (!ps.last.threadBusy.empty()) {
             p["thread_busy"] = ps.last.threadBusy;
         }
