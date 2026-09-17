@@ -481,6 +481,8 @@ void WriterPool::executePersist(PersistTask& task) {
     // DocMeta is packed and written to disk as-is, so the vector's storage
     // is the encoded form: one allocation per batch, not a string per op.
     std::vector<DocMeta> metas(batch.size());
+    const uint64_t cas =
+            std::chrono::system_clock::now().time_since_epoch().count();
 
     for (size_t i = 0; i < batch.size(); i++) {
         auto* req = batch[i];
@@ -489,6 +491,7 @@ void WriterPool::executePersist(PersistTask& task) {
 
         DocMeta& dm = metas[i];
         dm.seqno = seqno;
+        dm.cas = cas;
         dm.valueSize = req->value.Len();
         dm.flags = req->flags;
         dm.expiry = req->expiry;
