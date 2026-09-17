@@ -162,6 +162,8 @@ private:
     // → IO-thread; we touch the pool only from the IO thread (this Connection's
     // event-base), so no synchronization is needed. Cap prevents unbounded
     // growth when the engine is slower than the network.
+    // Prefers a Request recycled by the vbucket's shard writers.
+    Request* acquireRequest(uint16_t vbucket);
     std::vector<Request*> reqPool_;
     static constexpr size_t kMaxPooledReqs = 256;
     Request* acquireRequest();

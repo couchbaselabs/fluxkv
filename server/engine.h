@@ -98,6 +98,16 @@ extern DispatcherStats gDispStats;
 extern DocCache* gDocCache;
 // Runtime read-batch cap (set from main via --max-read-batch).
 extern size_t gMaxReadBatch;
+
+// Write coalescing. A vbucket whose last WriteDocs finished less than
+// gWriteCoalesceNs ago and has fewer than gMinWriteBatch items queued is
+// not written again until the interval has passed. Every WriteDocs carries
+// a fixed cost (a log transaction, memtable and index locking, the write
+// cache check), so writing whatever happens to be queued the instant a
+// writer is free turns a saturated pool into one that spends its CPU on
+// one- and two-item batches. 0 disables.
+extern size_t gMinWriteBatch;
+extern uint64_t gWriteCoalesceNs;
 // Master switch for per-op hot-path stat increments. At 1 M ops/s the cache-
 // line bouncing of atomic fetch_adds across N reader threads is measurable.
 // Disabled with --no-hot-stats; coarse counters (connectAccept/Close,
@@ -161,8 +171,14 @@ struct Request {
     uint8_t datatype{0}; // request datatype (SET)
     uint8_t resultDatatype{0}; // stored datatype (GET)
 
-    // Owns the request body data
+    // Owns the request body data when it did not fit inlineData.
     std::unique_ptr<folly::IOBuf> dataBuf;
+    // Small SET bodies (extras + key + value) are copied here so the IOBuf
+    // can be released on the IO thread that allocated it. Writers used to
+    // free it, and freeing into another thread's allocator arena was a
+    // third of writer CPU.
+    static constexpr size_t kInlineData = 128;
+    alignas(8) char inlineData[kInlineData];
 
     // For routing response back to connection
     Connection* conn{nullptr};
@@ -207,6 +223,10 @@ struct Request {
 struct VBQueue {
     folly::AtomicIntrusiveLinkedList<Request, &Request::hook> list;
     std::atomic<bool> scheduled{false};
+    // Write queues only: items pushed but not yet swept, and when the last
+    // WriteDocs for this vbucket finished. Both drive write coalescing.
+    std::atomic<uint32_t> pending{0};
+    std::atomic<uint64_t> lastWriteNs{0};
 };
 
 // Tasks dispatched to writer/reader pools
@@ -284,9 +304,21 @@ public:
 
     static constexpr uint16_t kMaxVBuckets = 1024;
 
+    // Finished write Requests come back here instead of being deleted on a
+    // writer thread. IO threads take from it before allocating. False when
+    // full; the caller deletes.
+    bool RecycleRequest(Request* req) {
+        return freeRequests_.write(req);
+    }
+    Request* TakeRequest() {
+        Request* r{nullptr};
+        return freeRequests_.read(r) ? r : nullptr;
+    }
+
 private:
     uint16_t shardId_;
     std::unique_ptr<Magma> magma_;
+    folly::MPMCQueue<Request*> freeRequests_;
     std::array<VBQueue, kMaxVBuckets> vbWriteQueues_;
     std::array<VBQueue, kMaxVBuckets> vbReadQueues_;
     std::array<std::atomic<uint64_t>, kMaxVBuckets> seqnos_{};
@@ -302,14 +334,28 @@ public:
     ~WriterPool();
 
     void Submit(PersistTask task);
+    // Submit now, or after the coalescing interval if the vbucket was just
+    // written and has little queued. Caller has already won `scheduled`.
+    void SubmitOrDefer(PersistTask task, VBQueue& vbq);
     void Shutdown();
 
 private:
+    struct Deferred {
+        uint64_t notBeforeNs{0};
+        PersistTask task;
+    };
+
     void workerLoop();
+    void deferLoop();
     void executePersist(PersistTask& task);
 
     std::vector<std::thread> threads_;
     folly::MPMCQueue<PersistTask> taskQueue_;
+    // FIFO of tasks waiting out the coalescing interval. Every entry has the
+    // same delay, so arrival order is due order and one thread sleeping on
+    // the head is enough.
+    folly::MPMCQueue<Deferred> deferQueue_;
+    std::thread deferThread_;
     std::atomic<bool> shutdown_{false};
     Bucket* bucket_;
 };

@@ -116,6 +116,13 @@ Connection::~Connection() {
     }
 }
 
+Request* Connection::acquireRequest(uint16_t vbucket) {
+    if (auto* r = bucket_->GetShard(vbucket).TakeRequest()) {
+        return r;
+    }
+    return acquireRequest();
+}
+
 Request* Connection::acquireRequest() {
     if (!reqPool_.empty()) {
         auto* r = reqPool_.back();
@@ -816,7 +823,7 @@ void Connection::handleSet(McbpHeader& hdr,
                            std::unique_ptr<folly::IOBuf> body) {
     hotStatAdd(gDispStats.cmdSet);
 
-    auto* req = acquireRequest();
+    auto* req = acquireRequest(hdr.specific);
     req->opcode = hdr.opcode;
     req->vbucket = hdr.specific;
     req->opaque = hdr.opaque;
@@ -825,8 +832,15 @@ void Connection::handleSet(McbpHeader& hdr,
 
     if (body) {
         body->coalesce();
-        req->dataBuf = std::move(body);
-        const char* p = reinterpret_cast<const char*>(req->dataBuf->data());
+        const char* p;
+        if (body->length() <= Request::kInlineData) {
+            // Copy and let the IOBuf go now, on this thread.
+            memcpy(req->inlineData, body->data(), body->length());
+            p = req->inlineData;
+        } else {
+            req->dataBuf = std::move(body);
+            p = reinterpret_cast<const char*>(req->dataBuf->data());
+        }
 
         if (hdr.extrasLen >= 4) {
             req->flags = ntohl(*reinterpret_cast<const uint32_t*>(p));

@@ -1,5 +1,7 @@
 #include "engine.h"
 
+#include <pthread.h>
+
 #include <algorithm>
 #include "connection.h"
 #include "include/libmagma/operations.h"
@@ -20,6 +22,28 @@ DocCache* gDocCache = nullptr;
 // libaio + IOQueueDepth=16 sweet spot; lower (8-16) is better for sync
 // QD=1 multi-thread parallelism.
 size_t gMaxReadBatch = 128;
+size_t gMinWriteBatch = 64;
+// Per-shard cap on recycled Requests; beyond it writers delete. Sized to
+// cover the write queue at a few hundred bytes per Request.
+static constexpr size_t kFreeRequestCap = 1 << 18;
+uint64_t gWriteCoalesceNs = 500 * 1000;
+
+namespace {
+inline uint64_t steadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+}
+
+inline bool shouldDeferWrite(const VBQueue& vbq, uint64_t now) {
+    if (gWriteCoalesceNs == 0 ||
+        vbq.pending.load(std::memory_order_relaxed) >= gMinWriteBatch) {
+        return false;
+    }
+    return now - vbq.lastWriteNs.load(std::memory_order_relaxed) <
+           gWriteCoalesceNs;
+}
+} // namespace
 // Gates per-op stat increments — see engine.h.
 bool gStatsHotPath = true;
 
@@ -90,7 +114,7 @@ std::string DispatcherStats::toJson() const {
 Shard::Shard(uint16_t shardId,
              const std::string& path,
              const Magma::Config& cfg)
-    : shardId_(shardId) {
+    : shardId_(shardId), freeRequests_(kFreeRequestCap) {
     Magma::Config shardCfg = cfg;
     shardCfg.Path = path;
     magma_ = std::make_unique<Magma>(shardCfg);
@@ -98,6 +122,10 @@ Shard::Shard(uint16_t shardId,
 
 Shard::~Shard() {
     Close();
+    Request* r{nullptr};
+    while (freeRequests_.read(r)) {
+        delete r;
+    }
 }
 
 void Shard::CreatePools(size_t numWriters,
@@ -153,9 +181,16 @@ static inline void releaseVBQueue(VBQueue& vbq, Q& taskQueue, Task retask) {
 }
 
 WriterPool::WriterPool(size_t numThreads, size_t queueSize, Bucket* bucket)
-    : taskQueue_(queueSize), bucket_(bucket) {
+    : taskQueue_(queueSize), deferQueue_(queueSize), bucket_(bucket) {
+    deferThread_ = std::thread([this]() {
+        pthread_setname_np(pthread_self(), "fx:coalesce");
+        deferLoop();
+    });
     for (size_t i = 0; i < numThreads; i++) {
-        threads_.emplace_back([this]() { workerLoop(); });
+        threads_.emplace_back([this]() {
+            pthread_setname_np(pthread_self(), "fx:writer");
+            workerLoop();
+        });
     }
 }
 
@@ -167,9 +202,49 @@ void WriterPool::Submit(PersistTask task) {
     taskQueue_.blockingWrite(std::move(task));
 }
 
+void WriterPool::SubmitOrDefer(PersistTask task, VBQueue& vbq) {
+    const uint64_t now = steadyNowNs();
+    if (shouldDeferWrite(vbq, now)) {
+        deferQueue_.blockingWrite(Deferred{
+                vbq.lastWriteNs.load(std::memory_order_relaxed) +
+                        gWriteCoalesceNs,
+                task});
+        return;
+    }
+    taskQueue_.blockingWrite(std::move(task));
+}
+
+void WriterPool::deferLoop() {
+    for (;;) {
+        Deferred d;
+        deferQueue_.blockingRead(d);
+        if (!d.task.shard) {
+            // Shutdown: hand over whatever is still waiting, then exit.
+            while (deferQueue_.read(d)) {
+                if (d.task.shard) {
+                    taskQueue_.blockingWrite(std::move(d.task));
+                }
+            }
+            break;
+        }
+        const uint64_t now = steadyNowNs();
+        if (d.notBeforeNs > now) {
+            std::this_thread::sleep_for(
+                    std::chrono::nanoseconds(d.notBeforeNs - now));
+        }
+        taskQueue_.blockingWrite(std::move(d.task));
+    }
+}
+
 void WriterPool::Shutdown() {
     if (shutdown_.exchange(true)) {
         return;
+    }
+    // Flush the coalescing queue into the task queue first so nothing is
+    // still waiting out its interval when the workers see their sentinels.
+    deferQueue_.blockingWrite(Deferred{0, PersistTask{nullptr, 0}});
+    if (deferThread_.joinable()) {
+        deferThread_.join();
     }
     // The sentinels queue behind whatever work is already pending. The queue
     // is FIFO, so each worker executes every task enqueued before this point
@@ -267,6 +342,8 @@ void WriterPool::executePersist(PersistTask& task) {
     std::vector<Request*> batch;
     batch.reserve(256);
     vbq.list.sweep([&](Request* req) { batch.push_back(req); });
+    vbq.pending.fetch_sub(static_cast<uint32_t>(batch.size()),
+                          std::memory_order_relaxed);
 
     if (batch.empty()) {
         releaseVBQueue(vbq, taskQueue_, PersistTask{shard, task.vbid});
@@ -277,16 +354,20 @@ void WriterPool::executePersist(PersistTask& task) {
     // Build WriteOperation batch
     std::vector<Magma::WriteOperation> ops;
     ops.reserve(batch.size());
-    std::vector<std::string> metaStorage(batch.size());
+    // DocMeta is packed and written to disk as-is, so the vector's storage
+    // is the encoded form: one allocation per batch, not a string per op.
+    std::vector<DocMeta> metas(batch.size());
+    const uint64_t cas =
+            std::chrono::system_clock::now().time_since_epoch().count();
 
     for (size_t i = 0; i < batch.size(); i++) {
         auto* req = batch[i];
         uint64_t seqno = shard->NextSeqno(task.vbid);
         req->resultSeqno = seqno;
 
-        DocMeta dm;
+        DocMeta& dm = metas[i];
         dm.seqno = seqno;
-        dm.cas = std::chrono::system_clock::now().time_since_epoch().count();
+        dm.cas = cas;
         dm.valueSize = req->value.Len();
         dm.flags = req->flags;
         dm.expiry = req->expiry;
@@ -294,8 +375,7 @@ void WriterPool::executePersist(PersistTask& task) {
         dm.deleted =
                 (req->opcode == static_cast<uint8_t>(Opcode::Delete)) ? 1 : 0;
 
-        metaStorage[i] = dm.encode();
-        Slice meta(metaStorage[i]);
+        Slice meta(reinterpret_cast<const char*>(&dm), sizeof(DocMeta));
 
         if (req->opcode == static_cast<uint8_t>(Opcode::Delete)) {
             ops.push_back(Magma::WriteOperation::NewDocDelete(req->key, meta));
@@ -309,6 +389,7 @@ void WriterPool::executePersist(PersistTask& task) {
     hotStatAdd(gDispStats.writeBatchItems, ops.size());
 
     auto status = shard->GetMagma()->WriteDocs(task.vbid, ops);
+    vbq.lastWriteNs.store(steadyNowNs(), std::memory_order_relaxed);
 
     // Release the cache pins these writes took in handleSet/handleDelete.
     // Done whether or not WriteDocs succeeded: a failed write is reported to
@@ -344,20 +425,30 @@ void WriterPool::executePersist(PersistTask& task) {
                     [conn, req]() { conn->sendWriteResponse(req); });
         }
     } else {
-        // Async mode: response already sent by IO thread. Just free requests.
+        // Async mode: response already sent by IO thread. Recycle the
+        // requests for the IO threads to reuse; deleting here frees memory
+        // another thread allocated.
+        if (status.IsOK()) {
+            hotStatAdd(gDispStats.cmdSetResp, batch.size());
+        } else {
+            hotStatAdd(gDispStats.cmdSetRespErr, batch.size());
+        }
         for (auto* req : batch) {
-            if (status.IsOK()) {
-                hotStatAdd(gDispStats.cmdSetResp);
-            } else {
-                hotStatAdd(gDispStats.cmdSetRespErr);
+            req->reset();
+            if (!shard->RecycleRequest(req)) {
+                delete req;
             }
-            delete req;
         }
     }
 
-    // Re-sweep immediately — items accumulated during WriteDocs.
-    // If we got more, loop back via the queue for fairness with other vbs.
-    releaseVBQueue(vbq, taskQueue_, PersistTask{shard, task.vbid});
+    // Items accumulated during WriteDocs. Re-arm through the queue for
+    // fairness with other vbs, deferred if this batch was small. Same
+    // seq_cst store and recheck as releaseVBQueue - see the comment there.
+    vbq.scheduled.store(false, std::memory_order_seq_cst);
+    if (!vbq.list.empty() &&
+        !vbq.scheduled.exchange(true, std::memory_order_acq_rel)) {
+        SubmitOrDefer(PersistTask{shard, task.vbid}, vbq);
+    }
 }
 
 // ---- ReaderPool ----
@@ -414,7 +505,10 @@ void ReaderPool::Submit(ReadTask task) {
 void ReaderPool::spawn() {
     auto w = std::make_unique<Worker>();
     auto* self = w.get();
-    w->thread = std::thread([this, self]() { workerLoop(self); });
+    w->thread = std::thread([this, self]() {
+        pthread_setname_np(pthread_self(), "fx:reader");
+        workerLoop(self);
+    });
     workers_.push_back(std::move(w));
     live_.fetch_add(1, std::memory_order_relaxed);
 }
@@ -915,11 +1009,12 @@ bool Bucket::EnqueueWrite(Request* req) {
 
     // Lock-free push (MPSC: multiple IO threads push)
     vbq.list.insertHead(req);
+    vbq.pending.fetch_add(1, std::memory_order_relaxed);
 
     // Schedule persistence if not already scheduled — push to THIS shard's
     // own writer pool (no cross-shard MPMC contention).
     if (!vbq.scheduled.exchange(true, std::memory_order_acq_rel)) {
-        shard.GetWriterPool()->Submit({&shard, req->vbucket});
+        shard.GetWriterPool()->SubmitOrDefer({&shard, req->vbucket}, vbq);
     }
     return true;
 }

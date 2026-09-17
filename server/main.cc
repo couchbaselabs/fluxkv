@@ -111,6 +111,18 @@ struct Config {
     size_t sharedWalFlushers = 2;
     size_t sharedWalChunks = 8;
     size_t sharedWalChunkSize = 8u << 20;
+    size_t sharedWalFlushUs = 200; // shwal MinFlushIntervalUs
+    // Wait for the shared log to be durable inside every WriteDocs.
+    // -1 follows --durable: an async server acknowledges before persistence,
+    // so making each writer sleep through a group-commit flush buys nothing.
+    int sharedWalSyncCommit = -1;
+    // Skip magma's lookup of the previous version on every set. magma then
+    // cannot report insert-vs-update per document (nothing here consumes
+    // that) and leaves the old seqIndex entry to compaction GC.
+    bool blindWrites = false;
+    // Write coalescing, see gWriteCoalesceNs in engine.h.
+    size_t writeCoalesceUs = 500;
+    size_t minWriteBatch = 64;
 };
 
 static void printUsage(const char* prog) {
@@ -172,6 +184,17 @@ static void printUsage(const char* prog) {
                  "log (default 2)\n"
               << "  --shared-wal-chunks N     in-flight chunks (default 8)\n"
               << "  --shared-wal-chunk-size N bytes per chunk (default 8MB)\n"
+              << "  --shared-wal-flush-us N   min interval between log "
+                 "flushes (default 200)\n"
+              << "  --shared-wal-sync-commit 0|1  wait for the shared log to "
+                 "be durable in every write batch (default: 1 with --durable, "
+                 "else 0)\n"
+              << "  --blind-writes        do not look up the previous version "
+                 "of a document on set\n"
+              << "  --write-coalesce-us N wait up to N us before writing a "
+                 "vbucket again when fewer than --min-write-batch items are "
+                 "queued (default 500, 0 disables)\n"
+              << "  --min-write-batch N   (default 64)\n"
               << "  --help            Show this help\n";
 }
 
@@ -221,6 +244,11 @@ static Config parseArgs(int argc, char* argv[]) {
             {"shared-wal-flushers", required_argument, nullptr, 1042},
             {"shared-wal-chunks", required_argument, nullptr, 1043},
             {"shared-wal-chunk-size", required_argument, nullptr, 1044},
+            {"shared-wal-sync-commit", required_argument, nullptr, 1046},
+            {"shared-wal-flush-us", required_argument, nullptr, 1050},
+            {"blind-writes", no_argument, nullptr, 1047},
+            {"write-coalesce-us", required_argument, nullptr, 1048},
+            {"min-write-batch", required_argument, nullptr, 1049},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
 
@@ -357,6 +385,21 @@ static Config parseArgs(int argc, char* argv[]) {
         case 1044:
             cfg.sharedWalChunkSize = strtoull(optarg, nullptr, 10);
             break;
+        case 1050:
+            cfg.sharedWalFlushUs = strtoull(optarg, nullptr, 10);
+            break;
+        case 1046:
+            cfg.sharedWalSyncCommit = atoi(optarg) != 0 ? 1 : 0;
+            break;
+        case 1047:
+            cfg.blindWrites = true;
+            break;
+        case 1048:
+            cfg.writeCoalesceUs = strtoull(optarg, nullptr, 10);
+            break;
+        case 1049:
+            cfg.minWriteBatch = strtoull(optarg, nullptr, 10);
+            break;
         case 'h':
         default:
             printUsage(argv[0]);
@@ -415,6 +458,8 @@ int main(int argc, char* argv[]) {
     magmaCfg.BlockCacheNumPartitions =
             std::max<size_t>(64, 4 * cfg.readers);
     kvserver::gMaxReadBatch = cfg.maxReadBatch;
+    kvserver::gWriteCoalesceNs = cfg.writeCoalesceUs * 1000;
+    kvserver::gMinWriteBatch = cfg.minWriteBatch;
     if (cfg.noHotStats) {
         kvserver::gStatsHotPath = false;
     }
@@ -479,6 +524,9 @@ int main(int argc, char* argv[]) {
         o.NumFlushers = static_cast<uint32_t>(cfg.sharedWalFlushers);
         o.NumChunks = static_cast<uint32_t>(cfg.sharedWalChunks);
         o.ChunkSize = static_cast<uint32_t>(cfg.sharedWalChunkSize);
+        o.MinFlushIntervalUs = cfg.sharedWalFlushUs;
+        o.SyncOnCommit = cfg.sharedWalSyncCommit < 0 ? cfg.durable
+                                                     : cfg.sharedWalSyncCommit;
         std::filesystem::create_directories(o.Path);
         auto s = SharedWALHandle::Create(o, sharedWal);
         if (!s.IsOK()) {
@@ -486,14 +534,18 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         magmaCfg.SharedWAL = sharedWal;
-        spdlog::info("  shared-wal: path={} flushers={} chunks={} chunk={}MB",
-                     o.Path,
-                     o.NumFlushers,
-                     o.NumChunks,
-                     o.ChunkSize / (1024 * 1024));
+        spdlog::info(
+                "  shared-wal: path={} flushers={} chunks={} chunk={}MB "
+                "sync-commit={}",
+                o.Path,
+                o.NumFlushers,
+                o.NumChunks,
+                o.ChunkSize / (1024 * 1024),
+                o.SyncOnCommit);
     }
 
     magmaCfg.LogLevel = "info";
+    magmaCfg.EnableUpdateStatusForSet = !cfg.blindWrites;
     // Write cache is half the per-shard quota.
     //
     // This used to be capped at 256 MB. The cap is the threshold magma
