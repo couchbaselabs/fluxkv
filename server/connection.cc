@@ -119,36 +119,32 @@ Connection::~Connection() {
 namespace {
 // Requests recycled by the writers, unrolled from the per-shard chains.
 // One per IO thread; deleted with the thread.
+// Kept as the chain the writer built, popped one at a time: each Request is
+// a cache miss (a writer wrote it last), and popping is the only touch
+// before handleSet fills it in anyway. Unrolling into a vector first cost a
+// second miss per request.
 struct RecycledRequests {
-    std::vector<Request*> free;
+    Request* chain{nullptr};
     ~RecycledRequests() {
-        for (auto* r : free) {
-            delete r;
+        while (chain) {
+            Request* next = chain->hook.next;
+            delete chain;
+            chain = next;
         }
     }
 };
 thread_local RecycledRequests tlsRecycled;
-constexpr size_t kMaxRecycledPerThread = 8192;
 } // namespace
 
 Request* Connection::acquireRequest(uint16_t vbucket) {
-    auto& free = tlsRecycled.free;
-    if (free.empty()) {
-        Request* chain = bucket_->GetShard(vbucket).TakeRequests();
-        while (chain) {
-            Request* next = chain->hook.next;
-            chain->hook.next = nullptr;
-            if (free.size() < kMaxRecycledPerThread) {
-                free.push_back(chain);
-            } else {
-                delete chain;
-            }
-            chain = next;
-        }
+    auto& c = tlsRecycled.chain;
+    if (!c) {
+        c = bucket_->GetShard(vbucket).TakeRequests();
     }
-    if (!free.empty()) {
-        auto* r = free.back();
-        free.pop_back();
+    if (c) {
+        Request* r = c;
+        c = r->hook.next;
+        r->hook.next = nullptr;
         return r;
     }
     return acquireRequest();
