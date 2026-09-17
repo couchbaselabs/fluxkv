@@ -59,6 +59,10 @@ set(CBMAGMA_INCLUDE_DIRS
     "${_src}"
     "${_src}/magma"
     "${_src}/magma/include"
+    # The shared write-ahead log is a vendored library inside magma; its
+    # headers are not on magma's public include path. Harmless when the
+    # directory is absent.
+    "${_src}/magma/shwal_lib/include"
     "${_src}/kv_engine/include"
     "${_src}/kv_engine/engines/ep/src/kvstore/storage_common"
     "${_src}/kv_engine/engines/ep/src/kvstore/magma-kvstore/kv_magma_common"

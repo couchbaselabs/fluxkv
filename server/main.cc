@@ -3,6 +3,10 @@
 #include "metadata.h"
 #include "server.h"
 
+// magma.h only forward-declares SharedWALHandle; creating one needs the
+// definition, which lives in magma's own tree rather than its public headers.
+#include "magma/shared_wal.h"
+
 #include <platform/cb_arena_malloc.h>
 #include <spdlog/spdlog.h>
 
@@ -13,6 +17,7 @@
 #include <execinfo.h>
 #include <fcntl.h>
 #include <algorithm>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -96,6 +101,16 @@ struct Config {
     bool autoTune = false;
     size_t maxIoThreads = 0; // 0 = hardware threads
     size_t maxReaders = 0; // 0 = 4 x hardware threads
+    // One write-ahead log shared by every shard, instead of one per shard.
+    // Shards stop serialising against each other on their own log mutex and
+    // one durability flush covers writes from all of them.
+    // Per-shard write cache in bytes; 0 derives it from the quota.
+    size_t writeCache = 0;
+    bool sharedWal = false;
+    std::string sharedWalPath; // defaults to <data-dir>/shared-wal
+    size_t sharedWalFlushers = 2;
+    size_t sharedWalChunks = 8;
+    size_t sharedWalChunkSize = 8u << 20;
 };
 
 static void printUsage(const char* prog) {
@@ -146,6 +161,17 @@ static void printUsage(const char* prog) {
                  "hardware threads)\n"
               << "  --max-readers N       ceiling for --auto-tune (default: "
                  "4 x hardware threads)\n"
+              << "  --write-cache N       per-shard write cache in bytes "
+                 "(default: half the per-shard quota). This is the threshold "
+                 "magma throttles writers against\n"
+              << "  --shared-wal          one write-ahead log shared by all "
+                 "shards instead of one per shard\n"
+              << "  --shared-wal-path P   where the shared log lives "
+                 "(default: <data-dir>/shared-wal)\n"
+              << "  --shared-wal-flushers N   flusher threads for the shared "
+                 "log (default 2)\n"
+              << "  --shared-wal-chunks N     in-flight chunks (default 8)\n"
+              << "  --shared-wal-chunk-size N bytes per chunk (default 8MB)\n"
               << "  --help            Show this help\n";
 }
 
@@ -189,6 +215,12 @@ static Config parseArgs(int argc, char* argv[]) {
             {"auto-tune", no_argument, nullptr, 1030},
             {"max-io-threads", required_argument, nullptr, 1031},
             {"max-readers", required_argument, nullptr, 1032},
+            {"write-cache", required_argument, nullptr, 1045},
+            {"shared-wal", no_argument, nullptr, 1040},
+            {"shared-wal-path", required_argument, nullptr, 1041},
+            {"shared-wal-flushers", required_argument, nullptr, 1042},
+            {"shared-wal-chunks", required_argument, nullptr, 1043},
+            {"shared-wal-chunk-size", required_argument, nullptr, 1044},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
 
@@ -307,6 +339,24 @@ static Config parseArgs(int argc, char* argv[]) {
         case 1032:
             cfg.maxReaders = strtoull(optarg, nullptr, 10);
             break;
+        case 1045:
+            cfg.writeCache = strtoull(optarg, nullptr, 10);
+            break;
+        case 1040:
+            cfg.sharedWal = true;
+            break;
+        case 1041:
+            cfg.sharedWalPath = optarg;
+            break;
+        case 1042:
+            cfg.sharedWalFlushers = strtoull(optarg, nullptr, 10);
+            break;
+        case 1043:
+            cfg.sharedWalChunks = strtoull(optarg, nullptr, 10);
+            break;
+        case 1044:
+            cfg.sharedWalChunkSize = strtoull(optarg, nullptr, 10);
+            break;
         case 'h':
         default:
             printUsage(argv[0]);
@@ -417,11 +467,44 @@ int main(int argc, char* argv[]) {
     if (cfg.dataBlockSize > 0) {
         magmaCfg.SeqTreeBlockSize = cfg.dataBlockSize;
     }
+    // One log for every shard. Each shard otherwise has its own write-ahead
+    // log and its own flush, so N shards mean N logs competing for the same
+    // device; here they append into one log and a single flush covers them.
+    std::shared_ptr<SharedWALHandle> sharedWal;
+    if (cfg.sharedWal) {
+        SharedWALHandle::Options o;
+        o.Path = cfg.sharedWalPath.empty()
+                         ? cfg.dataDir + "/" + cfg.bucket + "/shared-wal"
+                         : cfg.sharedWalPath;
+        o.NumFlushers = static_cast<uint32_t>(cfg.sharedWalFlushers);
+        o.NumChunks = static_cast<uint32_t>(cfg.sharedWalChunks);
+        o.ChunkSize = static_cast<uint32_t>(cfg.sharedWalChunkSize);
+        std::filesystem::create_directories(o.Path);
+        auto s = SharedWALHandle::Create(o, sharedWal);
+        if (!s.IsOK()) {
+            spdlog::error("shared WAL: {}", s.String());
+            return 1;
+        }
+        magmaCfg.SharedWAL = sharedWal;
+        spdlog::info("  shared-wal: path={} flushers={} chunks={} chunk={}MB",
+                     o.Path,
+                     o.NumFlushers,
+                     o.NumChunks,
+                     o.ChunkSize / (1024 * 1024));
+    }
+
     magmaCfg.LogLevel = "info";
-    // Scale write cache to 50% of per-shard quota, cap at 256MB
+    // Write cache is half the per-shard quota.
+    //
+    // This used to be capped at 256 MB. The cap is the threshold magma
+    // throttles writers against, so on a write workload the cache sat six
+    // times over it and every writer blocked in the throttle waiting for a
+    // flush - half the machine idle and the disk barely used while writes
+    // were refused. Raising the quota did nothing because the cap ignored it.
+    // --write-cache overrides the derived value.
     size_t perShardQuota = cfg.memQuota / cfg.shards;
     magmaCfg.MaxWriteCacheSize =
-            std::min(perShardQuota / 2, (size_t)256 * 1024 * 1024);
+            cfg.writeCache > 0 ? cfg.writeCache : perShardQuota / 2;
     magmaCfg.WALBufferSize =
             std::min(perShardQuota / 8, (size_t)16 * 1024 * 1024);
 
