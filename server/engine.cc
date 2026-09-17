@@ -42,6 +42,12 @@ std::string DispatcherStats::toJson() const {
     j["queued_gets"] = queuedGets.Sum();
     j["bad_magic"] = badMagic.load(std::memory_order_relaxed);
     j["bad_opcode"] = badOpcode.load(std::memory_order_relaxed);
+    j["migrations_started"] = migrationsStarted.load(std::memory_order_relaxed);
+    j["migrations_done"] = migrationsDone.load(std::memory_order_relaxed);
+    j["mig_wait_outstanding"] = migWaitOutstanding.load(std::memory_order_relaxed);
+    j["mig_wait_flush"] = migWaitFlush.load(std::memory_order_relaxed);
+    j["mig_wait_inflight"] = migWaitInflight.load(std::memory_order_relaxed);
+    j["mig_total_us"] = migTotalUs.load(std::memory_order_relaxed);
     auto wBatches = writeBatches.Sum();
     j["avg_write_batch"] =
             wBatches > 0

@@ -9,6 +9,7 @@
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/AsyncTimeout.h>
 
+#include <chrono>
 #include <list>
 #include <memory>
 #include <string>
@@ -97,6 +98,7 @@ private:
     const std::string& errorMap_;
     IOThread* owner_{nullptr};
     IOThread* migrateTarget_{nullptr};
+    std::chrono::steady_clock::time_point migrateStart_;
     bool closing_{false};
     bool migrating_{false};
     bool migrateCheckPending_{false};
@@ -136,6 +138,12 @@ private:
     };
     FlushLoopCb flushCb_;
     bool flushScheduled_{false};
+    class MigrateLoopCb : public folly::EventBase::LoopCallback {
+    public:
+        Connection* conn{nullptr};
+        void runLoopCallback() noexcept override;
+    };
+    MigrateLoopCb migrateCb_;
     // Deferred flush (MAGMA_FLUSH_DELAY_US > 0): instead of flushing at the tail
     // of every EventBase iteration (~1.6 responses per sendmsg at 1.1M GET/s,
     // O45), arm a high-res timer and let responses from many reader threads

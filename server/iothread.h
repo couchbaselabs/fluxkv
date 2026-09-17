@@ -3,7 +3,9 @@
 #include <folly/io/async/EventBase.h>
 
 #include <atomic>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -50,10 +52,56 @@ struct IOThread {
 
     void Start() {
         auto* e = evb.get();
+        pump.owner = this;
         thread = std::thread([e]() { e->loopForever(); });
         hasCpuClock =
                 pthread_getcpuclockid(thread.native_handle(), &cpuClock) == 0;
     }
+
+    // Run fn on the loop thread, promptly even when the loop is saturated.
+    //
+    // EventBase::runInEventBaseThread is drained only when the loop reaches
+    // its cross-thread queue, and a loop with many always-ready sockets can
+    // go many seconds without doing so (measured: 18 s for a 2.6 ms
+    // iteration). So work is left in a mailbox and the loop is told two
+    // ways: the queue, which wakes an idle loop, and a flag the read path
+    // checks on every event, which a busy loop sees within one iteration.
+    // Either way the mail runs as a loop callback, a plain top-level
+    // context, at the end of the current iteration.
+    void Post(std::function<void()> fn) {
+        {
+            std::lock_guard<std::mutex> g(mailMu);
+            mail.push_back(std::move(fn));
+        }
+        hasMail.store(true, std::memory_order_release);
+        evb->runInEventBaseThread([this]() { SchedulePump(); });
+    }
+
+    // Loop thread only.
+    void SchedulePump() {
+        if (!pump.isLoopCallbackScheduled()) {
+            evb->runInLoop(&pump);
+        }
+    }
+
+    struct Pump : folly::EventBase::LoopCallback {
+        IOThread* owner{nullptr};
+        void runLoopCallback() noexcept override {
+            std::vector<std::function<void()>> batch;
+            {
+                std::lock_guard<std::mutex> g(owner->mailMu);
+                batch.swap(owner->mail);
+                owner->hasMail.store(false, std::memory_order_release);
+            }
+            for (auto& fn : batch) {
+                fn();
+            }
+        }
+    };
+    Pump pump;
+    std::mutex mailMu;
+    std::vector<std::function<void()>> mail;
+    std::atomic<bool> hasMail{false};
 
     // CPU time consumed by the loop thread so far. The loop blocks in
     // epoll_wait when idle, so this is exactly its busy time.

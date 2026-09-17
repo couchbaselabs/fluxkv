@@ -79,6 +79,14 @@ struct DispatcherStats {
     HotCounter queuedGets;
     std::atomic<uint64_t> badMagic{0};
     std::atomic<uint64_t> badOpcode{0};
+    // Connection moves between IO threads: begun, and finished on the target.
+    std::atomic<uint64_t> migrationsStarted{0};
+    std::atomic<uint64_t> migrationsDone{0};
+    // Why a migration check had to wait, and total time spent migrating.
+    std::atomic<uint64_t> migWaitOutstanding{0};
+    std::atomic<uint64_t> migWaitFlush{0};
+    std::atomic<uint64_t> migWaitInflight{0};
+    std::atomic<uint64_t> migTotalUs{0};
 
     std::string toJson() const;
 };

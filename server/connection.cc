@@ -152,6 +152,14 @@ void Connection::destroy() {
     if (flushCb_.isLoopCallbackScheduled()) {
         flushCb_.cancelLoopCallback();
     }
+    if (migrateCb_.isLoopCallbackScheduled()) {
+        migrateCb_.cancelLoopCallback();
+    }
+    if (migrating_ && migrateTarget_) {
+        migrateTarget_->Unreserve();
+        migrateTarget_ = nullptr;
+    }
+    migrating_ = false;
     flushScheduled_ = false;
     if (owner_) {
         owner_->Remove(this);
@@ -174,6 +182,8 @@ bool Connection::migrateTo(IOThread* target) {
     }
     migrating_ = true;
     migrateTarget_ = target;
+    migrateStart_ = std::chrono::steady_clock::now();
+    gDispStats.migrationsStarted.fetch_add(1, std::memory_order_relaxed);
     // No new requests from here on; the ones in flight drain first.
     socket_->setReadCB(nullptr);
     scheduleMigrateCheck();
@@ -182,7 +192,9 @@ bool Connection::migrateTo(IOThread* target) {
 
 // The checks run as their own loop callback, never from inside a socket
 // callback: detaching the socket from within its own write completion would
-// pull the EventBase out from under AsyncSocket mid-call.
+// pull the EventBase out from under AsyncSocket mid-call. A loop callback
+// runs at the end of the current iteration, unlike the cross-thread queue,
+// which a busy loop may not drain for a long time.
 void Connection::scheduleMigrateCheck() {
     if (migrateCheckPending_ || !migrating_) {
         return;
@@ -192,10 +204,16 @@ void Connection::scheduleMigrateCheck() {
         return;
     }
     migrateCheckPending_ = true;
-    evb->runInEventBaseThread([this]() {
-        migrateCheckPending_ = false;
-        tryFinishMigrate();
-    });
+    migrateCb_.conn = this;
+    evb->runInLoop(&migrateCb_);
+}
+
+void Connection::MigrateLoopCb::runLoopCallback() noexcept {
+    if (!conn) {
+        return;
+    }
+    conn->migrateCheckPending_ = false;
+    conn->tryFinishMigrate();
 }
 
 void Connection::tryFinishMigrate() {
@@ -211,9 +229,11 @@ void Connection::tryFinishMigrate() {
         return;
     }
     if (outstandingRequests_.load(std::memory_order_acquire) != 0) {
+        gDispStats.migWaitOutstanding.fetch_add(1, std::memory_order_relaxed);
         return; // onDrained() schedules the next check
     }
     if (!pendingWriteBuf_.empty()) {
+        gDispStats.migWaitFlush.fetch_add(1, std::memory_order_relaxed);
         if (flushTimeout_ && flushTimeout_->isScheduled()) {
             flushTimeout_->cancelTimeout();
         }
@@ -227,12 +247,17 @@ void Connection::tryFinishMigrate() {
         return;
     }
     if (!inflightBufs_.empty()) {
+        gDispStats.migWaitInflight.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     // Quiescent: nothing in flight in either direction.
     if (flushCb_.isLoopCallbackScheduled()) {
         flushCb_.cancelLoopCallback();
     }
+    if (migrateCb_.isLoopCallbackScheduled()) {
+        migrateCb_.cancelLoopCallback();
+    }
+    migrateCheckPending_ = false;
     flushScheduled_ = false;
     flushTimeout_.reset(); // bound to the old loop; recreated lazily
     if (owner_) {
@@ -242,7 +267,7 @@ void Connection::tryFinishMigrate() {
     IOThread* target = migrateTarget_;
     migrateTarget_ = nullptr;
     socket_->detachEventBase();
-    target->evb->runInEventBaseThread([this, target]() { finishAttach(target); });
+    target->Post([this, target]() { finishAttach(target); });
 }
 
 void Connection::finishAttach(IOThread* target) {
@@ -250,6 +275,12 @@ void Connection::finishAttach(IOThread* target) {
     owner_ = target;
     owner_->Add(this);
     migrating_ = false;
+    gDispStats.migrationsDone.fetch_add(1, std::memory_order_relaxed);
+    gDispStats.migTotalUs.fetch_add(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - migrateStart_)
+                    .count(),
+            std::memory_order_relaxed);
     socket_->setReadCB(this);
     // Requests that arrived before reading stopped may still be buffered
     // and the client may be waiting on them.
@@ -283,6 +314,10 @@ void Connection::getReadBuffer(void** bufReturn, size_t* lenReturn) {
 }
 
 void Connection::readDataAvailable(size_t len) noexcept {
+    // Work posted to this loop from other threads; see IOThread::Post.
+    if (owner_ && owner_->hasMail.load(std::memory_order_acquire)) {
+        owner_->SchedulePump();
+    }
     readBuf_.postallocate(len);
     while (!closing_ && parseAndDispatch()) {
     }

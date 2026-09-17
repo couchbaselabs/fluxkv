@@ -109,7 +109,18 @@ void postMigrations(IOThread* from, std::vector<IOThread*> dests) {
     if (dests.empty()) {
         return;
     }
-    from->evb->runInEventBaseThread([from, dests = std::move(dests)]() {
+    const auto posted = std::chrono::steady_clock::now();
+    from->Post([from, posted, dests = std::move(dests)]() {
+        const auto delayMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - posted)
+                                     .count();
+        if (delayMs > 100) {
+            spdlog::warn("migration plan for {} connections ran {} ms after "
+                         "it was posted (loop avg {} us)",
+                         dests.size(),
+                         delayMs,
+                         from->evb->getAvgLoopTime());
+        }
         size_t next = 0;
         std::vector<Connection*> conns = from->conns;
         for (auto* c : conns) {
@@ -251,9 +262,21 @@ void Server::IOPool::Reap() {
             iot->thread.join();
         }
     }
-    // A retiring loop still holding connections (a late accept, or a move
-    // that was skipped) gets another sweep.
     if (live.empty()) {
+        return;
+    }
+    // Plans only move connections that are not already moving, so a plan
+    // made while a wave is in flight is partly dropped. Once nothing is in
+    // flight, sweep again: retiring loops still holding connections, and
+    // any imbalance a dropped plan left behind.
+    int inFlight = 0;
+    for (auto* iot : live) {
+        inFlight += iot->pending.load(std::memory_order_relaxed);
+    }
+    for (auto* iot : stuck) {
+        inFlight += iot->pending.load(std::memory_order_relaxed);
+    }
+    if (inFlight > 0) {
         return;
     }
     for (auto* iot : stuck) {
@@ -261,6 +284,23 @@ void Server::IOPool::Reap() {
                        planMoves(iot->connCount.load(std::memory_order_relaxed),
                                  live));
     }
+    if (stuck.empty()) {
+        rebalance();
+    }
+}
+
+bool Server::IOPool::Settled() const {
+    std::lock_guard<std::mutex> g(s_->ioMu_);
+    for (auto& iot : s_->ioThreads_) {
+        if (iot->pending.load(std::memory_order_relaxed) > 0) {
+            return false;
+        }
+        if (iot->retiring.load(std::memory_order_relaxed) &&
+            iot->connCount.load(std::memory_order_relaxed) > 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 PoolSample Server::IOPool::Sample(double wallSec) {
@@ -280,6 +320,9 @@ PoolSample Server::IOPool::Sample(double wallSec) {
         s.size++;
         s.threadBusy.push_back(busy);
         s.threadLoad.push_back(iot->Load());
+        // Smoothed loop iteration time: how long anything posted to this
+        // loop waits, at worst.
+        s.waitUs = std::max(s.waitUs, iot->evb->getAvgLoopTime());
     }
     s.busyMean = s.size > 0 ? sum / s.size : 0;
     return s;
@@ -459,14 +502,13 @@ void Server::Start() {
         auto* clusterCfg = &clusterConfig_;
         auto* errMap = &errorMap_;
 
-        evb->runInEventBaseThread(
-                [iot, evb, clientFd, bucket, clusterCfg, errMap]() {
-                    auto socket = folly::AsyncSocket::newSocket(
-                            evb, folly::NetworkSocket::fromFd(clientFd));
-                    auto* conn = new Connection(
-                            std::move(socket), bucket, *clusterCfg, *errMap);
-                    conn->start(iot);
-                });
+        iot->Post([iot, evb, clientFd, bucket, clusterCfg, errMap]() {
+            auto socket = folly::AsyncSocket::newSocket(
+                    evb, folly::NetworkSocket::fromFd(clientFd));
+            auto* conn = new Connection(
+                    std::move(socket), bucket, *clusterCfg, *errMap);
+            conn->start(iot);
+        });
     }
 }
 

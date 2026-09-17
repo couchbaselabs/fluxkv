@@ -55,6 +55,9 @@ private:
         void Shrink(size_t n) override;
         PoolSample Sample(double wallSec) override;
         void Reap() override;
+        // True when no connection move is pending and no retiring loop still
+        // holds connections.
+        bool Settled() const override;
 
     private:
         void rebalance();
