@@ -4,6 +4,7 @@
 # size, accepted SET/s from the server counters (written + deduplicated),
 # magma stats and a profile. Runs on the server host.
 # Env: WRITERS FLUSHERS MEMQ VALSIZE CONNS PIPE SRVX SWF TAG PF JECONF
+#      ZIPF=0.99 for a skewed keyspace; unset for uniform random keys
 #      NOTUNE=" " (fixed thread counts instead of --auto-tune)
 #      DWARF=1 (add a DWARF call graph of six writer threads)
 set -u
@@ -36,7 +37,7 @@ grep -q "listening on" /tmp/flux-$TAG.log || { echo FAIL; tail /tmp/flux-$TAG.lo
 PID=$(pgrep -f "fluxkv_server --port 14001" | head -1)
 
 $FB -host 127.0.0.1:14001 -mode set -keys 256000000 -vbuckets 256 -keylen 8 \
-    -valsize ${VALSIZE:-8} -zipf 0.99 -conns ${CONNS:-64} -pipeline ${PIPE:-64} -batch 64 -pregen 64 \
+    -valsize ${VALSIZE:-8} ${ZIPF:+-zipf $ZIPF} -conns ${CONNS:-64} -pipeline ${PIPE:-64} -batch 64 -pregen 64 \
     -runtime 70s > /tmp/fb_$TAG.txt 2>&1 &
 FBP=$!
 sleep 15
