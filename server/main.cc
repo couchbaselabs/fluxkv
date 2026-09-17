@@ -123,6 +123,8 @@ struct Config {
     // Write coalescing, see gWriteCoalesceNs in engine.h.
     size_t writeCoalesceUs = 500;
     size_t minWriteBatch = 64;
+    std::string batchSort = "auto"; // auto | always | never
+    double sortDupThreshold = 0.05;
 };
 
 static void printUsage(const char* prog) {
@@ -195,6 +197,11 @@ static void printUsage(const char* prog) {
                  "vbucket again when fewer than --min-write-batch items are "
                  "queued (default 500, 0 disables)\n"
               << "  --min-write-batch N   (default 64)\n"
+              << "  --batch-sort MODE     sort write batches by key: auto "
+                 "(when a sample says the batch repeats keys), always, never "
+                 "(default auto)\n"
+              << "  --sort-dup-threshold F  duplicate fraction at which auto "
+                 "sorts (default 0.05)\n"
               << "  --help            Show this help\n";
 }
 
@@ -249,6 +256,8 @@ static Config parseArgs(int argc, char* argv[]) {
             {"blind-writes", no_argument, nullptr, 1047},
             {"write-coalesce-us", required_argument, nullptr, 1048},
             {"min-write-batch", required_argument, nullptr, 1049},
+            {"batch-sort", required_argument, nullptr, 1051},
+            {"sort-dup-threshold", required_argument, nullptr, 1052},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
 
@@ -400,6 +409,12 @@ static Config parseArgs(int argc, char* argv[]) {
         case 1049:
             cfg.minWriteBatch = strtoull(optarg, nullptr, 10);
             break;
+        case 1051:
+            cfg.batchSort = optarg;
+            break;
+        case 1052:
+            cfg.sortDupThreshold = strtod(optarg, nullptr);
+            break;
         case 'h':
         default:
             printUsage(argv[0]);
@@ -460,6 +475,15 @@ int main(int argc, char* argv[]) {
     kvserver::gMaxReadBatch = cfg.maxReadBatch;
     kvserver::gWriteCoalesceNs = cfg.writeCoalesceUs * 1000;
     kvserver::gMinWriteBatch = cfg.minWriteBatch;
+    kvserver::gSortDupThreshold = cfg.sortDupThreshold;
+    if (cfg.batchSort == "always") {
+        kvserver::gBatchSort = kvserver::BatchSort::Always;
+    } else if (cfg.batchSort == "never") {
+        kvserver::gBatchSort = kvserver::BatchSort::Never;
+    } else if (cfg.batchSort != "auto") {
+        spdlog::error("--batch-sort must be auto, always or never");
+        return 1;
+    }
     if (cfg.noHotStats) {
         kvserver::gStatsHotPath = false;
     }

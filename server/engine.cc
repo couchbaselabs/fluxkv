@@ -6,6 +6,7 @@
 #include "connection.h"
 #include "include/libmagma/operations.h"
 
+#include <folly/container/F14Set.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <algorithm>
@@ -23,6 +24,8 @@ DocCache* gDocCache = nullptr;
 // QD=1 multi-thread parallelism.
 size_t gMaxReadBatch = 128;
 size_t gMinWriteBatch = 64;
+BatchSort gBatchSort = BatchSort::Auto;
+double gSortDupThreshold = 0.05;
 // Per-shard cap on recycled Requests; beyond it writers delete. Sized to
 // cover the write queue at a few hundred bytes per Request.
 static constexpr size_t kFreeRequestCap = 1 << 18;
@@ -33,6 +36,41 @@ inline uint64_t steadyNowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                    std::chrono::steady_clock::now().time_since_epoch())
             .count();
+}
+
+// First 8 key bytes, big-endian, so that ordering by this value orders by
+// key for keys of 8 bytes or fewer.
+inline uint64_t keyPrefix(const Slice& k) {
+    uint64_t p = 0;
+    const size_t n = std::min<size_t>(8, k.Len());
+    for (size_t j = 0; j < n; j++) {
+        p |= static_cast<uint64_t>(static_cast<uint8_t>(k.Data()[j]))
+             << (56 - 8 * j);
+    }
+    return p;
+}
+
+// Fraction of a sample of the batch that repeats an earlier sampled key.
+// Sampling with a stride rather than a prefix keeps it representative of
+// the whole batch. Prefix collisions between different keys only make the
+// estimate high, which costs a sort, never correctness: the sort's dedupe
+// compares full keys.
+constexpr size_t kDupSampleMax = 128;
+
+double estimateDupFraction(const std::vector<Request*>& batch) {
+    const size_t n = batch.size();
+    const size_t want = std::min(n, kDupSampleMax);
+    const size_t stride = std::max<size_t>(1, n / want);
+    folly::F14FastSet<uint64_t> seen;
+    seen.reserve(want);
+    size_t sampled = 0, dups = 0;
+    for (size_t i = 0; i < n && sampled < want; i += stride) {
+        sampled++;
+        if (!seen.insert(keyPrefix(batch[i]->key)).second) {
+            dups++;
+        }
+    }
+    return sampled > 1 ? static_cast<double>(dups) / sampled : 0.0;
 }
 
 inline bool shouldDeferWrite(const VBQueue& vbq, uint64_t now) {
@@ -61,6 +99,7 @@ std::string DispatcherStats::toJson() const {
     j["write_batches"] = writeBatches.Sum();
     j["write_batch_items"] = writeBatchItems.Sum();
     j["write_dedups"] = writeDedups.Sum();
+    j["write_batches_sorted"] = writeBatchesSorted.Sum();
     j["read_batches"] = readBatches.Sum();
     j["read_batch_items"] = readBatchItems.Sum();
     j["tmp_fails"] = tmpFails.load(std::memory_order_relaxed);
@@ -364,12 +403,18 @@ void WriterPool::executePersist(PersistTask& task) {
     // not arrival order; nothing here exposes cross-key ordering. Dropped
     // requests are answered/recycled with the survivors below.
     std::vector<Request*> dropped;
-    if (batch.size() > 1) {
-        // Sort a compact (key prefix, index) array rather than the pointers:
-        // comparing through the pointers touched two scattered Requests per
-        // compare and cost more than the memtable insert it was meant to
-        // speed up. The prefix is the first 8 key bytes big-endian; equal
-        // prefixes fall back to the full key, then arrival order.
+    const bool doSort =
+            batch.size() > 1 &&
+            (gBatchSort == BatchSort::Always ||
+             (gBatchSort == BatchSort::Auto &&
+              estimateDupFraction(batch) >= gSortDupThreshold));
+    if (doSort) {
+        hotStatAdd(gDispStats.writeBatchesSorted);
+        // Sort a compact (key prefix, length, index) array rather than the
+        // pointers: comparing through the pointers touched two scattered
+        // Requests per compare and cost more than the memtable insert it
+        // was meant to speed up. Keys of 8 bytes or fewer are decided by
+        // prefix and length alone and never dereference.
         struct SortKey {
             uint64_t prefix;
             uint32_t idx;
@@ -378,46 +423,41 @@ void WriterPool::executePersist(PersistTask& task) {
         std::vector<SortKey> keys(batch.size());
         for (size_t i = 0; i < batch.size(); i++) {
             const auto& k = batch[i]->key;
-            uint64_t p = 0;
-            const size_t n = std::min<size_t>(8, k.Len());
-            for (size_t j = 0; j < n; j++) {
-                p |= static_cast<uint64_t>(
-                             static_cast<uint8_t>(k.Data()[j]))
-                     << (56 - 8 * j);
-            }
-            keys[i] = {p, static_cast<uint32_t>(i), static_cast<uint32_t>(k.Len())};
+            keys[i] = {keyPrefix(k),
+                       static_cast<uint32_t>(i),
+                       static_cast<uint32_t>(k.Len())};
         }
         auto fullKey = [&](uint32_t i) {
             return std::string_view(batch[i]->key.Data(), batch[i]->key.Len());
         };
-        // Keys of up to 8 bytes are decided by prefix and length alone;
-        // only longer keys with equal prefixes touch the Requests. Under
-        // Zipf half the batch are duplicates, so equal prefixes are common
-        // and a memcmp fallback there cost more than the memtable insert.
         auto sameKey = [&](const SortKey& a, const SortKey& b) {
             return a.prefix == b.prefix && a.len == b.len &&
                    (a.len <= 8 || fullKey(a.idx) == fullKey(b.idx));
         };
-        std::sort(keys.begin(), keys.end(), [&](const SortKey& a, const SortKey& b) {
-            if (a.prefix != b.prefix) {
-                return a.prefix < b.prefix;
-            }
-            if (a.len <= 8 && b.len <= 8) {
-                return a.len != b.len ? a.len < b.len : a.idx < b.idx;
-            }
-            const auto ka = fullKey(a.idx), kb = fullKey(b.idx);
-            if (ka != kb) {
-                return ka < kb;
-            }
-            return a.idx < b.idx;
-        });
+        std::sort(keys.begin(),
+                  keys.end(),
+                  [&](const SortKey& a, const SortKey& b) {
+                      if (a.prefix != b.prefix) {
+                          return a.prefix < b.prefix;
+                      }
+                      if (a.len <= 8 && b.len <= 8) {
+                          return a.len != b.len ? a.len < b.len : a.idx < b.idx;
+                      }
+                      const auto ka = fullKey(a.idx), kb = fullKey(b.idx);
+                      if (ka != kb) {
+                          return ka < kb;
+                      }
+                      return a.idx < b.idx;
+                  });
+        // Newest write per key wins; it is the last of each equal run.
+        // Seqnos are assigned below in this order, so within one batch they
+        // follow key order rather than arrival order. Nothing here exposes
+        // cross-key ordering, and magma only requires per-key increase.
         std::vector<Request*> sorted;
         sorted.reserve(batch.size());
         for (size_t i = 0; i < keys.size(); i++) {
             auto* req = batch[keys[i].idx];
-            const bool dupOfNext =
-                    i + 1 < keys.size() && sameKey(keys[i], keys[i + 1]);
-            if (dupOfNext) {
+            if (i + 1 < keys.size() && sameKey(keys[i], keys[i + 1])) {
                 dropped.push_back(req);
             } else {
                 sorted.push_back(req);

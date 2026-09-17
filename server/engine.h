@@ -74,6 +74,7 @@ struct DispatcherStats {
     HotCounter writeBatches;
     HotCounter writeBatchItems;
     HotCounter writeDedups; // older duplicates dropped within a batch
+    HotCounter writeBatchesSorted; // batches the writer chose to sort
     HotCounter readBatches;
     HotCounter readBatchItems;
     std::atomic<uint64_t> tmpFails{0};
@@ -109,6 +110,16 @@ extern size_t gMaxReadBatch;
 // one- and two-item batches. 0 disables.
 extern size_t gMinWriteBatch;
 extern uint64_t gWriteCoalesceNs;
+
+// Sorting a write batch by key pays when the batch holds repeats of the
+// same key (they collapse to one write) and, less, through locality in the
+// memtable's skiplist. Under a uniform keyspace there are no repeats and
+// the sort is close to pure cost, so the writer samples the batch and
+// decides. Always/Never force it for measurement.
+enum class BatchSort { Auto, Always, Never };
+extern BatchSort gBatchSort;
+// Estimated duplicate fraction at or above which Auto sorts.
+extern double gSortDupThreshold;
 // Master switch for per-op hot-path stat increments. At 1 M ops/s the cache-
 // line bouncing of atomic fetch_adds across N reader threads is measurable.
 // Disabled with --no-hot-stats; coarse counters (connectAccept/Close,
