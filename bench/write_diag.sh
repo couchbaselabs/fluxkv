@@ -1,9 +1,11 @@
 #!/bin/bash
 # fluxkv SET-only throughput on loopback with everything measured: server and
 # client cores, whole-box idle, disk bytes, per-thread CPU by role, write batch
-# size, accepted ops/s from the server counters, magma stats and a profile.
-# Runs on the server host. Env: WRITERS FLUSHERS MEMQ VALSIZE CONNS PIPE SRVX
-# SWF TAG PF DWARF=1 (add a DWARF call graph of six writer threads).
+# size, accepted SET/s from the server counters (written + deduplicated),
+# magma stats and a profile. Runs on the server host.
+# Env: WRITERS FLUSHERS MEMQ VALSIZE CONNS PIPE SRVX SWF TAG PF JECONF
+#      NOTUNE=" " (fixed thread counts instead of --auto-tune)
+#      DWARF=1 (add a DWARF call graph of six writer threads)
 set -u
 KV=/root/fluxkv/build/fluxkv_server
 FB=/root/fluxbench
@@ -26,7 +28,7 @@ setsid env ${JECONF:+JE_MALLOC_CONF=$JECONF} ${PRELOAD:+LD_PRELOAD=$PRELOAD} FLU
   --shards 8 --vbuckets 256 --mem-quota ${MEMQ:-8589934592} \
   --writers ${WRITERS:-64} --flushers ${FLUSHERS:-16} --write-queue-mem 4294967296 \
   --no-compression --index-compression-lz4 --data-block-size 1024 \
-  --io-queue-depth 16 --stats-port 18091 --auto-tune \
+  --io-queue-depth 16 --stats-port 18091 ${NOTUNE:---auto-tune} \
   --shared-wal --shared-wal-flushers ${SWF:-4} ${SRVX:-} \
   > /tmp/flux-$TAG.log 2>&1 </dev/null &
 for i in $(seq 1 180); do grep -q "listening on" /tmp/flux-$TAG.log 2>/dev/null && break; sleep 1; done
@@ -65,8 +67,9 @@ awk -v r="${R:-0}" -v e="${E:-?}" -v g=$((G1-G0)) -v c=$((C1-C0)) -v hz="$HZ" \
      r, e, g/hz/el, c/hz/el, (du+ds)/hz/el, 100.0*di/tot, w/el/1e9, (r>0? w/el/r:0) }'
 echo "--- write batches:"
 b0=$(echo "$D0" | grep -oE '"write_batches": [0-9]+' | grep -oE '[0-9]+'); i0=$(echo "$D0" | grep -oE '"write_batch_items": [0-9]+' | grep -oE '[0-9]+')
+d0=$(echo "$D0" | grep -oE '"write_dedups": [0-9]+' | grep -oE "[0-9]+"); d1=$(echo "$D1" | grep -oE '"write_dedups": [0-9]+' | grep -oE "[0-9]+")
 b1=$(echo "$D1" | grep -oE '"write_batches": [0-9]+' | grep -oE '[0-9]+'); i1=$(echo "$D1" | grep -oE '"write_batch_items": [0-9]+' | grep -oE '[0-9]+')
-echo "batches=$((b1-b0)) items=$((i1-i0)) avg=$(( (i1-i0) / ( (b1-b0) > 0 ? (b1-b0) : 1) ))  ACCEPTED=$(echo "($i1-$i0)/($T1-$T0)" | bc) ops/s in window"
+echo "batches=$((b1-b0)) items=$((i1-i0)) avg=$(( (i1-i0) / ( (b1-b0) > 0 ? (b1-b0) : 1) ))  ACCEPTED=$(echo "($i1-$i0+$d1-$d0)/($T1-$T0)" | bc) SET/s in window (dedup $(echo "($d1-$d0)/($T1-$T0)" | bc), written $(echo "($i1-$i0)/($T1-$T0)" | bc))"
 echo "$D1" | grep -oE '"tmp_fails": [0-9]+'
 echo "--- per-thread cores by comm:"
 join <(sort /tmp/tc0_$TAG) <(sort /tmp/tc1_$TAG) | awk -v hz=$HZ -v el=$(echo "$T1 - $T0" | bc) \
