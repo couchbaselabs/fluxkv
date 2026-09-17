@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <pthread.h>
 #include <algorithm>
 #include <cmath>
 
@@ -30,7 +31,10 @@ void ThreadTuner::Start() {
         return;
     }
     lastOps_ = opsCounter_();
-    thread_ = std::thread([this]() { run(); });
+    thread_ = std::thread([this]() {
+        pthread_setname_np(pthread_self(), "fx:tuner");
+        run();
+    });
 }
 
 void ThreadTuner::Stop() {

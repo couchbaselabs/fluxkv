@@ -1,6 +1,7 @@
 #pragma once
 
 #include <folly/io/async/EventBase.h>
+#include <pthread.h>
 
 #include <atomic>
 #include <functional>
@@ -53,7 +54,10 @@ struct IOThread {
     void Start() {
         auto* e = evb.get();
         pump.owner = this;
-        thread = std::thread([e]() { e->loopForever(); });
+        thread = std::thread([e]() {
+            pthread_setname_np(pthread_self(), "fx:io");
+            e->loopForever();
+        });
         hasCpuClock =
                 pthread_getcpuclockid(thread.native_handle(), &cpuClock) == 0;
     }

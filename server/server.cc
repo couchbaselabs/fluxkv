@@ -4,6 +4,7 @@
 #include <folly/io/async/AsyncSocket.h>
 #include <spdlog/spdlog.h>
 
+#include <pthread.h>
 #include <algorithm>
 #include <chrono>
 #include <limits>
@@ -371,6 +372,7 @@ void Server::Start() {
 
     // Start HTTP stats thread
     statsThread_ = std::thread([this]() {
+        pthread_setname_np(pthread_self(), "fx:stats");
         int statsFd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (statsFd < 0)
             return;
