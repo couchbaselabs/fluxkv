@@ -133,6 +133,11 @@ struct Config {
     size_t lsmLevel0Tables = 0;
     size_t lsmMinCompactSize = 0;
     int lsmLevelMultiplier = 0;
+    // Run magma without a write-ahead log. Writes then live only in the
+    // memtable until it is flushed, so a crash loses everything since the
+    // last flush. Measurement only: it prices the log, it is not a mode to
+    // serve from.
+    bool noWal = false;
 };
 
 static void printUsage(const char* prog) {
@@ -220,6 +225,9 @@ static void printUsage(const char* prog) {
                  "cover (default 4MB)\n"
               << "  --lsm-level-multiplier N size ratio between levels "
                  "(default 10)\n"
+              << "  --no-wal              run magma with no write-ahead log. "
+                 "UNSAFE: a crash loses every write since the last memtable "
+                 "flush. For measuring the log's cost only\n"
               << "  --help            Show this help\n";
 }
 
@@ -281,6 +289,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"lsm-level0-tables", required_argument, nullptr, 1055},
             {"lsm-min-compact-size", required_argument, nullptr, 1056},
             {"lsm-level-multiplier", required_argument, nullptr, 1057},
+            {"no-wal", no_argument, nullptr, 1058},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
 
@@ -453,6 +462,9 @@ static Config parseArgs(int argc, char* argv[]) {
         case 1057:
             cfg.lsmLevelMultiplier = atoi(optarg);
             break;
+        case 1058:
+            cfg.noWal = true;
+            break;
         case 'h':
         default:
             printUsage(argv[0]);
@@ -621,6 +633,13 @@ int main(int argc, char* argv[]) {
     }
     if (cfg.lsmLevelMultiplier > 0) {
         magmaCfg.LSMLevelSizeMultiplier = cfg.lsmLevelMultiplier;
+    }
+
+    if (cfg.noWal) {
+        magmaCfg.EnableWAL = false;
+        spdlog::warn(
+                "  --no-wal: magma has no write-ahead log. A crash loses "
+                "every write since the last memtable flush.");
     }
 
     magmaCfg.LogLevel = "info";
