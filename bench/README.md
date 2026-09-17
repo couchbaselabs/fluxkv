@@ -412,6 +412,46 @@ Things learned building it, in the order they cost time:
   grown alone. Any rule demanding a gain proportional to the step deadlocks
   them at 1 IO thread and 8 readers; plain "more than 1%" does not.
 
+### Writes: 4.5M async SET/s on loopback, CPU-bound
+
+8-byte keys and values, Zipf 0.99 over 256M keys, 100% SET, async
+acknowledgement, 8 shards x 32 vbuckets, 64 writers. Measured with
+`write_diag.sh`; the accepted rate comes from the server's own
+`write_batch_items` counter, because the client's rate counts TmpFail
+replies once the write queue is full.
+
+```
+--mem-quota 68719476736 --writers 64 --flushers 32 --compactors 128 \
+--shared-wal --shared-wal-flushers 1 --shared-wal-chunk-size 2097152 \
+--shared-wal-chunks 24 --shared-wal-flush-us 50 \
+--blind-writes --write-coalesce-us 2000 --auto-tune
+```
+
+| step | accepted SET/s | server cores | writer cores |
+|---|---|---|---|
+| per-shard write-ahead logs | 1.70M | - | - |
+| one shared log | 3.12M | 48.7 | - |
+| allocations routed to jemalloc | 3.30M | 51 | 38.7 |
+| `--blind-writes` | 3.24M | 45 | 23.7 |
+| shared log no longer fsync-waits per batch + write coalescing | 3.20M | 43 | 20.3 |
+| 64 GB quota, client 128 conns x 128 deep | 4.03M | 67 | 33.6 |
+| request recycling + inline bodies | 4.32M | 64 | 27.8 |
+| 32 flushers / 128 compactors | **4.50M** | 71 | 32.8 |
+
+At the last row the box has 5% idle (73.7 of 80 cores, client 1.7). Disk
+is 0.88 GB/s of a 7.3 GB/s `fio` sequential-write ceiling.
+
+At **1 KB values** the same configuration accepts **1.11M SET/s, 2.8 GB/s
+written**, at 53 server cores with 21% idle. That point is bound by the
+memtable flush path (flush queue backs up, the write-cache throttle
+refuses writes), not by CPU or disk.
+
+What each change was worth is in the commit messages of `e83b1d4` and
+`aeccf07`. The two that matter most: the shared log waited for fsync
+inside every write batch (98% of writer sleep time), and once that was
+gone the server had no batching of its own, so `--write-coalesce-us` is
+not optional with the shared log in async mode.
+
 ## Reading the numbers
 
 **Check the errors before believing the rate.** A GET for a key that was
