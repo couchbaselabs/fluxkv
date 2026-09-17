@@ -157,29 +157,38 @@ extern size_t gDispatchBatch;
 
 // A single KV request flowing through the engine.
 // Uses intrusive linked list for lock-free per-vb write queues.
-struct Request {
+//
+// Field order is by access pattern on the writer, which reads Requests that
+// IO threads wrote: the list hook and the key/value views share the first
+// cache line, the inline body follows so the key bytes are on the next line
+// the hardware prefetcher already fetches, and the cold result fields come
+// last. Walking a batch cost two to three misses per Request before this.
+struct alignas(64) Request {
+    // Intrusive linked list hook for per-vb queues (write OR read, not both)
+    folly::AtomicIntrusiveLinkedListHook<Request> hook;
+
+    // Zero-copy views into inlineData or dataBuf
+    Slice key;
+    Slice value;
+
     // Parsed from mcbp header
     uint8_t opcode{0};
+    uint8_t datatype{0}; // request datatype (SET)
     uint16_t vbucket{0};
+    uint32_t flags{0};
+    uint32_t expiry{0};
     uint32_t opaque{0};
     uint64_t cas{0};
 
-    // Zero-copy views into dataBuf
-    Slice key;
-    Slice value;
-    uint32_t flags{0};
-    uint32_t expiry{0};
-    uint8_t datatype{0}; // request datatype (SET)
-    uint8_t resultDatatype{0}; // stored datatype (GET)
-
-    // Owns the request body data when it did not fit inlineData.
-    std::unique_ptr<folly::IOBuf> dataBuf;
     // Small SET bodies (extras + key + value) are copied here so the IOBuf
     // can be released on the IO thread that allocated it. Writers used to
     // free it, and freeing into another thread's allocator arena was a
     // third of writer CPU.
     static constexpr size_t kInlineData = 128;
     alignas(8) char inlineData[kInlineData];
+
+    // Owns the request body data when it did not fit inlineData.
+    std::unique_ptr<folly::IOBuf> dataBuf;
 
     // For routing response back to connection
     Connection* conn{nullptr};
@@ -189,13 +198,11 @@ struct Request {
     Status resultStatus;
     uint64_t resultSeqno{0};
     uint32_t resultFlags{0};
+    uint8_t resultDatatype{0}; // stored datatype (GET)
     // GET result value copied from FetchBuffer. std::vector with capacity
     // preserved across reset() — the Connection-local Request pool reuses
     // this buffer, so steady-state value-size workloads incur zero allocs.
     std::vector<uint8_t> responseBuf;
-
-    // Intrusive linked list hook for per-vb queues (write OR read, not both)
-    folly::AtomicIntrusiveLinkedListHook<Request> hook;
 
     // Reset to default state for pool reuse. Cheap — no heap frees beyond
     // releasing dataBuf/responseBuf, which usually came from coalesce/move.
@@ -253,6 +260,9 @@ public:
         while (Request* h = head_.exchange(nullptr, std::memory_order_acq_rel)) {
             while (h) {
                 Request* next = h->hook.next;
+                // Each Request was last written by another thread; start
+                // its line coming while this one is processed.
+                __builtin_prefetch(next);
                 h->hook.next = nullptr;
                 fn(h);
                 h = next;

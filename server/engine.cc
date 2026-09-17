@@ -6,7 +6,6 @@
 #include "connection.h"
 #include "include/libmagma/operations.h"
 
-#include <folly/container/F14Set.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <algorithm>
@@ -353,28 +352,79 @@ void WriterPool::executePersist(PersistTask& task) {
     }
     std::reverse(batch.begin(), batch.end());
 
-    // Keep only the newest write per key. Repeats within one batch are
-    // common under skewed keys (Zipf 0.99: the top key alone is ~5% of all
-    // writes) and every one costs a memtable insert, log bytes and a flush
-    // and compaction pass before GC removes it. Non-blind magma rejects
-    // duplicates outright. Dropped requests are answered/recycled with the
-    // survivors below.
+    // Sort the batch by key, arrival order within a key. Two reasons.
+    // Repeats within one batch are common under skewed keys (Zipf 0.99: the
+    // top key alone is ~5% of all writes) and every one costs a memtable
+    // insert, log bytes and a flush and compaction pass before GC removes
+    // it; sorted, the newest write per key is the last of a run and the
+    // rest are dropped without hashing. And magma's skiplist has a
+    // sequential-insert fast path (reuse the last insert's predecessors when
+    // the new key sorts right after it), which key order feeds. Seqnos are
+    // assigned in this order, so within one batch they follow key order,
+    // not arrival order; nothing here exposes cross-key ordering. Dropped
+    // requests are answered/recycled with the survivors below.
     std::vector<Request*> dropped;
     if (batch.size() > 1) {
-        folly::F14FastSet<std::string_view> seen;
-        seen.reserve(batch.size());
-        size_t w = batch.size();
-        for (size_t i = batch.size(); i-- > 0;) {
-            auto* req = batch[i];
-            if (seen.insert(std::string_view(req->key.Data(), req->key.Len()))
-                        .second) {
-                batch[--w] = req;
-            } else {
+        // Sort a compact (key prefix, index) array rather than the pointers:
+        // comparing through the pointers touched two scattered Requests per
+        // compare and cost more than the memtable insert it was meant to
+        // speed up. The prefix is the first 8 key bytes big-endian; equal
+        // prefixes fall back to the full key, then arrival order.
+        struct SortKey {
+            uint64_t prefix;
+            uint32_t idx;
+            uint32_t len;
+        };
+        std::vector<SortKey> keys(batch.size());
+        for (size_t i = 0; i < batch.size(); i++) {
+            const auto& k = batch[i]->key;
+            uint64_t p = 0;
+            const size_t n = std::min<size_t>(8, k.Len());
+            for (size_t j = 0; j < n; j++) {
+                p |= static_cast<uint64_t>(
+                             static_cast<uint8_t>(k.Data()[j]))
+                     << (56 - 8 * j);
+            }
+            keys[i] = {p, static_cast<uint32_t>(i), static_cast<uint32_t>(k.Len())};
+        }
+        auto fullKey = [&](uint32_t i) {
+            return std::string_view(batch[i]->key.Data(), batch[i]->key.Len());
+        };
+        // Keys of up to 8 bytes are decided by prefix and length alone;
+        // only longer keys with equal prefixes touch the Requests. Under
+        // Zipf half the batch are duplicates, so equal prefixes are common
+        // and a memcmp fallback there cost more than the memtable insert.
+        auto sameKey = [&](const SortKey& a, const SortKey& b) {
+            return a.prefix == b.prefix && a.len == b.len &&
+                   (a.len <= 8 || fullKey(a.idx) == fullKey(b.idx));
+        };
+        std::sort(keys.begin(), keys.end(), [&](const SortKey& a, const SortKey& b) {
+            if (a.prefix != b.prefix) {
+                return a.prefix < b.prefix;
+            }
+            if (a.len <= 8 && b.len <= 8) {
+                return a.len != b.len ? a.len < b.len : a.idx < b.idx;
+            }
+            const auto ka = fullKey(a.idx), kb = fullKey(b.idx);
+            if (ka != kb) {
+                return ka < kb;
+            }
+            return a.idx < b.idx;
+        });
+        std::vector<Request*> sorted;
+        sorted.reserve(batch.size());
+        for (size_t i = 0; i < keys.size(); i++) {
+            auto* req = batch[keys[i].idx];
+            const bool dupOfNext =
+                    i + 1 < keys.size() && sameKey(keys[i], keys[i + 1]);
+            if (dupOfNext) {
                 dropped.push_back(req);
+            } else {
+                sorted.push_back(req);
             }
         }
-        if (w > 0) {
-            batch.erase(batch.begin(), batch.begin() + w);
+        batch.swap(sorted);
+        if (!dropped.empty()) {
             hotStatAdd(gDispStats.writeDedups, dropped.size());
         }
     }
