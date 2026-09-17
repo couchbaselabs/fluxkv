@@ -412,7 +412,7 @@ Things learned building it, in the order they cost time:
   grown alone. Any rule demanding a gain proportional to the step deadlocks
   them at 1 IO thread and 8 readers; plain "more than 1%" does not.
 
-### Writes: 4.5M async SET/s on loopback, CPU-bound
+### Writes: 9.06M async SET/s on loopback, zero errors, CPU-bound
 
 8-byte keys and values, Zipf 0.99 over 256M keys, 100% SET, async
 acknowledgement, 8 shards x 32 vbuckets, 64 writers. Measured with
@@ -436,18 +436,33 @@ replies once the write queue is full.
 | shared log no longer fsync-waits per batch + write coalescing | 3.20M | 43 | 20.3 |
 | 64 GB quota, client 128 conns x 128 deep | 4.03M | 67 | 33.6 |
 | request recycling + inline bodies | 4.32M | 64 | 27.8 |
-| 32 flushers / 128 compactors | **4.50M** | 71 | 32.8 |
+| 32 flushers / 128 compactors | 4.50M (TmpFails) | 71 | 32.8 |
+| batch dedupe, chained recycling, staged enqueue, magma fast comparators | 6.42M, 0 errors | 62.9 | 27.3 |
+| client 256 x 256 | 7.97M, 0 errors | 69.8 | 30.3 |
+| `--io-threads 16` fixed, client 128 x 128 | **9.06M, 0 errors** | 71.5 | 33.0 |
 
-At the last row the box has 5% idle (73.7 of 80 cores, client 1.7). Disk
-is 0.88 GB/s of a 7.3 GB/s `fio` sequential-write ceiling.
+At the last row the box has 5% idle (72.7 of 80 cores, client 2.8), 7.9 us
+of server CPU per acknowledged SET. Disk is 0.94 GB/s of a 7.3 GB/s `fio`
+sequential-write ceiling.
+
+Two rates matter. The server acknowledged 9.06M SET/s; magma was given
+**4.70M/s**, because the writer keeps only the newest write per key within
+a vbucket batch and at Zipf 0.99 the rest (44% here, 75% at larger
+batches) repeat a key already in the batch. `write_dedups` in
+`/stats/dispatcher` counts them. The unique-write rate is the storage
+engine's ceiling on this box: offering more load (256 x 256, 16 IO
+threads) acknowledges 14.7M/s but fills the write queue and turns 3% into
+TmpFail while the written rate falls to 3.7M.
 
 At **1 KB values** the same configuration accepts **1.11M SET/s, 2.8 GB/s
 written**, at 53 server cores with 21% idle. That point is bound by the
 memtable flush path (flush queue backs up, the write-cache throttle
 refuses writes), not by CPU or disk.
 
-What each change was worth is in the commit messages of `e83b1d4` and
-`aeccf07`. The two that matter most: the shared log waited for fsync
+What each change was worth is in the commit messages of `e83b1d4`,
+`aeccf07`, `f27ff78` and `1ef4431`. `write_prof.sh` gives a DWARF call
+graph per thread role; the per-role split is what found every one of
+these. The two that matter most: the shared log waited for fsync
 inside every write batch (98% of writer sleep time), and once that was
 gone the server had no batching of its own, so `--write-coalesce-us` is
 not optional with the shared log in async mode.
