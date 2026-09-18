@@ -290,6 +290,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"max-io-threads", required_argument, nullptr, 1031},
             {"max-readers", required_argument, nullptr, 1032},
             {"max-writers", required_argument, nullptr, 1060},
+            {"durable-spin", required_argument, nullptr, 1061},
             {"write-cache", required_argument, nullptr, 1045},
             {"shared-wal", no_argument, nullptr, 1040},
             {"shared-wal-path", required_argument, nullptr, 1041},
@@ -430,6 +431,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1060:
             cfg.maxWriters = strtoull(optarg, nullptr, 10);
+            break;
+        case 1061:
+            kvserver::gDurableSpinIters = atoi(optarg);
             break;
         case 1045:
             cfg.writeCache = strtoull(optarg, nullptr, 10);

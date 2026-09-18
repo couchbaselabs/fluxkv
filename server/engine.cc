@@ -28,6 +28,7 @@ size_t gMaxReadBatch = 128;
 size_t gMinWriteBatch = 64;
 BatchSort gBatchSort = BatchSort::Auto;
 bool gAsyncDurable = false;
+int gDurableSpinIters = 4000;
 double gSortDupThreshold = 0.05;
 // Per-shard cap on recycled Requests; beyond it writers delete. Sized to
 // cover the write queue at a few hundred bytes per Request.
@@ -189,6 +190,20 @@ void Shard::durableLoop() {
     pthread_setname_np(pthread_self(), "fx:durable");
     for (;;) {
         uint64_t target = 0;
+        // Spin on the queue before sleeping: under load the next batch is
+        // already on its way and the condition-variable wake is pure latency
+        // on the critical path of every write.
+        for (int i = 0; i < gDurableSpinIters; i++) {
+            if (durablePending_.load(std::memory_order_acquire) ||
+                durableStop_.load(std::memory_order_relaxed)) {
+                break;
+            }
+#if defined(__x86_64__) || defined(__i386__)
+            asm volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+            asm volatile("yield" ::: "memory");
+#endif
+        }
         {
             std::unique_lock<std::mutex> lk(durableMu_);
             durableCv_.wait(lk, [this]() {
@@ -217,6 +232,8 @@ void Shard::durableLoop() {
                 ready.push_back(std::move(durableQueue_.front()));
                 durableQueue_.pop_front();
             }
+            durablePending_.store(!durableQueue_.empty(),
+                                  std::memory_order_release);
         }
         if (ready.empty()) {
             // Watermark did not move: the log is wedged or shutting down.
@@ -269,6 +286,9 @@ void Shard::AwaitDurable(PendingDurable&& p) {
         std::lock_guard<std::mutex> g(durableMu_);
         durableQueue_.push_back(std::move(p));
     }
+    // Published before the notify so a spinning completion thread sees the
+    // batch without taking the lock.
+    durablePending_.store(true, std::memory_order_release);
     durableCv_.notify_one();
 }
 

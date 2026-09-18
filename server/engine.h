@@ -132,6 +132,8 @@ extern BatchSort gBatchSort;
 // unchanged: the watermark is monotonic, so a batch is answered only after
 // everything it logged is on disk.
 extern bool gAsyncDurable;
+// Spin iterations in the durable completion thread before it sleeps.
+extern int gDurableSpinIters;
 // Estimated duplicate fraction at or above which Auto sorts.
 extern double gSortDupThreshold;
 // Master switch for per-op hot-path stat increments. At 1 M ops/s the cache-
@@ -430,6 +432,8 @@ private:
     std::mutex durableMu_;
     std::condition_variable durableCv_;
     std::deque<PendingDurable> durableQueue_;
+    // Mirrors !durableQueue_.empty() for the lock-free spin in durableLoop.
+    std::atomic<bool> durablePending_{false};
     std::thread durableThread_;
     std::atomic<bool> durableStop_{false};
     Bucket* durableBucket_{nullptr};
