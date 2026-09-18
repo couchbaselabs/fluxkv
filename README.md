@@ -113,11 +113,11 @@ Acknowledged only after the write-ahead log reaches disk. 64 GiB memory quota,
 | 8 B | 32 conns | 326K/s | 90 us | 154 us | 301 us |
 | 8 B | 32 conns, pipe 8 | 1.26M/s | 142 us | 464 us | 1.5 ms |
 | 8 B | 112 conns, pipe 128 | 4.90M/s | 1.58 ms | 4.3 ms | 8.2 ms |
-| 8 B | 112 conns, pipe 512 | 6.7M burst / 6.0M at 90 s / 5.8M sustained | 3.4-4.9 ms | 10-25 ms | ~70 ms |
+| 8 B | 112 conns, pipe 512 | **6.7M burst / 6.0M at 90 s / 5.8M sustained** | 3.4-4.9 ms | 10-25 ms | ~70 ms |
 | 1 KB | 1 conn | 11.2K/s | 77 us | 181 us | 304 us |
 | 1 KB | 32 conns | 263K/s | 103 us | 195 us | 529 us |
 | 1 KB | 32 conns, pipe 8 | 782K/s (0.80 GB/s) | 207 us | 451 us | 2.9 ms |
-| 1 KB | 112 conns, pipe 128 | 1.65M/s (1.69 GB/s) | 3.4 ms | ~65 ms | ~250 ms |
+| 1 KB | 112 conns, pipe 128 | **1.65M/s (1.69 GB/s)** | 3.4 ms | ~65 ms | ~250 ms |
 
 A durable write at low rate costs 75 us, of which 25 us is the device and
 about 15 us is two thread handoffs. Below ~260K/s a 1 KB document costs the
@@ -151,16 +151,17 @@ single largest lever on read performance.
 | dataset | doc cache | load | throughput | p50 | p99 | device reads/GET |
 |---|---|---|---|---|---|---|
 | 8 B, 300M keys, 49 GB | off | 32 conns | 107K/s | 280 us | 616 us | 1.95 |
-| 8 B, 300M keys, 49 GB | off | 112, pipe 128 | 683K/s | 10.1 ms | 20.7 ms | 1.98 |
+| 8 B, 300M keys, 49 GB | off | 112, pipe 128 | **683K/s** | 10.1 ms | 20.7 ms | 1.98 |
 | 8 B, 300M keys, 49 GB | 32 GiB | 32 conns | 573K/s | 29 us | 382 us | 0.30 |
-| 8 B, 300M keys, 49 GB | 32 GiB | 112, pipe 128 | 3.42M/s | 969 us | 6.8 ms | 0.33 |
+| 8 B, 300M keys, 49 GB | 32 GiB | 112, pipe 128 | **3.42M/s** | 969 us | 6.8 ms | 0.33 |
 | 1 KB, 200M keys, 186 GB | off | 32 conns | 156K/s | 184 us | 441 us | 1.01 |
+| 1 KB, 200M keys, 186 GB | off | 112, pipe 128 | **1.44M/s** | 5.4 ms | 10.0 ms | - |
 | 1 KB, 200M keys, 186 GB | 64 GiB | 32 conns | 294K/s | 44 us | 318 us | - |
-| 1 KB, 200M keys, 186 GB | 64 GiB | 112, pipe 128 | 3.20M/s | 1.07 ms | 7.6 ms | - |
+| 1 KB, 200M keys, 186 GB | 64 GiB | 112, pipe 128 | **3.20M/s** | 1.07 ms | 7.6 ms | - |
 | 8 B, 10M keys, 1.6 GB | 16 GiB (100% hit) | 8 conns | 352K/s | 22 us | 28 us | 0 |
 | 8 B, 10M keys, 1.6 GB | 16 GiB | 32 conns, pipe 8 | 5.91M/s | 37 us | 51 us | 0 |
 | 8 B, 10M keys, 1.6 GB | 16 GiB | 112, pipe 512 | 26.4M/s | 1.55 ms | 3.8 ms | 0 |
-| 8 B, 10M keys, 1.6 GB | 16 GiB | 80, pipe 1024, batch 256 | 80.4M/s | not measurable | - | 0 |
+| 8 B, 10M keys, 1.6 GB | 16 GiB | 80, pipe 1024, batch 256 | **80.4M/s** | not measurable | - | 0 |
 
 The cache helps medians far more than tails: a hit costs ~30 us while a miss
 still pays the full disk path, so p99 stays in the miss population until the
