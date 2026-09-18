@@ -117,7 +117,7 @@ struct Config {
     size_t sharedWalFlushers = 2;
     size_t sharedWalChunks = 8;
     size_t sharedWalChunkSize = 8u << 20;
-    size_t sharedWalFlushUs = 200; // shwal MinFlushIntervalUs
+    size_t sharedWalFlushUs = 0; // shwal MinFlushIntervalUs
     // Wait for the shared log to be durable inside every WriteDocs.
     // -1 follows --durable: an async server acknowledges before persistence,
     // so making each writer sleep through a group-commit flush buys nothing.
@@ -127,7 +127,7 @@ struct Config {
     // that) and leaves the old seqIndex entry to compaction GC.
     bool blindWrites = false;
     // Write coalescing, see gWriteCoalesceNs in engine.h.
-    size_t writeCoalesceUs = 500;
+    size_t writeCoalesceUs = 0;
     size_t minWriteBatch = 64;
     std::string batchSort = "auto"; // auto | always | never
     double sortDupThreshold = 0.05;
@@ -209,8 +209,9 @@ static void printUsage(const char* prog) {
                  "log (default 2)\n"
               << "  --shared-wal-chunks N     in-flight chunks (default 8)\n"
               << "  --shared-wal-chunk-size N bytes per chunk (default 8MB)\n"
-              << "  --shared-wal-flush-us N   min interval between log "
-                 "flushes (default 200)\n"
+              << "  --shared-wal-flush-us N   idle backoff for the log's "
+                 "flusher threads; they flush on arrival when busy (default "
+                 "0, which floors at the log's own 10 us)\n"
               << "  --shared-wal-sync-commit 0|1  wait for the shared log to "
                  "be durable in every write batch (default: 1 with --durable, "
                  "else 0)\n"
@@ -218,7 +219,8 @@ static void printUsage(const char* prog) {
                  "of a document on set\n"
               << "  --write-coalesce-us N wait up to N us before writing a "
                  "vbucket again when fewer than --min-write-batch items are "
-                 "queued (default 500, 0 disables)\n"
+                 "queued (default 0, disabled: it costs latency at low rate "
+                 "and measures as noise at high rate)\n"
               << "  --min-write-batch N   (default 64)\n"
               << "  --batch-sort MODE     sort write batches by key: auto "
                  "(when a sample says the batch repeats keys), always, never "

@@ -32,7 +32,7 @@ double gSortDupThreshold = 0.05;
 // Per-shard cap on recycled Requests; beyond it writers delete. Sized to
 // cover the write queue at a few hundred bytes per Request.
 static constexpr size_t kFreeRequestCap = 1 << 18;
-uint64_t gWriteCoalesceNs = 500 * 1000;
+uint64_t gWriteCoalesceNs = 0;
 
 namespace {
 inline uint64_t steadyNowNs() {
@@ -326,10 +326,12 @@ static inline void releaseVBQueue(VBQueue& vbq, Q& taskQueue, Task retask) {
 
 WriterPool::WriterPool(size_t numThreads, size_t queueSize, Bucket* bucket)
     : taskQueue_(queueSize), deferQueue_(queueSize), bucket_(bucket) {
-    deferThread_ = std::thread([this]() {
-        pthread_setname_np(pthread_self(), "fx:coalesce");
-        deferLoop();
-    });
+    if (gWriteCoalesceNs) {
+        deferThread_ = std::thread([this]() {
+            pthread_setname_np(pthread_self(), "fx:coalesce");
+            deferLoop();
+        });
+    }
     for (size_t i = 0; i < numThreads; i++) {
         threads_.emplace_back([this]() {
             pthread_setname_np(pthread_self(), "fx:writer");
@@ -386,8 +388,8 @@ void WriterPool::Shutdown() {
     }
     // Flush the coalescing queue into the task queue first so nothing is
     // still waiting out its interval when the workers see their sentinels.
-    deferQueue_.blockingWrite(Deferred{0, PersistTask{nullptr, 0}});
     if (deferThread_.joinable()) {
+        deferQueue_.blockingWrite(Deferred{0, PersistTask{nullptr, 0}});
         deferThread_.join();
     }
     // The sentinels queue behind whatever work is already pending. The queue
