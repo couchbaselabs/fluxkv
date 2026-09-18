@@ -131,7 +131,29 @@ extern BatchSort gBatchSort;
 // when the log's durable watermark passes that position. Ordering is
 // unchanged: the watermark is monotonic, so a batch is answered only after
 // everything it logged is on disk.
+inline uint64_t steadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+}
+
 extern bool gAsyncDurable;
+// Per-stage timing of the durable write path, off by default: it costs four
+// clock reads per request. Sums and counts only - the shape of the mean is
+// enough to say which hop to remove.
+extern bool gTraceLatency;
+struct StageTimers {
+    // arrival -> writer picks the batch up
+    std::atomic<uint64_t> toWriterNs{0};
+    // writer pickup -> WriteDocs returned (memtable + log staging)
+    std::atomic<uint64_t> writeNs{0};
+    // WriteDocs returned -> completion thread saw it durable
+    std::atomic<uint64_t> durableNs{0};
+    // durable -> response appended on the IO thread
+    std::atomic<uint64_t> respondNs{0};
+    std::atomic<uint64_t> count{0};
+};
+extern StageTimers gStages;
 // Spin iterations in the durable completion thread before it sleeps.
 extern int gDurableSpinIters;
 // Estimated duplicate fraction at or above which Auto sorts.
@@ -226,6 +248,9 @@ struct alignas(64) Request {
     // and destroy the EventBase this request still points at.
     class IOThread* ioOwner{nullptr};
 
+    // Stage timestamps, only written when gTraceLatency.
+    uint64_t tArrive{0}, tWriter{0}, tWritten{0}, tDurable{0};
+
     // Result filled by engine thread
     Status resultStatus;
     uint64_t resultSeqno{0};
@@ -253,6 +278,7 @@ struct alignas(64) Request {
         conn = nullptr;
         evb = nullptr;
         ioOwner = nullptr;
+        tArrive = tWriter = tWritten = tDurable = 0;
         resultStatus = Status();
         resultSeqno = 0;
         resultFlags = 0;

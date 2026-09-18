@@ -108,6 +108,10 @@ struct Config {
     size_t maxIoThreads = 0; // 0 = hardware threads
     size_t maxReaders = 0; // 0 = 4 x hardware threads
     size_t maxWriters = 0; // 0 = 2 x hardware threads
+    int sharedWalPrewrite = -1; // -1 = magma default (on)
+    // 256 MB: big enough that rotation is rare, small enough that the
+    // recycle pool fills and a pre-write pass is cheap.
+    size_t sharedWalSegmentSize = 256ull << 20;
     // One write-ahead log shared by every shard, instead of one per shard.
     // Shards stop serialising against each other on their own log mutex and
     // one durability flush covers writes from all of them.
@@ -215,6 +219,12 @@ static void printUsage(const char* prog) {
               << "  --shared-wal-flush-us N   idle backoff for the log's "
                  "flusher threads; they flush on arrival when busy (default "
                  "0, which floors at the log's own 10 us)\n"
+              << "  --shared-wal-segment-size N  log segment bytes (default "
+                 "256MB). Smaller segments recycle sooner and make "
+                 "--shared-wal-prewrite cheap\n"
+              << "  --shared-wal-prewrite 0|1  write zeros through a new log "
+                 "segment before use, so the first write into it does not pay "
+                 "for extent conversion (default 1)\n"
               << "  --shared-wal-sync-commit 0|1  wait for the shared log to "
                  "be durable in every write batch (default: 1 with --durable, "
                  "else 0)\n"
@@ -291,6 +301,9 @@ static Config parseArgs(int argc, char* argv[]) {
             {"max-readers", required_argument, nullptr, 1032},
             {"max-writers", required_argument, nullptr, 1060},
             {"durable-spin", required_argument, nullptr, 1061},
+            {"trace-latency", no_argument, nullptr, 1062},
+            {"shared-wal-prewrite", required_argument, nullptr, 1063},
+            {"shared-wal-segment-size", required_argument, nullptr, 1064},
             {"write-cache", required_argument, nullptr, 1045},
             {"shared-wal", no_argument, nullptr, 1040},
             {"shared-wal-path", required_argument, nullptr, 1041},
@@ -434,6 +447,15 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1061:
             kvserver::gDurableSpinIters = atoi(optarg);
+            break;
+        case 1062:
+            kvserver::gTraceLatency = true;
+            break;
+        case 1063:
+            cfg.sharedWalPrewrite = atoi(optarg);
+            break;
+        case 1064:
+            cfg.sharedWalSegmentSize = strtoull(optarg, nullptr, 10);
             break;
         case 1045:
             cfg.writeCache = strtoull(optarg, nullptr, 10);
@@ -644,6 +666,12 @@ int main(int argc, char* argv[]) {
         o.MinFlushIntervalUs = cfg.sharedWalFlushUs;
         o.SyncOnCommit = cfg.sharedWalSyncCommit < 0 ? cfg.durable
                                                      : cfg.sharedWalSyncCommit;
+        if (cfg.sharedWalPrewrite >= 0) {
+            o.PrewriteSegments = cfg.sharedWalPrewrite != 0;
+        }
+        if (cfg.sharedWalSegmentSize) {
+            o.SegmentSize = cfg.sharedWalSegmentSize;
+        }
         std::filesystem::create_directories(o.Path);
         auto s = SharedWALHandle::Create(o, sharedWal);
         if (!s.IsOK()) {

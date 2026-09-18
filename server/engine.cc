@@ -28,6 +28,8 @@ size_t gMaxReadBatch = 128;
 size_t gMinWriteBatch = 64;
 BatchSort gBatchSort = BatchSort::Auto;
 bool gAsyncDurable = false;
+bool gTraceLatency = false;
+StageTimers gStages;
 int gDurableSpinIters = 4000;
 double gSortDupThreshold = 0.05;
 // Per-shard cap on recycled Requests; beyond it writers delete. Sized to
@@ -36,11 +38,6 @@ static constexpr size_t kFreeRequestCap = 1 << 18;
 uint64_t gWriteCoalesceNs = 0;
 
 namespace {
-inline uint64_t steadyNowNs() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-                   std::chrono::steady_clock::now().time_since_epoch())
-            .count();
-}
 
 // First 8 key bytes, big-endian, so that ordering by this value orders by
 // key for keys of 8 bytes or fewer.
@@ -100,6 +97,17 @@ bool gStatsHotPath = true;
 
 std::string DispatcherStats::toJson() const {
     nlohmann::json j;
+    if (const uint64_t n = gStages.count.load(std::memory_order_relaxed)) {
+        j["stage_to_writer_us"] =
+                gStages.toWriterNs.load(std::memory_order_relaxed) / 1e3 / n;
+        j["stage_write_us"] =
+                gStages.writeNs.load(std::memory_order_relaxed) / 1e3 / n;
+        j["stage_durable_us"] =
+                gStages.durableNs.load(std::memory_order_relaxed) / 1e3 / n;
+        j["stage_respond_us"] =
+                gStages.respondNs.load(std::memory_order_relaxed) / 1e3 / n;
+        j["stage_count"] = n;
+    }
     j["cmd_set"] = cmdSet.Sum();
     j["cmd_get"] = cmdGet.Sum();
     j["cmd_delete"] = cmdDelete.Sum();
@@ -250,7 +258,9 @@ void Shard::durableLoop() {
         folly::F14FastMap<folly::EventBase*, std::vector<Request*>> byLoop;
         for (auto& p : ready) {
             const bool ok = p.status.IsOK();
+            const uint64_t tDurable = gTraceLatency ? steadyNowNs() : 0;
             for (auto* req : p.reqs) {
+                req->tDurable = tDurable;
                 // A recycled Request is already OK; only a failure is worth
                 // the string copy in Status::operator=.
                 if (!ok) {
@@ -620,6 +630,13 @@ size_t WriterPool::executePersist(PersistTask& task) {
     }
     std::reverse(batch.begin(), batch.end());
 
+    if (gTraceLatency) {
+        const uint64_t t = steadyNowNs();
+        for (auto* req : batch) {
+            req->tWriter = t;
+        }
+    }
+
     // Sort the batch by key, arrival order within a key. Two reasons.
     // Repeats within one batch are common under skewed keys (Zipf 0.99: the
     // top key alone is ~5% of all writes) and every one costs a memtable
@@ -740,7 +757,13 @@ size_t WriterPool::executePersist(PersistTask& task) {
     hotStatAdd(gDispStats.writeBatchItems, ops.size());
 
     auto status = shard->GetMagma()->WriteDocs(task.vbid, ops);
-    vbq.lastWriteNs.store(steadyNowNs(), std::memory_order_relaxed);
+    const uint64_t tWritten = steadyNowNs();
+    vbq.lastWriteNs.store(tWritten, std::memory_order_relaxed);
+    if (gTraceLatency) {
+        for (auto* req : batch) {
+            req->tWritten = tWritten;
+        }
+    }
 
     // Release the cache pins these writes took in handleSet/handleDelete.
     // Done whether or not WriteDocs succeeded: a failed write is reported to

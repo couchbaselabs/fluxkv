@@ -908,6 +908,9 @@ void Connection::handleSet(McbpHeader& hdr,
         if (owner_) {
             owner_->Reserve();
         }
+        if (gTraceLatency) {
+            req->tArrive = steadyNowNs();
+        }
         if (!bucket_->StageWrite(req)) {
             // Refused: answer now and undo the cache entry, which would
             // otherwise stay pinned forever waiting for a MarkPersisted that
@@ -991,6 +994,9 @@ void Connection::handleDelete(McbpHeader& hdr,
         req->ioOwner = owner_;
         if (owner_) {
             owner_->Reserve();
+        }
+        if (gTraceLatency) {
+            req->tArrive = steadyNowNs();
         }
         if (!bucket_->StageWrite(req)) {
             gDispStats.tmpFails.fetch_add(1, std::memory_order_relaxed);
@@ -1107,6 +1113,18 @@ void Connection::sendWriteResponse(Request* req) {
     // on the loop itself, once the response is out. reset() clears the
     // field, so read it first.
     auto* iot = req->ioOwner;
+    if (gTraceLatency && req->tArrive && req->tDurable) {
+        const uint64_t now = steadyNowNs();
+        gStages.toWriterNs.fetch_add(req->tWriter - req->tArrive,
+                                     std::memory_order_relaxed);
+        gStages.writeNs.fetch_add(req->tWritten - req->tWriter,
+                                  std::memory_order_relaxed);
+        gStages.durableNs.fetch_add(req->tDurable - req->tWritten,
+                                    std::memory_order_relaxed);
+        gStages.respondNs.fetch_add(now - req->tDurable,
+                                    std::memory_order_relaxed);
+        gStages.count.fetch_add(1, std::memory_order_relaxed);
+    }
     if (!closing_) {
         McbpStatus status = req->resultStatus.IsOK()
                                     ? McbpStatus::Success
