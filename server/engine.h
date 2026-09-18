@@ -14,6 +14,9 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -118,6 +121,17 @@ extern uint64_t gWriteCoalesceNs;
 // decides. Always/Never force it for measurement.
 enum class BatchSort { Auto, Always, Never };
 extern BatchSort gBatchSort;
+
+// Durable mode acknowledges a write once magma's shared log says it is on
+// disk. With this off, the writer thread blocks inside WriteDocs until its
+// own transaction is durable, so in-flight work is capped by the number of
+// writer threads. With it on, the writer returns as soon as the record is
+// in the memtable and the log buffer, the batch is parked against the log
+// position it ended at, and a completion thread per shard acknowledges it
+// when the log's durable watermark passes that position. Ordering is
+// unchanged: the watermark is monotonic, so a batch is answered only after
+// everything it logged is on disk.
+extern bool gAsyncDurable;
 // Estimated duplicate fraction at or above which Auto sorts.
 extern double gSortDupThreshold;
 // Master switch for per-op hot-path stat increments. At 1 M ops/s the cache-
@@ -377,6 +391,20 @@ public:
     // per request (the per-request pop was 28% of IO-thread CPU). IO threads
     // take a chain into a thread-local free list before allocating. False
     // when full; the caller deletes the chain.
+    // A batch waiting for the shared log to reach `lsn`. Held in arrival
+    // order, which is also LSN order, so the completion thread only has to
+    // look at the head.
+    struct PendingDurable {
+        uint64_t lsn{0};
+        Status status;
+        std::vector<Request*> reqs;
+        size_t bytes{0};
+    };
+
+    // Park a finished batch until the log is durable to its end. Takes the
+    // requests. Only called when gAsyncDurable.
+    void AwaitDurable(PendingDurable&& p);
+
     bool RecycleRequests(Request* chain) {
         return freeRequests_.write(chain);
     }
@@ -389,6 +417,14 @@ private:
     uint16_t shardId_;
     std::unique_ptr<Magma> magma_;
     folly::MPMCQueue<Request*> freeRequests_;
+    // Batches acknowledged when the shared log reaches their LSN.
+    std::mutex durableMu_;
+    std::condition_variable durableCv_;
+    std::deque<PendingDurable> durableQueue_;
+    std::thread durableThread_;
+    std::atomic<bool> durableStop_{false};
+    Bucket* durableBucket_{nullptr};
+    void durableLoop();
     std::array<VBQueue, kMaxVBuckets> vbWriteQueues_;
     std::array<VBQueue, kMaxVBuckets> vbReadQueues_;
     std::array<std::atomic<uint64_t>, kMaxVBuckets> seqnos_{};

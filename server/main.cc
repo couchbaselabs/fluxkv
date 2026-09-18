@@ -138,6 +138,10 @@ struct Config {
     // last flush. Measurement only: it prices the log, it is not a mode to
     // serve from.
     bool noWal = false;
+    // Acknowledge a durable write from a completion thread when the shared
+    // log reports it persisted, instead of blocking the writer inside
+    // WriteDocs. Needs --durable and --shared-wal.
+    bool asyncDurable = false;
 };
 
 static void printUsage(const char* prog) {
@@ -225,6 +229,9 @@ static void printUsage(const char* prog) {
                  "cover (default 4MB)\n"
               << "  --lsm-level-multiplier N size ratio between levels "
                  "(default 10)\n"
+              << "  --async-durable       in --durable mode, acknowledge from "
+                 "a completion thread when the shared log reaches the write, "
+                 "instead of blocking a writer thread on it\n"
               << "  --no-wal              run magma with no write-ahead log. "
                  "UNSAFE: a crash loses every write since the last memtable "
                  "flush. For measuring the log's cost only\n"
@@ -290,6 +297,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"lsm-min-compact-size", required_argument, nullptr, 1056},
             {"lsm-level-multiplier", required_argument, nullptr, 1057},
             {"no-wal", no_argument, nullptr, 1058},
+            {"async-durable", no_argument, nullptr, 1059},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
 
@@ -465,6 +473,9 @@ static Config parseArgs(int argc, char* argv[]) {
         case 1058:
             cfg.noWal = true;
             break;
+        case 1059:
+            cfg.asyncDurable = true;
+            break;
         case 'h':
         default:
             printUsage(argv[0]);
@@ -526,6 +537,19 @@ int main(int argc, char* argv[]) {
     kvserver::gWriteCoalesceNs = cfg.writeCoalesceUs * 1000;
     kvserver::gMinWriteBatch = cfg.minWriteBatch;
     kvserver::gSortDupThreshold = cfg.sortDupThreshold;
+    if (cfg.asyncDurable) {
+        if (!cfg.durable || !cfg.sharedWal) {
+            spdlog::error("--async-durable needs --durable and --shared-wal");
+            return 1;
+        }
+        // The writer no longer waits, so the log must not make it wait
+        // inside EndTxn either.
+        if (cfg.sharedWalSyncCommit < 0) {
+            cfg.sharedWalSyncCommit = 0;
+        }
+        kvserver::gAsyncDurable = true;
+        spdlog::info("  async-durable: acknowledging from the log watermark");
+    }
     if (cfg.batchSort == "always") {
         kvserver::gBatchSort = kvserver::BatchSort::Always;
     } else if (cfg.batchSort == "never") {

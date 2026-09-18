@@ -25,6 +25,7 @@ DocCache* gDocCache = nullptr;
 size_t gMaxReadBatch = 128;
 size_t gMinWriteBatch = 64;
 BatchSort gBatchSort = BatchSort::Auto;
+bool gAsyncDurable = false;
 double gSortDupThreshold = 0.05;
 // Per-shard cap on recycled Requests; beyond it writers delete. Sized to
 // cover the write queue at a few hundred bytes per Request.
@@ -166,6 +167,11 @@ Shard::Shard(uint16_t shardId,
 }
 
 Shard::~Shard() {
+    if (durableThread_.joinable()) {
+        durableStop_.store(true, std::memory_order_relaxed);
+        durableCv_.notify_all();
+        durableThread_.join();
+    }
     Close();
     Request* r{nullptr};
     while (freeRequests_.read(r)) {
@@ -173,10 +179,84 @@ Shard::~Shard() {
     }
 }
 
+void Shard::durableLoop() {
+    pthread_setname_np(pthread_self(), "fx:durable");
+    for (;;) {
+        uint64_t target = 0;
+        {
+            std::unique_lock<std::mutex> lk(durableMu_);
+            durableCv_.wait(lk, [this]() {
+                return durableStop_.load(std::memory_order_relaxed) ||
+                       !durableQueue_.empty();
+            });
+            if (durableStop_.load(std::memory_order_relaxed) &&
+                durableQueue_.empty()) {
+                return;
+            }
+            // The head has the smallest LSN, so waiting for it covers
+            // every batch that can be completed in this pass.
+            target = durableQueue_.front().lsn;
+        }
+
+        // One thread parks here instead of every writer. Wakes when the
+        // log's flusher publishes a watermark at or past the target.
+        magma_->AwaitWALDurable(target);
+        const uint64_t durable = magma_->GetWALDurableLSN();
+
+        std::vector<PendingDurable> ready;
+        {
+            std::lock_guard<std::mutex> g(durableMu_);
+            while (!durableQueue_.empty() &&
+                   durableQueue_.front().lsn <= durable) {
+                ready.push_back(std::move(durableQueue_.front()));
+                durableQueue_.pop_front();
+            }
+        }
+        if (ready.empty()) {
+            // Watermark did not move: the log is wedged or shutting down.
+            // Do not spin on it.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+
+        for (auto& p : ready) {
+            for (auto* req : p.reqs) {
+                req->resultStatus = p.status;
+                if (p.status.IsOK()) {
+                    hotStatAdd(gDispStats.cmdSetResp);
+                } else {
+                    hotStatAdd(gDispStats.cmdSetRespErr);
+                }
+                auto* conn = req->conn;
+                req->evb->runInEventBaseThread(
+                        [conn, req]() { conn->sendWriteResponse(req); });
+            }
+            // The queue budget is released only now, so it bounds writes
+            // that are acknowledged-pending rather than merely unwritten.
+            if (durableBucket_) {
+                durableBucket_->queuedBytes_.fetch_sub(
+                        p.bytes, std::memory_order_relaxed);
+            }
+        }
+    }
+}
+
+void Shard::AwaitDurable(PendingDurable&& p) {
+    {
+        std::lock_guard<std::mutex> g(durableMu_);
+        durableQueue_.push_back(std::move(p));
+    }
+    durableCv_.notify_one();
+}
+
 void Shard::CreatePools(size_t numWriters,
                         size_t numReaders,
                         size_t queueSize,
                         Bucket* bucket) {
+    if (gAsyncDurable && bucket && bucket->IsDurable()) {
+        durableBucket_ = bucket;
+        durableThread_ = std::thread([this]() { durableLoop(); });
+    }
     writerPool_ = std::make_unique<WriterPool>(numWriters, queueSize, bucket);
     readerPool_ = std::make_unique<ReaderPool>(numReaders, queueSize, bucket);
 }
@@ -379,6 +459,20 @@ void WriterPool::workerLoop() {
     }
 }
 
+// Items accumulated during WriteDocs. Re-arm through the queue for
+// fairness with other vbs, deferred if this batch was small. Same seq_cst
+// store and recheck as releaseVBQueue - see the comment there.
+static inline void releaseVBQueueAfterWrite(VBQueue& vbq,
+                                            Shard* shard,
+                                            uint16_t vbid,
+                                            WriterPool& pool) {
+    vbq.scheduled.store(false, std::memory_order_seq_cst);
+    if (!vbq.list.empty() &&
+        !vbq.scheduled.exchange(true, std::memory_order_acq_rel)) {
+        pool.SubmitOrDefer(PersistTask{shard, vbid}, vbq);
+    }
+}
+
 void WriterPool::executePersist(PersistTask& task) {
     auto* shard = task.shard;
     auto& vbq = shard->GetVBWriteQueue(task.vbid);
@@ -539,6 +633,23 @@ void WriterPool::executePersist(PersistTask& task) {
     }
     batch.insert(batch.end(), dropped.begin(), dropped.end());
 
+    if (bucket_->IsDurable() && gAsyncDurable && status.IsOK()) {
+        // Hand the batch to the shard's completion thread and move on. The
+        // records are already in the memtable and staged in the log; what
+        // is left is the log reaching disk, and one thread can wait for
+        // that on behalf of every writer. queuedBytes_ is released there,
+        // so the write-queue limit bounds acknowledged-pending bytes.
+        Shard::PendingDurable p;
+        p.lsn = shard->GetMagma()->GetWALTailLSN();
+        p.status = status;
+        p.bytes = batchBytes;
+        p.reqs = std::move(batch);
+        shard->AwaitDurable(std::move(p));
+        batch.clear();
+        releaseVBQueueAfterWrite(vbq, shard, task.vbid, *this);
+        return;
+    }
+
     bucket_->queuedBytes_.fetch_sub(batchBytes, std::memory_order_relaxed);
 
     if (bucket_->IsDurable()) {
@@ -574,14 +685,7 @@ void WriterPool::executePersist(PersistTask& task) {
         }
     }
 
-    // Items accumulated during WriteDocs. Re-arm through the queue for
-    // fairness with other vbs, deferred if this batch was small. Same
-    // seq_cst store and recheck as releaseVBQueue - see the comment there.
-    vbq.scheduled.store(false, std::memory_order_seq_cst);
-    if (!vbq.list.empty() &&
-        !vbq.scheduled.exchange(true, std::memory_order_acq_rel)) {
-        SubmitOrDefer(PersistTask{shard, task.vbid}, vbq);
-    }
+    releaseVBQueueAfterWrite(vbq, shard, task.vbid, *this);
 }
 
 // ---- ReaderPool ----
