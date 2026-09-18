@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include "connection.h"
+#include "iothread.h"
 #include "include/libmagma/operations.h"
 
+#include <folly/container/F14Map.h>
 #include <folly/container/F14Set.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -219,6 +221,12 @@ void Shard::durableLoop() {
             continue;
         }
 
+        // Group the responses by event base and post one task per IO
+        // thread, not one per request. A completion pass covers hundreds of
+        // requests spread over a handful of loops, and the per-request
+        // runInEventBaseThread hop was costing more CPU on the IO threads
+        // than the writers spent producing the batch.
+        folly::F14FastMap<folly::EventBase*, std::vector<Request*>> byLoop;
         for (auto& p : ready) {
             for (auto* req : p.reqs) {
                 req->resultStatus = p.status;
@@ -227,9 +235,7 @@ void Shard::durableLoop() {
                 } else {
                     hotStatAdd(gDispStats.cmdSetRespErr);
                 }
-                auto* conn = req->conn;
-                req->evb->runInEventBaseThread(
-                        [conn, req]() { conn->sendWriteResponse(req); });
+                byLoop[req->evb].push_back(req);
             }
             // The queue budget is released only now, so it bounds writes
             // that are acknowledged-pending rather than merely unwritten.
@@ -237,6 +243,17 @@ void Shard::durableLoop() {
                 durableBucket_->queuedBytes_.fetch_sub(
                         p.bytes, std::memory_order_relaxed);
             }
+        }
+
+        // Each parked request holds a reservation on the loop it will be
+        // answered on, so the loop cannot be retired underneath us. The
+        // reservation is dropped on that loop, after the response.
+        for (auto& [evb, reqs] : byLoop) {
+            evb->runInEventBaseThread([v = std::move(reqs)]() {
+                for (auto* req : v) {
+                    req->conn->sendWriteResponse(req);
+                }
+            });
         }
     }
 }

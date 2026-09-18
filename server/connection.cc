@@ -900,6 +900,13 @@ void Connection::handleSet(McbpHeader& hdr,
         outstandingRequests_.fetch_add(1, std::memory_order_relaxed);
         req->conn = this;
         req->evb = socket_->getEventBase();
+        // Keep this loop alive until the response is sent: with
+        // --async-durable the request outlives the socket wake, and the
+        // tuner retires a loop once its connections have migrated off.
+        req->ioOwner = owner_;
+        if (owner_) {
+            owner_->Reserve();
+        }
         if (!bucket_->EnqueueWrite(req)) {
             // Refused: answer now and undo the cache entry, which would
             // otherwise stay pinned forever waiting for a MarkPersisted that
@@ -977,6 +984,13 @@ void Connection::handleDelete(McbpHeader& hdr,
         outstandingRequests_.fetch_add(1, std::memory_order_relaxed);
         req->conn = this;
         req->evb = socket_->getEventBase();
+        // Keep this loop alive until the response is sent: with
+        // --async-durable the request outlives the socket wake, and the
+        // tuner retires a loop once its connections have migrated off.
+        req->ioOwner = owner_;
+        if (owner_) {
+            owner_->Reserve();
+        }
         if (!bucket_->EnqueueWrite(req)) {
             gDispStats.tmpFails.fetch_add(1, std::memory_order_relaxed);
             if (cache) {
@@ -1088,6 +1102,10 @@ void Connection::sendUnknownCommand(const McbpHeader& hdr) {
 // ---- Response senders called from engine threads via EventBase ----
 
 void Connection::sendWriteResponse(Request* req) {
+    // Taken when the request was queued in durable mode; released here,
+    // on the loop itself, once the response is out. reset() clears the
+    // field, so read it first.
+    auto* iot = req->ioOwner;
     if (!closing_) {
         McbpStatus status = req->resultStatus.IsOK()
                                     ? McbpStatus::Success
@@ -1097,6 +1115,9 @@ void Connection::sendWriteResponse(Request* req) {
         scheduleFlush();
     }
     releaseRequest(req);
+    if (iot) {
+        iot->Unreserve();
+    }
     if (outstandingRequests_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         onDrained();
     }
