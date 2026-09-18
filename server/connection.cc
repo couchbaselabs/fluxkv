@@ -320,6 +320,7 @@ void Connection::finishAttach(IOThread* target) {
     // and the client may be waiting on them.
     while (!closing_ && parseAndDispatch()) {
     }
+    bucket_->FlushStaged();
     if (flushDelayUs() > 0) {
         if (!pendingWriteBuf_.empty()) {
             scheduleFlush();
@@ -907,7 +908,7 @@ void Connection::handleSet(McbpHeader& hdr,
         if (owner_) {
             owner_->Reserve();
         }
-        if (!bucket_->EnqueueWrite(req)) {
+        if (!bucket_->StageWrite(req)) {
             // Refused: answer now and undo the cache entry, which would
             // otherwise stay pinned forever waiting for a MarkPersisted that
             // never comes.
@@ -991,7 +992,7 @@ void Connection::handleDelete(McbpHeader& hdr,
         if (owner_) {
             owner_->Reserve();
         }
-        if (!bucket_->EnqueueWrite(req)) {
+        if (!bucket_->StageWrite(req)) {
             gDispStats.tmpFails.fetch_add(1, std::memory_order_relaxed);
             if (cache) {
                 cache->Erase(req->vbucket,
@@ -1002,7 +1003,7 @@ void Connection::handleDelete(McbpHeader& hdr,
             sendWriteResponse(req);
         }
     } else {
-        if (bucket_->EnqueueWrite(req)) {
+        if (bucket_->StageWrite(req)) {
             appendEmptyResponse(pendingWriteBuf_,
                                 hdr.opcode,
                                 McbpStatus::Success,

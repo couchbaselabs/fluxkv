@@ -559,7 +559,6 @@ public:
     }
 
     // Returns true if enqueued, false if over memory limit (TMPFAIL)
-    bool EnqueueWrite(Request* req);
     // Two-phase enqueue for IO threads: StageWrite does the admission check
     // and links the request into a per-thread, per-vbucket chain; FlushStaged
     // pushes every chain with one CAS each and schedules the writers. Call
@@ -622,7 +621,7 @@ private:
     std::unique_ptr<DocCache> cache_;
     std::vector<std::unique_ptr<Shard>> shards_;
     // Per-shard pools live inside each Shard now (sharded). Bucket holds
-    // no global pools — EnqueueRead/EnqueueWrite route to the shard's own.
+    // no global pools — EnqueueRead/StageWrite route to the shard's own.
 };
 
 // The per-shard reader pools presented to the tuner as one pool. Every shard

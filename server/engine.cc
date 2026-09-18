@@ -228,15 +228,17 @@ void Shard::durableLoop() {
         // than the writers spent producing the batch.
         folly::F14FastMap<folly::EventBase*, std::vector<Request*>> byLoop;
         for (auto& p : ready) {
+            const bool ok = p.status.IsOK();
             for (auto* req : p.reqs) {
-                req->resultStatus = p.status;
-                if (p.status.IsOK()) {
-                    hotStatAdd(gDispStats.cmdSetResp);
-                } else {
-                    hotStatAdd(gDispStats.cmdSetRespErr);
+                // A recycled Request is already OK; only a failure is worth
+                // the string copy in Status::operator=.
+                if (!ok) {
+                    req->resultStatus = p.status;
                 }
                 byLoop[req->evb].push_back(req);
             }
+            hotStatAdd(ok ? gDispStats.cmdSetResp : gDispStats.cmdSetRespErr,
+                       p.reqs.size());
             // The queue budget is released only now, so it bounds writes
             // that are acknowledged-pending rather than merely unwritten.
             if (durableBucket_) {
@@ -1315,30 +1317,6 @@ void Bucket::FlushStaged() {
         }
     }
     t.touched.clear();
-}
-
-bool Bucket::EnqueueWrite(Request* req) {
-    // Memory backpressure check
-    size_t itemSize = req->key.Len() + req->value.Len() + sizeof(Request);
-    if (queuedBytes_.load(std::memory_order_relaxed) + itemSize >
-        writeQueueMemLimit_) {
-        return false; // TMPFAIL — over memory limit
-    }
-    queuedBytes_.fetch_add(itemSize, std::memory_order_relaxed);
-
-    auto& shard = GetShard(req->vbucket);
-    auto& vbq = shard.GetVBWriteQueue(req->vbucket);
-
-    // Lock-free push (MPSC: multiple IO threads push)
-    vbq.list.insertHead(req);
-    vbq.pending.fetch_add(1, std::memory_order_relaxed);
-
-    // Schedule persistence if not already scheduled — push to THIS shard's
-    // own writer pool (no cross-shard MPMC contention).
-    if (!vbq.scheduled.exchange(true, std::memory_order_acq_rel)) {
-        shard.GetWriterPool()->SubmitOrDefer({&shard, req->vbucket}, vbq);
-    }
-    return true;
 }
 
 void Bucket::EnqueueRead(Request* req) {
