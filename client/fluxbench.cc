@@ -40,6 +40,8 @@ constexpr uint8_t kResponseMagic = 0x81;
 constexpr size_t kHeaderSize = 24;
 constexpr uint8_t kOpGet = 0x00;
 constexpr uint8_t kOpSet = 0x01;
+constexpr uint8_t kOpSaslAuth = 0x21;
+constexpr uint8_t kOpSelectBucket = 0x89;
 
 struct Options {
     std::string host = "127.0.0.1";
@@ -65,7 +67,14 @@ struct Options {
     // Zipf skew for key selection. 0 = uniform. Higher values concentrate
     // more of the load on fewer keys.
     double zipf = 0.0;
+    // SASL PLAIN credentials and bucket. Empty user skips the handshake,
+    // which is what a server without authentication expects.
+    std::string user;
+    std::string pass;
+    std::string bucket;
 };
+
+Options gOpts;
 
 // Couchbase vbucket mapping: CRC32 of the key, high bits masked, modulo the
 // vbucket count. Clients must agree with whatever wrote the data, so keep this
@@ -256,6 +265,53 @@ bool readFully(int fd, uint8_t* data, size_t len) {
     return true;
 }
 
+// One synchronous mcbp command on an otherwise idle connection. Used only
+// for the pre-pipeline handshake, so it reads and discards the whole reply.
+bool simpleCmd(int fd,
+               uint8_t opcode,
+               const std::string& key,
+               const std::string& value) {
+    std::vector<uint8_t> req;
+    uint8_t h[kHeaderSize] = {};
+    h[0] = kRequestMagic;
+    h[1] = opcode;
+    putU16(h + 2, static_cast<uint16_t>(key.size()));
+    putU32(h + 8, static_cast<uint32_t>(key.size() + value.size()));
+    req.insert(req.end(), h, h + kHeaderSize);
+    req.insert(req.end(), key.begin(), key.end());
+    req.insert(req.end(), value.begin(), value.end());
+    if (!writeFully(fd, req.data(), req.size())) {
+        return false;
+    }
+    uint8_t rh[kHeaderSize];
+    if (!readFully(fd, rh, kHeaderSize)) {
+        return false;
+    }
+    const uint32_t bodyLen = getU32(rh + 8);
+    std::vector<uint8_t> body(bodyLen);
+    if (bodyLen && !readFully(fd, body.data(), bodyLen)) {
+        return false;
+    }
+    return (static_cast<uint16_t>(rh[6] << 8 | rh[7])) == 0;
+}
+
+// SASL PLAIN then SELECT_BUCKET. Servers that take neither leave -user unset.
+bool handshake(int fd) {
+    if (gOpts.user.empty()) {
+        return true;
+    }
+    std::string plain;
+    plain.push_back('\0');
+    plain += gOpts.user;
+    plain.push_back('\0');
+    plain += gOpts.pass;
+    if (!simpleCmd(fd, kOpSaslAuth, "PLAIN", plain)) {
+        return false;
+    }
+    return gOpts.bucket.empty() ||
+           simpleCmd(fd, kOpSelectBucket, gOpts.bucket, "");
+}
+
 int connectTo(const std::string& host, uint16_t port) {
     addrinfo hints{};
     hints.ai_family = AF_INET;
@@ -274,6 +330,10 @@ int connectTo(const std::string& host, uint16_t port) {
     if (fd >= 0) {
         int one = 1;
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        if (!handshake(fd)) {
+            ::close(fd);
+            fd = -1;
+        }
     }
     return fd;
 }
@@ -608,6 +668,10 @@ void usage(const char* prog) {
                "(default 256)\n"
             << "  -valsize N        value size in bytes for set (default 1024)\n"
             << "  -mode get|set     operation (default get)\n"
+            << "  -user U           SASL PLAIN user; unset skips the "
+               "handshake entirely (default: unset)\n"
+            << "  -pass P           SASL PLAIN password\n"
+            << "  -bucket B         bucket to select after authenticating\n"
             << "  -randvals         random, incompressible values\n"
             << "  -zipf THETA       Zipf key selection (e.g. 0.99); default "
                "uniform. With -mode set this also switches SET from the "
@@ -630,7 +694,13 @@ int main(int argc, char** argv) {
             }
             return argv[++i];
         };
-        if (arg == "-host") {
+        if (arg == "-user") {
+            opts.user = next();
+        } else if (arg == "-pass") {
+            opts.pass = next();
+        } else if (arg == "-bucket") {
+            opts.bucket = next();
+        } else if (arg == "-host") {
             const std::string hp = next();
             const auto colon = hp.find(':');
             if (colon == std::string::npos) {
@@ -687,6 +757,8 @@ int main(int argc, char** argv) {
         std::cerr << "-conns, -pipeline and -keys must be non-zero\n";
         return 2;
     }
+
+    gOpts = opts; // connectTo() reads the credentials from here
 
     std::vector<Result> results(opts.conns);
     std::vector<std::thread> threads;
