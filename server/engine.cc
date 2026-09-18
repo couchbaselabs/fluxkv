@@ -530,9 +530,30 @@ void WriterPool::workerLoop(Worker* self) {
     // leave the rest of the queue unwritten, discarding writes the client had
     // already been told were stored. Callers drain first - see
     // Bucket::DrainWrites().
+    // Brief spin before parking, as ReaderPool does. A durable write costs
+    // four thread handoffs and the device only ~28 us, so a wake on this hop
+    // is a large share of the latency. MAGMA_WRITER_SPIN_ITERS=0 disables.
+    static const int kSpinIters = []() {
+        const char* env = std::getenv("MAGMA_WRITER_SPIN_ITERS");
+        return env ? std::atoi(env) : 2000;
+    }();
     for (;;) {
         PersistTask task;
-        taskQueue_.blockingRead(task);
+        bool got = false;
+        for (int i = 0; i < kSpinIters; i++) {
+            if (taskQueue_.read(task)) {
+                got = true;
+                break;
+            }
+#if defined(__x86_64__) || defined(__i386__)
+            asm volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+            asm volatile("yield" ::: "memory");
+#endif
+        }
+        if (!got) {
+            taskQueue_.blockingRead(task);
+        }
         if (!task.shard) {
             break; // stop, or retire this one worker
         }
