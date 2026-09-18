@@ -62,6 +62,9 @@ struct TunerConfig {
     // be kept in both directions, which would cycle at the boundary.
     double minGain{0.01};
     double maxLoss{0.005};
+    // A pool whose threads are this idle is not measurable against global
+    // throughput: shrinking it is judged on the idleness alone.
+    double idleBusy{0.02};
     // Windows to skip after a change, then windows to average before judging
     // it; a step too small to show the tolerance in full gets the longer look.
     size_t settleWindows{1};
@@ -131,8 +134,11 @@ private:
         double busyBefore{0};
         size_t measure{0};
         double noise{0}; // steadyNoise() when the trial started
-        double tputSum{0};
-        size_t tputN{0};
+        // Per-window throughput during a trial. The verdict takes the
+        // median: a single flush or compaction stall inside the window
+        // otherwise decides it, and one did - a grow measured -77.7% in a
+        // load whose own noise was 12%.
+        std::vector<double> tputWindows;
         size_t windowsSinceChange{0};
         size_t settledWindows{0}; // windows since the pool reported Settled
         Direction grow, shrink;

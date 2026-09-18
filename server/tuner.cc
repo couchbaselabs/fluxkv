@@ -180,9 +180,11 @@ void ThreadTuner::decide(double tput) {
             return;
         }
         if (++ps.settledWindows > cfg_.settleWindows) {
-            ps.tputSum += tput;
-            if (++ps.tputN >= ps.measure) {
-                judge(ps, ps.tputSum / ps.tputN);
+            ps.tputWindows.push_back(tput);
+            if (ps.tputWindows.size() >= ps.measure) {
+                auto w = ps.tputWindows;
+                std::sort(w.begin(), w.end());
+                judge(ps, w[w.size() / 2]);
             }
         }
         return;
@@ -299,8 +301,7 @@ bool ThreadTuner::startTrial(PoolState& ps) {
         auto want = static_cast<size_t>(std::ceil(ps.noise / cfg_.minGain));
         ps.measure = std::min<size_t>(8, std::max(ps.measure, want));
     }
-    ps.tputSum = 0;
-    ps.tputN = 0;
+    ps.tputWindows.clear();
     ps.windowsSinceChange = 0;
     ps.settledWindows = 0;
     ps.changes++;
@@ -345,6 +346,12 @@ void ThreadTuner::judge(PoolState& ps, double tput) {
     bool keep;
     if (ps.refTput == 0) {
         keep = !grew;
+    } else if (!grew && ps.busyBefore < cfg_.idleBusy) {
+        // The pool was doing nothing, so global throughput cannot say
+        // whether removing threads from it helped; its own idleness can.
+        // Judging these on throughput produced verdicts like a reader
+        // shrink "kept" on a 124% gain in a write-only load.
+        keep = true;
     } else if (grew) {
         keep = ratio >= 1.0 + tol;
     } else {
