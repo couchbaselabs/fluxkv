@@ -107,6 +107,7 @@ struct Config {
     bool autoTune = false;
     size_t maxIoThreads = 0; // 0 = hardware threads
     size_t maxReaders = 0; // 0 = 4 x hardware threads
+    size_t maxWriters = 0; // 0 = 2 x hardware threads
     // One write-ahead log shared by every shard, instead of one per shard.
     // Shards stop serialising against each other on their own log mutex and
     // one durability flush covers writes from all of them.
@@ -198,6 +199,8 @@ static void printUsage(const char* prog) {
                  "hardware threads)\n"
               << "  --max-readers N       ceiling for --auto-tune (default: "
                  "4 x hardware threads)\n"
+              << "  --max-writers N       ceiling for --auto-tune (default: "
+                 "2 x hardware threads)\n"
               << "  --write-cache N       per-shard write cache in bytes "
                  "(default: half the per-shard quota). This is the threshold "
                  "magma throttles writers against\n"
@@ -286,6 +289,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"auto-tune", no_argument, nullptr, 1030},
             {"max-io-threads", required_argument, nullptr, 1031},
             {"max-readers", required_argument, nullptr, 1032},
+            {"max-writers", required_argument, nullptr, 1060},
             {"write-cache", required_argument, nullptr, 1045},
             {"shared-wal", no_argument, nullptr, 1040},
             {"shared-wal-path", required_argument, nullptr, 1041},
@@ -423,6 +427,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1032:
             cfg.maxReaders = strtoull(optarg, nullptr, 10);
+            break;
+        case 1060:
+            cfg.maxWriters = strtoull(optarg, nullptr, 10);
             break;
         case 1045:
             cfg.writeCache = strtoull(optarg, nullptr, 10);
@@ -788,14 +795,21 @@ int main(int argc, char* argv[]) {
         // Readers move in whole shards; the floor is one per shard.
         ThreadTuner::Bounds rd{cfg.shards,
                                cfg.maxReaders ? cfg.maxReaders : 4 * hw};
+        // Writers move in whole shards too.
+        ThreadTuner::Bounds wr{cfg.shards,
+                               cfg.maxWriters ? cfg.maxWriters : 2 * hw};
         io.max = std::max(io.max, static_cast<size_t>(cfg.ioThreads));
         rd.max = std::max(rd.max, static_cast<size_t>(cfg.readers));
-        server.EnableAutoTune(TunerConfig{}, io, rd);
-        spdlog::info("  auto-tune: io-threads {}..{} readers {}..{}",
-                     io.min,
-                     io.max,
-                     rd.min,
-                     rd.max);
+        wr.max = std::max(wr.max, static_cast<size_t>(cfg.writers));
+        server.EnableAutoTune(TunerConfig{}, io, rd, wr);
+        spdlog::info(
+                "  auto-tune: io-threads {}..{} readers {}..{} writers {}..{}",
+                io.min,
+                io.max,
+                rd.min,
+                rd.max,
+                wr.min,
+                wr.max);
     }
 
     server.Start(); // returns once RequestStop() has been called

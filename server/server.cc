@@ -43,15 +43,18 @@ Server::~Server() {
 
 void Server::EnableAutoTune(const TunerConfig& cfg,
                             ThreadTuner::Bounds ioBounds,
-                            ThreadTuner::Bounds readerBounds) {
+                            ThreadTuner::Bounds readerBounds,
+                            ThreadTuner::Bounds writerBounds) {
     tuner_ = std::make_unique<ThreadTuner>(cfg, []() {
         return gDispStats.cmdGet.Sum() + gDispStats.cmdSet.Sum() +
                gDispStats.cmdDelete.Sum();
     });
     ioPool_ = std::make_unique<IOPool>(this);
     readerGroup_ = std::make_unique<ReaderPoolGroup>(bucket_);
+    writerGroup_ = std::make_unique<WriterPoolGroup>(bucket_);
     tuner_->AddPool(ioPool_.get(), ioBounds);
     tuner_->AddPool(readerGroup_.get(), readerBounds);
+    tuner_->AddPool(writerGroup_.get(), writerBounds);
 }
 
 void Server::addIOThread() {

@@ -320,6 +320,9 @@ struct alignas(64) VBQueue {
 struct PersistTask {
     class Shard* shard{nullptr};
     uint16_t vbid{0};
+    // Stamped by Submit; the gap to dequeue is how long work waited for a
+    // thread, which the tuner reports.
+    uint64_t enqueuedNs{0};
 };
 
 struct ReadTask {
@@ -451,17 +454,54 @@ public:
     void SubmitOrDefer(PersistTask task, VBQueue& vbq);
     void Shutdown();
 
+    // Run-time sizing, driven by the tuner. Same shape as ReaderPool: Grow
+    // starts threads now, Shrink queues one retire sentinel per thread and
+    // the worker that takes it exits after its current batch, Reap joins it.
+    // A retiring worker has already released its vbucket, so no write is
+    // stranded.
+    size_t Size() const {
+        return live_.load(std::memory_order_relaxed);
+    }
+    void Grow(size_t n);
+    void Shrink(size_t n);
+    void Reap();
+
+    // Work done since the previous call. Busy time is measured around
+    // executePersist only.
+    struct Sample {
+        uint64_t busyNs{0};
+        uint64_t waitNs{0};
+        uint64_t tasks{0};
+        uint64_t items{0};
+    };
+    Sample TakeSample();
+
 private:
     struct Deferred {
         uint64_t notBeforeNs{0};
         PersistTask task;
     };
+    struct Worker {
+        std::thread thread;
+        std::atomic<bool> done{false};
+    };
+    struct alignas(64) Acct {
+        std::atomic<uint64_t> busyNs{0};
+        std::atomic<uint64_t> waitNs{0};
+        std::atomic<uint64_t> tasks{0};
+        std::atomic<uint64_t> items{0};
+    };
 
-    void workerLoop();
+    void spawn();
+    void workerLoop(Worker* self);
     void deferLoop();
-    void executePersist(PersistTask& task);
+    // Returns the number of requests written.
+    size_t executePersist(PersistTask& task);
 
-    std::vector<std::thread> threads_;
+    std::vector<std::unique_ptr<Worker>> workers_;
+    std::atomic<size_t> live_{0};
+    Acct acct_[kStatShards];
+    Sample lastSample_;
     folly::MPMCQueue<PersistTask> taskQueue_;
     // FIFO of tasks waiting out the coalescing interval. Every entry has the
     // same delay, so arrival order is due order and one thread sleeping on
@@ -605,6 +645,13 @@ public:
         }
         return v;
     }
+    std::vector<WriterPool*> WriterPools() {
+        std::vector<WriterPool*> v;
+        for (auto& s : shards_) {
+            v.push_back(s->GetWriterPool());
+        }
+        return v;
+    }
 
     // Public for writer pool access
     std::atomic<size_t> queuedBytes_{0};
@@ -627,6 +674,27 @@ private:
 // The per-shard reader pools presented to the tuner as one pool. Every shard
 // carries the same share of vbuckets, so they are always kept the same size:
 // Size() is the total and Step() is the shard count.
+// Every shard has its own writer pool, so a step is one thread per shard.
+class WriterPoolGroup : public ElasticPool {
+public:
+    explicit WriterPoolGroup(Bucket* bucket) : pools_(bucket->WriterPools()) {
+    }
+    const char* Name() const override {
+        return "writers";
+    }
+    size_t Size() const override;
+    size_t Step() const override {
+        return pools_.size();
+    }
+    void Grow(size_t n) override;
+    void Shrink(size_t n) override;
+    PoolSample Sample(double wallSec) override;
+    void Reap() override;
+
+private:
+    std::vector<WriterPool*> pools_;
+};
+
 class ReaderPoolGroup : public ElasticPool {
 public:
     explicit ReaderPoolGroup(Bucket* bucket) : pools_(bucket->ReaderPools()) {

@@ -89,6 +89,10 @@ inline bool shouldDeferWrite(const VBQueue& vbq, uint64_t now) {
     return now - vbq.lastWriteNs.load(std::memory_order_relaxed) <
            gWriteCoalesceNs;
 }
+// Sentinels travel through a task queue with a null shard: vbid 0 stops a
+// worker for shutdown, vbid 1 retires one worker for Shrink.
+constexpr uint16_t kStopWorker = 0;
+constexpr uint16_t kRetireWriter = 1;
 } // namespace
 // Gates per-op stat increments — see engine.h.
 bool gStatsHotPath = true;
@@ -333,11 +337,63 @@ WriterPool::WriterPool(size_t numThreads, size_t queueSize, Bucket* bucket)
         });
     }
     for (size_t i = 0; i < numThreads; i++) {
-        threads_.emplace_back([this]() {
-            pthread_setname_np(pthread_self(), "fx:writer");
-            workerLoop();
-        });
+        spawn();
     }
+}
+
+void WriterPool::spawn() {
+    auto w = std::make_unique<Worker>();
+    auto* self = w.get();
+    w->thread = std::thread([this, self]() {
+        pthread_setname_np(pthread_self(), "fx:writer");
+        workerLoop(self);
+    });
+    workers_.push_back(std::move(w));
+    live_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void WriterPool::Grow(size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        spawn();
+    }
+}
+
+void WriterPool::Shrink(size_t n) {
+    // Never retire the last writer: with none left nothing drains the
+    // queues and the bucket wedges.
+    const size_t live = live_.load(std::memory_order_relaxed);
+    n = std::min(n, live > 1 ? live - 1 : 0);
+    live_.fetch_sub(n, std::memory_order_relaxed);
+    for (size_t i = 0; i < n; i++) {
+        taskQueue_.blockingWrite(PersistTask{nullptr, kRetireWriter, 0});
+    }
+}
+
+void WriterPool::Reap() {
+    for (auto it = workers_.begin(); it != workers_.end();) {
+        if ((*it)->done.load(std::memory_order_acquire)) {
+            (*it)->thread.join();
+            it = workers_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+WriterPool::Sample WriterPool::TakeSample() {
+    Sample total;
+    for (const auto& a : acct_) {
+        total.busyNs += a.busyNs.load(std::memory_order_relaxed);
+        total.waitNs += a.waitNs.load(std::memory_order_relaxed);
+        total.tasks += a.tasks.load(std::memory_order_relaxed);
+        total.items += a.items.load(std::memory_order_relaxed);
+    }
+    Sample delta{total.busyNs - lastSample_.busyNs,
+                 total.waitNs - lastSample_.waitNs,
+                 total.tasks - lastSample_.tasks,
+                 total.items - lastSample_.items};
+    lastSample_ = total;
+    return delta;
 }
 
 WriterPool::~WriterPool() {
@@ -345,11 +401,13 @@ WriterPool::~WriterPool() {
 }
 
 void WriterPool::Submit(PersistTask task) {
+    task.enqueuedNs = steadyNowNs();
     taskQueue_.blockingWrite(std::move(task));
 }
 
 void WriterPool::SubmitOrDefer(PersistTask task, VBQueue& vbq) {
     const uint64_t now = steadyNowNs();
+    task.enqueuedNs = now;
     if (shouldDeferWrite(vbq, now)) {
         deferQueue_.blockingWrite(Deferred{
                 vbq.lastWriteNs.load(std::memory_order_relaxed) +
@@ -389,20 +447,22 @@ void WriterPool::Shutdown() {
     // Flush the coalescing queue into the task queue first so nothing is
     // still waiting out its interval when the workers see their sentinels.
     if (deferThread_.joinable()) {
-        deferQueue_.blockingWrite(Deferred{0, PersistTask{nullptr, 0}});
+        deferQueue_.blockingWrite(Deferred{0, PersistTask{nullptr, 0, 0}});
         deferThread_.join();
     }
     // The sentinels queue behind whatever work is already pending. The queue
     // is FIFO, so each worker executes every task enqueued before this point
     // and only then reads its sentinel and exits.
-    for (size_t i = 0; i < threads_.size(); i++) {
-        taskQueue_.blockingWrite(PersistTask{nullptr, 0});
+    for (size_t i = 0; i < workers_.size(); i++) {
+        taskQueue_.blockingWrite(PersistTask{nullptr, kStopWorker, 0});
     }
-    for (auto& t : threads_) {
-        if (t.joinable()) {
-            t.join();
+    for (auto& w : workers_) {
+        if (w->thread.joinable()) {
+            w->thread.join();
         }
     }
+    workers_.clear();
+    live_.store(0, std::memory_order_relaxed);
 }
 
 size_t gDispatchBatch = 16;
@@ -464,7 +524,7 @@ private:
 } // namespace
 
 
-void WriterPool::workerLoop() {
+void WriterPool::workerLoop(Worker* self) {
     // Exit on the sentinel only, never on the shutdown flag. Testing the flag
     // here let a worker that had just finished a task return immediately and
     // leave the rest of the queue unwritten, discarding writes the client had
@@ -474,10 +534,18 @@ void WriterPool::workerLoop() {
         PersistTask task;
         taskQueue_.blockingRead(task);
         if (!task.shard) {
-            break; // sentinel
+            break; // stop, or retire this one worker
         }
-        executePersist(task);
+        auto& acct = acct_[statSlot()];
+        const uint64_t t0 = steadyNowNs();
+        const size_t written = executePersist(task);
+        const uint64_t t1 = steadyNowNs();
+        acct.busyNs.fetch_add(t1 - t0, std::memory_order_relaxed);
+        acct.waitNs.fetch_add(t0 - task.enqueuedNs, std::memory_order_relaxed);
+        acct.tasks.fetch_add(1, std::memory_order_relaxed);
+        acct.items.fetch_add(written, std::memory_order_relaxed);
     }
+    self->done.store(true, std::memory_order_release);
 }
 
 // Items accumulated during WriteDocs. Re-arm through the queue for
@@ -494,7 +562,7 @@ static inline void releaseVBQueueAfterWrite(VBQueue& vbq,
     }
 }
 
-void WriterPool::executePersist(PersistTask& task) {
+size_t WriterPool::executePersist(PersistTask& task) {
     auto* shard = task.shard;
     auto& vbq = shard->GetVBWriteQueue(task.vbid);
 
@@ -506,8 +574,8 @@ void WriterPool::executePersist(PersistTask& task) {
                           std::memory_order_relaxed);
 
     if (batch.empty()) {
-        releaseVBQueue(vbq, taskQueue_, PersistTask{shard, task.vbid});
-        return;
+        releaseVBQueue(vbq, taskQueue_, PersistTask{shard, task.vbid, 0});
+        return 0;
     }
     std::reverse(batch.begin(), batch.end());
 
@@ -665,10 +733,11 @@ void WriterPool::executePersist(PersistTask& task) {
         p.status = status;
         p.bytes = batchBytes;
         p.reqs = std::move(batch);
+        const size_t written = p.reqs.size();
         shard->AwaitDurable(std::move(p));
         batch.clear();
         releaseVBQueueAfterWrite(vbq, shard, task.vbid, *this);
-        return;
+        return written;
     }
 
     bucket_->queuedBytes_.fetch_sub(batchBytes, std::memory_order_relaxed);
@@ -706,7 +775,9 @@ void WriterPool::executePersist(PersistTask& task) {
         }
     }
 
+    const size_t written = batch.size();
     releaseVBQueueAfterWrite(vbq, shard, task.vbid, *this);
+    return written;
 }
 
 // ---- ReaderPool ----
@@ -1005,6 +1076,59 @@ size_t ReaderPool::executeRead(ReadTask& task) {
 
     releaseVBQueue(vbq, taskQueue_, ReadTask{shard, task.vbid, nowNs()});
     return batch.size();
+}
+
+// ---- WriterPoolGroup ----
+
+size_t WriterPoolGroup::Size() const {
+    size_t n = 0;
+    for (auto* p : pools_) {
+        n += p->Size();
+    }
+    return n;
+}
+
+void WriterPoolGroup::Grow(size_t n) {
+    const size_t per = std::max<size_t>(1, n / pools_.size());
+    for (auto* p : pools_) {
+        p->Grow(per);
+    }
+}
+
+void WriterPoolGroup::Shrink(size_t n) {
+    const size_t per = std::max<size_t>(1, n / pools_.size());
+    for (auto* p : pools_) {
+        p->Shrink(per);
+    }
+}
+
+void WriterPoolGroup::Reap() {
+    for (auto* p : pools_) {
+        p->Reap();
+    }
+}
+
+PoolSample WriterPoolGroup::Sample(double wallSec) {
+    PoolSample s;
+    uint64_t busyNs = 0, waitNs = 0, tasks = 0, items = 0;
+    for (auto* p : pools_) {
+        const auto d = p->TakeSample();
+        busyNs += d.busyNs;
+        waitNs += d.waitNs;
+        tasks += d.tasks;
+        items += d.items;
+        s.size += p->Size();
+        if (p->Size() > 0 && wallSec > 0) {
+            s.busyMax =
+                    std::max(s.busyMax, d.busyNs / (wallSec * 1e9 * p->Size()));
+        }
+    }
+    if (s.size > 0 && wallSec > 0) {
+        s.busyMean = busyNs / (wallSec * 1e9 * s.size);
+    }
+    s.avgBatch = tasks > 0 ? static_cast<double>(items) / tasks : 0;
+    s.waitUs = tasks > 0 ? waitNs / 1e3 / tasks : 0;
+    return s;
 }
 
 // ---- ReaderPoolGroup ----

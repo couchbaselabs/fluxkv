@@ -38,7 +38,8 @@ public:
     // Bounds are inclusive thread counts; see ThreadTuner.
     void EnableAutoTune(const TunerConfig& cfg,
                         ThreadTuner::Bounds ioBounds,
-                        ThreadTuner::Bounds readerBounds);
+                        ThreadTuner::Bounds readerBounds,
+                        ThreadTuner::Bounds writerBounds);
 
 private:
     // The IO threads as one pool. Growing starts loops and spreads existing
@@ -93,6 +94,7 @@ private:
 
     std::unique_ptr<IOPool> ioPool_;
     std::unique_ptr<ReaderPoolGroup> readerGroup_;
+    std::unique_ptr<WriterPoolGroup> writerGroup_;
     std::unique_ptr<ThreadTuner> tuner_;
 };
 
