@@ -514,7 +514,17 @@ void Server::Start() {
     }
 }
 
+void Server::RequestStop() {
+    running_.store(false);
+}
+
 void Server::Stop() {
+    // Idempotent: main calls this after Start() returns and ~Server calls it
+    // again. A second pass joined already-joined threads (std::system_error)
+    // and touched IOThreads the first pass was destroying.
+    if (stopped_.exchange(true)) {
+        return;
+    }
     running_.store(false);
     if (listenFd_ >= 0) {
         ::close(listenFd_);

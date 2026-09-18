@@ -1178,8 +1178,16 @@ void Bucket::Close() {
             r->Shutdown();
         }
     }
+    // Shards are independent magma instances; closing them one after
+    // another took over a second each and left the process alive 10 s past
+    // SIGTERM.
+    std::vector<std::thread> closers;
+    closers.reserve(shards_.size());
     for (auto& shard : shards_) {
-        shard->Close();
+        closers.emplace_back([&shard]() { shard->Close(); });
+    }
+    for (auto& t : closers) {
+        t.join();
     }
 }
 

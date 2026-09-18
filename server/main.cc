@@ -20,17 +20,23 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <atomic>
 #include <thread>
 
 using namespace magma;
 using namespace magma::kvserver;
 
 static Server* gServer = nullptr;
+static std::atomic<int> gSignal{0};
 
+// Only async-signal-safe work here. Stop() used to run from this handler:
+// it joins threads and locks a mutex, and a second SIGTERM during the 5-15 s
+// shutdown re-entered it on a random thread while the IO threads were being
+// destroyed, which segfaulted or aborted on a double join.
 static void signalHandler(int sig) {
-    spdlog::info("Caught signal {}, shutting down...", sig);
+    gSignal.store(sig, std::memory_order_relaxed);
     if (gServer) {
-        gServer->Stop();
+        gServer->RequestStop();
     }
 }
 
@@ -790,8 +796,12 @@ int main(int argc, char* argv[]) {
                      rd.max);
     }
 
-    server.Start(); // blocks until Stop() is called
+    server.Start(); // returns once RequestStop() has been called
 
+    if (int sig = gSignal.load(std::memory_order_relaxed)) {
+        spdlog::info("Caught signal {}, shutting down...", sig);
+    }
+    server.Stop();
     spdlog::info("magma-kvserver shutdown complete");
     return 0;
 }

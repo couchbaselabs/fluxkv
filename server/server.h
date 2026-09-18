@@ -26,8 +26,12 @@ public:
            uint16_t statsPort = 80);
     ~Server();
 
-    // Blocks on accept loop. Call Stop() from signal handler.
+    // Blocks on the accept loop until RequestStop().
     void Start();
+    // Async-signal-safe: only asks Start() to return. The caller then runs
+    // Stop() on its own thread.
+    void RequestStop();
+    // Joins every thread. Idempotent.
     void Stop();
 
     // Size the IO threads and the reader pools at run time from load.
@@ -73,6 +77,7 @@ private:
     int listenFd_{-1};
     uint16_t statsPort_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> stopped_{false};
     std::thread statsThread_;
 
     // Precomputed protocol responses
