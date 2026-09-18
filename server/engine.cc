@@ -31,6 +31,7 @@ bool gAsyncDurable = false;
 bool gTraceLatency = false;
 StageTimers gStages;
 int gDurableSpinIters = 4000;
+size_t gCompletionSlice = 512;
 double gSortDupThreshold = 0.05;
 // Per-shard cap on recycled Requests; beyond it writers delete. Sized to
 // cover the write queue at a few hundred bytes per Request.
@@ -107,6 +108,14 @@ std::string DispatcherStats::toJson() const {
         j["stage_respond_us"] =
                 gStages.respondNs.load(std::memory_order_relaxed) / 1e3 / n;
         j["stage_count"] = n;
+        j["stage_max_to_writer_us"] =
+                gStages.toWriterMax.load(std::memory_order_relaxed) / 1e3;
+        j["stage_max_write_us"] =
+                gStages.writeMax.load(std::memory_order_relaxed) / 1e3;
+        j["stage_max_durable_us"] =
+                gStages.durableMax.load(std::memory_order_relaxed) / 1e3;
+        j["stage_max_respond_us"] =
+                gStages.respondMax.load(std::memory_order_relaxed) / 1e3;
     }
     j["cmd_set"] = cmdSet.Sum();
     j["cmd_get"] = cmdGet.Sum();
@@ -250,11 +259,17 @@ void Shard::durableLoop() {
             continue;
         }
 
-        // Group the responses by event base and post one task per IO
-        // thread, not one per request. A completion pass covers hundreds of
-        // requests spread over a handful of loops, and the per-request
-        // runInEventBaseThread hop was costing more CPU on the IO threads
-        // than the writers spent producing the batch.
+        // Group the responses per IO thread and hand each one its whole
+        // share at once. Grouping alone was not enough: this used
+        // runInEventBaseThread, which a loop only drains when it reaches its
+        // cross-thread queue, and a loop with many always-ready sockets can
+        // go a long time without doing so. That was the tail - the mean time
+        // from durable to response was 18.8 ms at pipeline 512 while the
+        // durable wait itself was 0.9 ms. IOThread::Post exists for this: it
+        // leaves the work in a mailbox and raises a flag the read path
+        // checks on every event, so a busy loop picks it up within one
+        // iteration.
+        folly::F14FastMap<IOThread*, std::vector<Request*>> byThread;
         folly::F14FastMap<folly::EventBase*, std::vector<Request*>> byLoop;
         for (auto& p : ready) {
             const bool ok = p.status.IsOK();
@@ -266,7 +281,11 @@ void Shard::durableLoop() {
                 if (!ok) {
                     req->resultStatus = p.status;
                 }
-                byLoop[req->evb].push_back(req);
+                if (req->ioOwner) {
+                    byThread[req->ioOwner].push_back(req);
+                } else {
+                    byLoop[req->evb].push_back(req);
+                }
             }
             hotStatAdd(ok ? gDispStats.cmdSetResp : gDispStats.cmdSetRespErr,
                        p.reqs.size());
@@ -281,12 +300,30 @@ void Shard::durableLoop() {
         // Each parked request holds a reservation on the loop it will be
         // answered on, so the loop cannot be retired underneath us. The
         // reservation is dropped on that loop, after the response.
+        // Post in slices: answering tens of thousands of requests in one
+        // callback keeps that loop from reading its sockets for the whole
+        // run of them.
+        auto post = [](auto&& submit, std::vector<Request*>& reqs) {
+            for (size_t i = 0; i < reqs.size(); i += gCompletionSlice) {
+                const size_t n = std::min(gCompletionSlice, reqs.size() - i);
+                std::vector<Request*> slice(reqs.begin() + i,
+                                            reqs.begin() + i + n);
+                submit([v = std::move(slice)]() {
+                    for (auto* req : v) {
+                        req->conn->sendWriteResponse(req);
+                    }
+                });
+            }
+        };
+        for (auto& [iot, reqs] : byThread) {
+            post([iot](std::function<void()> fn) { iot->Post(std::move(fn)); },
+                 reqs);
+        }
         for (auto& [evb, reqs] : byLoop) {
-            evb->runInEventBaseThread([v = std::move(reqs)]() {
-                for (auto* req : v) {
-                    req->conn->sendWriteResponse(req);
-                }
-            });
+            post([evb](std::function<void()> fn) {
+                     evb->runInEventBaseThread(std::move(fn));
+                 },
+                 reqs);
         }
     }
 }

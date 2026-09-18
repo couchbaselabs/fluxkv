@@ -152,10 +152,24 @@ struct StageTimers {
     // durable -> response appended on the IO thread
     std::atomic<uint64_t> respondNs{0};
     std::atomic<uint64_t> count{0};
+    // Worst seen for each stage: the mean says where the time goes, the max
+    // says which stage owns the tail.
+    std::atomic<uint64_t> toWriterMax{0};
+    std::atomic<uint64_t> writeMax{0};
+    std::atomic<uint64_t> durableMax{0};
+    std::atomic<uint64_t> respondMax{0};
 };
+inline void bumpMax(std::atomic<uint64_t>& m, uint64_t v) {
+    uint64_t cur = m.load(std::memory_order_relaxed);
+    while (v > cur && !m.compare_exchange_weak(cur, v,
+                                               std::memory_order_relaxed)) {
+    }
+}
 extern StageTimers gStages;
 // Spin iterations in the durable completion thread before it sleeps.
 extern int gDurableSpinIters;
+// Requests answered per posted completion callback; see durableLoop.
+extern size_t gCompletionSlice;
 // Estimated duplicate fraction at or above which Auto sorts.
 extern double gSortDupThreshold;
 // Master switch for per-op hot-path stat increments. At 1 M ops/s the cache-

@@ -304,6 +304,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"trace-latency", no_argument, nullptr, 1062},
             {"shared-wal-prewrite", required_argument, nullptr, 1063},
             {"shared-wal-segment-size", required_argument, nullptr, 1064},
+            {"completion-slice", required_argument, nullptr, 1065},
             {"write-cache", required_argument, nullptr, 1045},
             {"shared-wal", no_argument, nullptr, 1040},
             {"shared-wal-path", required_argument, nullptr, 1041},
@@ -456,6 +457,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1064:
             cfg.sharedWalSegmentSize = strtoull(optarg, nullptr, 10);
+            break;
+        case 1065:
+            kvserver::gCompletionSlice = strtoull(optarg, nullptr, 10);
             break;
         case 1045:
             cfg.writeCache = strtoull(optarg, nullptr, 10);

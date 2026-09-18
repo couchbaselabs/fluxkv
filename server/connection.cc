@@ -1113,7 +1113,8 @@ void Connection::sendWriteResponse(Request* req) {
     // on the loop itself, once the response is out. reset() clears the
     // field, so read it first.
     auto* iot = req->ioOwner;
-    if (gTraceLatency && req->tArrive && req->tDurable) {
+    if (gTraceLatency && req->tArrive && req->tWriter >= req->tArrive &&
+        req->tWritten >= req->tWriter && req->tDurable >= req->tWritten) {
         const uint64_t now = steadyNowNs();
         gStages.toWriterNs.fetch_add(req->tWriter - req->tArrive,
                                      std::memory_order_relaxed);
@@ -1124,6 +1125,10 @@ void Connection::sendWriteResponse(Request* req) {
         gStages.respondNs.fetch_add(now - req->tDurable,
                                     std::memory_order_relaxed);
         gStages.count.fetch_add(1, std::memory_order_relaxed);
+        bumpMax(gStages.toWriterMax, req->tWriter - req->tArrive);
+        bumpMax(gStages.writeMax, req->tWritten - req->tWriter);
+        bumpMax(gStages.durableMax, req->tDurable - req->tWritten);
+        bumpMax(gStages.respondMax, now - req->tDurable);
     }
     if (!closing_) {
         McbpStatus status = req->resultStatus.IsOK()
