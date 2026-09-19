@@ -52,6 +52,76 @@ public:
     }
 };
 
+// The per-shard pools of one role presented to the tuner as a single pool.
+// Every shard carries the same share of the work, so the shards are kept the
+// same size: Size() is the total and Step() is one thread per shard.
+// Pool must provide Size/Grow/Shrink/Reap and a TakeSample() returning
+// busyNs, waitNs, tasks and items accumulated since the previous call.
+template <typename Pool>
+class ShardedPoolGroup : public ElasticPool {
+public:
+    ShardedPoolGroup(const char* name, std::vector<Pool*> pools)
+        : name_(name), pools_(std::move(pools)) {
+    }
+
+    const char* Name() const override {
+        return name_;
+    }
+    size_t Step() const override {
+        return pools_.size();
+    }
+    size_t Size() const override {
+        size_t n = 0;
+        for (auto* p : pools_) {
+            n += p->Size();
+        }
+        return n;
+    }
+    void Grow(size_t n) override {
+        const size_t per = std::max<size_t>(1, n / pools_.size());
+        for (auto* p : pools_) {
+            p->Grow(per);
+        }
+    }
+    void Shrink(size_t n) override {
+        const size_t per = std::max<size_t>(1, n / pools_.size());
+        for (auto* p : pools_) {
+            p->Shrink(per);
+        }
+    }
+    void Reap() override {
+        for (auto* p : pools_) {
+            p->Reap();
+        }
+    }
+    PoolSample Sample(double wallSec) override {
+        PoolSample s;
+        uint64_t busyNs = 0, waitNs = 0, tasks = 0, items = 0;
+        for (auto* p : pools_) {
+            const auto d = p->TakeSample();
+            busyNs += d.busyNs;
+            waitNs += d.waitNs;
+            tasks += d.tasks;
+            items += d.items;
+            s.size += p->Size();
+            if (p->Size() > 0 && wallSec > 0) {
+                s.busyMax = std::max(
+                        s.busyMax, d.busyNs / (wallSec * 1e9 * p->Size()));
+            }
+        }
+        if (s.size > 0 && wallSec > 0) {
+            s.busyMean = busyNs / (wallSec * 1e9 * s.size);
+        }
+        s.avgBatch = tasks > 0 ? static_cast<double>(items) / tasks : 0;
+        s.waitUs = tasks > 0 ? waitNs / 1e3 / tasks : 0;
+        return s;
+    }
+
+private:
+    const char* name_;
+    std::vector<Pool*> pools_;
+};
+
 struct TunerConfig {
     std::chrono::milliseconds sampleInterval{250};
     // A decision window is this many samples; throughput is averaged over it.

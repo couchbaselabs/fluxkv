@@ -50,8 +50,10 @@ void Server::EnableAutoTune(const TunerConfig& cfg,
                gDispStats.cmdDelete.Sum();
     });
     ioPool_ = std::make_unique<IOPool>(this);
-    readerGroup_ = std::make_unique<ReaderPoolGroup>(bucket_);
-    writerGroup_ = std::make_unique<WriterPoolGroup>(bucket_);
+    readerGroup_ =
+            std::make_unique<ReaderPoolGroup>("readers", bucket_->ReaderPools());
+    writerGroup_ =
+            std::make_unique<WriterPoolGroup>("writers", bucket_->WriterPools());
     tuner_->AddPool(ioPool_.get(), ioBounds);
     tuner_->AddPool(readerGroup_.get(), readerBounds);
     tuner_->AddPool(writerGroup_.get(), writerBounds);

@@ -715,49 +715,10 @@ private:
     // no global pools — EnqueueRead/StageWrite route to the shard's own.
 };
 
-// The per-shard reader pools presented to the tuner as one pool. Every shard
-// carries the same share of vbuckets, so they are always kept the same size:
-// Size() is the total and Step() is the shard count.
-// Every shard has its own writer pool, so a step is one thread per shard.
-class WriterPoolGroup : public ElasticPool {
-public:
-    explicit WriterPoolGroup(Bucket* bucket) : pools_(bucket->WriterPools()) {
-    }
-    const char* Name() const override {
-        return "writers";
-    }
-    size_t Size() const override;
-    size_t Step() const override {
-        return pools_.size();
-    }
-    void Grow(size_t n) override;
-    void Shrink(size_t n) override;
-    PoolSample Sample(double wallSec) override;
-    void Reap() override;
-
-private:
-    std::vector<WriterPool*> pools_;
-};
-
-class ReaderPoolGroup : public ElasticPool {
-public:
-    explicit ReaderPoolGroup(Bucket* bucket) : pools_(bucket->ReaderPools()) {
-    }
-    const char* Name() const override {
-        return "readers";
-    }
-    size_t Size() const override;
-    size_t Step() const override {
-        return pools_.size();
-    }
-    void Grow(size_t n) override;
-    void Shrink(size_t n) override;
-    PoolSample Sample(double wallSec) override;
-    void Reap() override;
-
-private:
-    std::vector<ReaderPool*> pools_;
-};
+// One thread per shard is the step for both roles, so the group adapter is
+// shared: see ShardedPoolGroup in tuner.h.
+using WriterPoolGroup = ShardedPoolGroup<WriterPool>;
+using ReaderPoolGroup = ShardedPoolGroup<ReaderPool>;
 
 } // namespace kvserver
 } // namespace magma
