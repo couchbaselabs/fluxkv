@@ -136,6 +136,18 @@ double ThreadTuner::tolerance(const PoolState& ps) const {
     return std::max(cfg_.minGain, ps.noise / std::sqrt(n));
 }
 
+bool ThreadTuner::rampingUp() const {
+    for (const auto& ps : pools_) {
+        if (ps.trial == Trial::None && ps.grow.backoff == 0 &&
+            ps.grow.keptStreak >= cfg_.rampAfterKept &&
+            ps.last.busyMean >= cfg_.rampBusy &&
+            ps.pool->Size() < ps.bounds.max) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void ThreadTuner::decide(double tput) {
     bool steady = true;
     for (auto& ps : pools_) {
@@ -198,7 +210,14 @@ void ThreadTuner::decide(double tput) {
     const double a = steadyRecent_[steadyRecent_.size() - 1];
     const double b = steadyRecent_[steadyRecent_.size() - 2];
     if (a > 0 && std::abs(a - b) / a > std::max(cfg_.minGain, steadyNoise())) {
-        return;
+        // Each kept grow raises throughput, which makes the next window
+        // disagree with the last, which blocks the next grow: the tuner
+        // stalls itself for the whole ramp. A pegged pool that has kept
+        // every recent step is exempt while throughput is rising; a load
+        // that is falling or oscillating still waits for a baseline.
+        if (!(a > b && rampingUp())) {
+            return;
+        }
     }
 
     // One change per window, pools taken in turn. A pool rests one window
@@ -263,6 +282,15 @@ bool ThreadTuner::startTrial(PoolState& ps) {
 
     // A quarter of the pool, halved after each failure, never below a step.
     size_t n = std::max(step, roundToStep(size / 4, step));
+    // While a pegged pool keeps every step it is given, escalate: reaching
+    // the working size from a small start otherwise costs a trial per
+    // quarter, and each trial pays settle plus measure windows. Capped at
+    // doubling, and dir.cap below still bounds a retry after a revert.
+    if (wantGrow && dir.keptStreak >= cfg_.rampAfterKept &&
+        busy >= cfg_.rampBusy) {
+        const size_t mult = dir.keptStreak >= cfg_.rampAfterKept + 1 ? 4 : 2;
+        n = std::max(n, roundToStep(size / 4 * mult, step));
+    }
     if (dir.cap > 0) {
         n = std::min(n, dir.cap);
     }
@@ -374,8 +402,10 @@ void ThreadTuner::judge(PoolState& ps, double tput) {
     if (keep) {
         dir.cap = 0;
         dir.nextBackoff = 0;
+        dir.keptStreak++;
     } else {
         ps.reverts++;
+        dir.keptStreak = 0;
         if (grew) {
             pool->Shrink(delta);
         } else {

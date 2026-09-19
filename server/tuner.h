@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -65,6 +66,11 @@ struct TunerConfig {
     // A pool whose threads are this idle is not measurable against global
     // throughput: shrinking it is judged on the idleness alone.
     double idleBusy{0.02};
+    // A pool this busy that has taken several steps in a row without a
+    // revert is ramping towards its working size. Its step escalates so
+    // that costs a few trials rather than dozens.
+    double rampBusy{0.90};
+    size_t rampAfterKept{2};
     // Windows to skip after a change, then windows to average before judging
     // it; a step too small to show the tolerance in full gets the longer look.
     size_t settleWindows{1};
@@ -118,6 +124,10 @@ private:
         size_t nextBackoff{0}; // what the next failure will cost
         double tputAtFail{0};
         double busyAtFail{0};
+        // Consecutive kept moves. A pool still accepting every step is
+        // ramping, not searching, so the step escalates; any revert
+        // resets it and the halving search takes over.
+        size_t keptStreak{0};
     };
 
     struct PoolState {
@@ -156,6 +166,9 @@ private:
     void judge(PoolState& ps, double tput);
     size_t roundToStep(size_t n, size_t step) const;
     double recentSteady() const;
+    // True while a pegged pool is still being given steps it keeps. Such a
+    // pool does not need a settled baseline to know it wants more threads.
+    bool rampingUp() const;
     // Window-to-window variation of steady throughput (coefficient of
     // variation over steadyRecent_). Verdict thresholds and measurement
     // length scale with it: a load whose throughput swings 8% between
