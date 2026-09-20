@@ -648,6 +648,12 @@ public:
     // pushes every chain with one CAS each and schedules the writers. Call
     // FlushStaged before returning to the event loop.
     bool StageWrite(Request* req);
+    // Room for more staged writes? Used to lift read backpressure; the
+    // margin keeps a connection from resuming straight back into a refusal.
+    bool WriteQueueHasRoom() const {
+        return queuedBytes_.load(std::memory_order_relaxed) <
+               writeQueueMemLimit_ - writeQueueMemLimit_ / 8;
+    }
     void FlushStaged();
     void EnqueueRead(Request* req);
     bool IsDurable() const {

@@ -158,6 +158,25 @@ private:
     };
     std::unique_ptr<FlushTimeout> flushTimeout_;
 
+    // Write-queue backpressure. Acknowledging on acceptance means the client
+    // never waits, so it offers far more than the engine drains and the
+    // surplus used to be parsed, copied and refused: 90% of requests at
+    // pipeline 128, costing 20 cores and half the disk throughput. Stop
+    // reading instead and let TCP hold the client off until the queue drains.
+    class ResumeTimeout : public folly::AsyncTimeout {
+    public:
+        explicit ResumeTimeout(folly::EventBase* evb)
+            : folly::AsyncTimeout(evb) {
+        }
+        Connection* conn{nullptr};
+        void timeoutExpired() noexcept override;
+    };
+    std::unique_ptr<ResumeTimeout> resumeTimeout_;
+    bool readPaused_{false};
+    bool stageFull_{false};
+    void pauseForQueue();
+    void resumeAfterQueue();
+
     // Per-Connection Request freelist. Requests flow IO-thread → engine-thread
     // → IO-thread; we touch the pool only from the IO thread (this Connection's
     // event-base), so no synchronization is needed. Cap prevents unbounded

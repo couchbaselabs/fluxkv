@@ -189,6 +189,10 @@ void Connection::destroy() {
     if (migrateCb_.isLoopCallbackScheduled()) {
         migrateCb_.cancelLoopCallback();
     }
+    if (resumeTimeout_ && resumeTimeout_->isScheduled()) {
+        resumeTimeout_->cancelTimeout();
+    }
+    readPaused_ = false;
     if (migrating_ && migrateTarget_) {
         migrateTarget_->Unreserve();
         migrateTarget_ = nullptr;
@@ -294,6 +298,11 @@ void Connection::tryFinishMigrate() {
     migrateCheckPending_ = false;
     flushScheduled_ = false;
     flushTimeout_.reset(); // bound to the old loop; recreated lazily
+    if (resumeTimeout_ && resumeTimeout_->isScheduled()) {
+        resumeTimeout_->cancelTimeout();
+    }
+    resumeTimeout_.reset();
+    readPaused_ = false;
     if (owner_) {
         owner_->Remove(this);
         owner_ = nullptr;
@@ -318,9 +327,12 @@ void Connection::finishAttach(IOThread* target) {
     socket_->setReadCB(this);
     // Requests that arrived before reading stopped may still be buffered
     // and the client may be waiting on them.
-    while (!closing_ && parseAndDispatch()) {
+    while (!closing_ && !stageFull_ && parseAndDispatch()) {
     }
     bucket_->FlushStaged();
+    if (stageFull_) {
+        pauseForQueue();
+    }
     if (flushDelayUs() > 0) {
         if (!pendingWriteBuf_.empty()) {
             scheduleFlush();
@@ -354,9 +366,12 @@ void Connection::readDataAvailable(size_t len) noexcept {
         owner_->SchedulePump();
     }
     readBuf_.postallocate(len);
-    while (!closing_ && parseAndDispatch()) {
+    while (!closing_ && !stageFull_ && parseAndDispatch()) {
     }
     bucket_->FlushStaged();
+    if (stageFull_) {
+        pauseForQueue();
+    }
     if (flushDelayUs() > 0) {
         // Let synchronous responses ride the same deferred flush.
         if (!pendingWriteBuf_.empty()) {
@@ -375,6 +390,56 @@ void Connection::flushPending() {
     pendingWriteBuf_.clear();
     auto& buf = inflightBufs_.back();
     socket_->write(this, buf.data(), buf.size());
+}
+
+// Detach from the socket and re-check shortly. The kernel receive buffer
+// then fills and the client's window closes, which paces it without either
+// side doing wasted work. Re-check rather than wait for a signal from the
+// engine: a paused connection produces no events of its own.
+void Connection::pauseForQueue() {
+    stageFull_ = false;
+    if (closing_ || migrating_ || readPaused_) {
+        return;
+    }
+    auto* evb = socket_->getEventBase();
+    if (!evb) {
+        return;
+    }
+    readPaused_ = true;
+    socket_->setReadCB(nullptr);
+    if (!resumeTimeout_) {
+        resumeTimeout_ = std::make_unique<ResumeTimeout>(evb);
+        resumeTimeout_->conn = this;
+    }
+    resumeTimeout_->scheduleTimeoutHighRes(std::chrono::microseconds(200));
+}
+
+void Connection::resumeAfterQueue() {
+    if (!readPaused_) {
+        return;
+    }
+    if (closing_ || migrating_) {
+        readPaused_ = false;
+        return;
+    }
+    if (!bucket_->WriteQueueHasRoom()) {
+        resumeTimeout_->scheduleTimeoutHighRes(std::chrono::microseconds(200));
+        return;
+    }
+    readPaused_ = false;
+    socket_->setReadCB(this);
+    // Bytes may already be buffered from before the pause.
+    while (!closing_ && !stageFull_ && parseAndDispatch()) {
+    }
+    bucket_->FlushStaged();
+    if (stageFull_) {
+        pauseForQueue();
+    }
+    flushPending();
+}
+
+void Connection::ResumeTimeout::timeoutExpired() noexcept {
+    conn->resumeAfterQueue();
 }
 
 void Connection::scheduleFlush() {
@@ -950,6 +1015,9 @@ void Connection::handleSet(McbpHeader& hdr,
                                               req->key.Len()));
             }
             releaseRequest(req);
+            // The queue is full: stop taking requests off this socket rather
+            // than refusing every one of them at nearly the cost of a write.
+            stageFull_ = true;
         }
     }
 }
