@@ -164,6 +164,11 @@ struct Config {
     // decompresses one block to find a 12-byte key; at ~1M writes/s LZ4 and
     // the in-block scan were ~8% of server CPU.
     size_t keyBlockSize = 0;
+
+    // seqIndex LSD level count (magma default 5) and tiered level-0. The
+    // tiered mode wants 3 levels: L0 tiered, L1 deltas, L2 data.
+    int lsdLevels = 0;
+    bool lsdTieredL0 = false;
     size_t lsmLevel0Tables = 0;
     size_t lsmMinCompactSize = 0;
     int lsmLevelMultiplier = 0;
@@ -265,6 +270,9 @@ static void printUsage(const char* prog) {
                  "sorts (default 0.05)\n"
               << "  --lsm-sstable-size N     max sstable bytes (magma "
                  "default 2MB)\n"
+              << "  --lsd-levels N       seqIndex LSD levels (magma default 5)\n"
+              << "  --lsd-tiered-l0      tiered level-0 seqIndex GC (needs "
+                 "--lsd-levels 3 and the magma research branch)\n"
               << "  --key-block-size N   key-index data block size in bytes "
                  "(magma default 32768)\n"
               << "  --sstable-write-buffer N  sstable writer buffer in bytes "
@@ -361,6 +369,8 @@ static Config parseArgs(int argc, char* argv[]) {
             {"key-warm-new-tables", no_argument, nullptr, 1072},
             {"sstable-write-buffer", required_argument, nullptr, 1074},
             {"key-block-size", required_argument, nullptr, 1075},
+            {"lsd-levels", required_argument, nullptr, 1077},
+            {"lsd-tiered-l0", no_argument, nullptr, 1078},
             {"lsm-level0-tables", required_argument, nullptr, 1055},
             {"lsm-min-compact-size", required_argument, nullptr, 1056},
             {"lsm-level-multiplier", required_argument, nullptr, 1057},
@@ -562,6 +572,12 @@ static Config parseArgs(int argc, char* argv[]) {
         case 1075:
             cfg.keyBlockSize = strtoull(optarg, nullptr, 10);
             break;
+        case 1077:
+            cfg.lsdLevels = atoi(optarg);
+            break;
+        case 1078:
+            cfg.lsdTieredL0 = true;
+            break;
         case 1055:
             cfg.lsmLevel0Tables = strtoull(optarg, nullptr, 10);
             break;
@@ -762,6 +778,10 @@ int main(int argc, char* argv[]) {
     if (cfg.keyBlockSize > 0) {
         magmaCfg.KeyTreeBlockSize = cfg.keyBlockSize;
     }
+    if (cfg.lsdLevels > 0) {
+        magmaCfg.LSDNumLevels = cfg.lsdLevels;
+    }
+    magmaCfg.LSDTieredL0 = cfg.lsdTieredL0;
     if (cfg.lsmBaseLevelSize > 0) {
         magmaCfg.LSMMaxBaseLevelSize = cfg.lsmBaseLevelSize;
     }
