@@ -141,6 +141,11 @@ struct Config {
     // table count are the knobs that matter for a write-only workload.
     size_t lsmSSTableSize = 0;
     size_t lsmBaseLevelSize = 0;
+    // Fraction of the seqIndex data level that delta levels may reach before
+    // they are merged down. magma's own default is 0.25; Couchbase ships 0.5
+    // (magma_fragmentation_percentage=50). Design write amp is 1/ratio, so
+    // this is the single largest lever on write amplification.
+    double lsdFragRatio = 0.5;
     size_t lsmLevel0Tables = 0;
     size_t lsmMinCompactSize = 0;
     int lsmLevelMultiplier = 0;
@@ -242,6 +247,10 @@ static void printUsage(const char* prog) {
                  "sorts (default 0.05)\n"
               << "  --lsm-sstable-size N     max sstable bytes (magma "
                  "default 2MB)\n"
+              << "  --lsd-frag-ratio F   seqIndex delta level size as a "
+                 "fraction of the data level (default 0.5, matching "
+                 "Couchbase; magma's own default is 0.25). Design write amp "
+                 "is 1/F\n"
               << "  --lsm-base-level-size N  max bytes in the base level "
                  "(default 4MB)\n"
               << "  --lsm-level0-tables N    L0 tables before compacting "
@@ -320,6 +329,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"sort-dup-threshold", required_argument, nullptr, 1052},
             {"lsm-sstable-size", required_argument, nullptr, 1053},
             {"lsm-base-level-size", required_argument, nullptr, 1054},
+            {"lsd-frag-ratio", required_argument, nullptr, 1066},
             {"lsm-level0-tables", required_argument, nullptr, 1055},
             {"lsm-min-compact-size", required_argument, nullptr, 1056},
             {"lsm-level-multiplier", required_argument, nullptr, 1057},
@@ -505,6 +515,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1054:
             cfg.lsmBaseLevelSize = strtoull(optarg, nullptr, 10);
+            break;
+        case 1066:
+            cfg.lsdFragRatio = strtod(optarg, nullptr);
             break;
         case 1055:
             cfg.lsmLevel0Tables = strtoull(optarg, nullptr, 10);
@@ -697,6 +710,7 @@ int main(int argc, char* argv[]) {
         magmaCfg.LSMMaxSSTableSize = cfg.lsmSSTableSize;
         magmaCfg.LSMLSDMaxSSTableSize = cfg.lsmSSTableSize;
     }
+    magmaCfg.LSDFragmentationRatio = cfg.lsdFragRatio;
     if (cfg.lsmBaseLevelSize > 0) {
         magmaCfg.LSMMaxBaseLevelSize = cfg.lsmBaseLevelSize;
     }
