@@ -670,6 +670,8 @@ public:
         return echoGetValue_;
     }
     std::string GetStatsJson();
+    // Per-kvstore magma counters, for locating a kvstore that stopped reclaiming.
+    std::string GetKVStoreStatsJson();
 
     // Document cache in front of magma (--cache-size). Null when disabled.
     // Set before Open(); the IO threads read it without synchronisation.

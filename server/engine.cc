@@ -1383,6 +1383,34 @@ std::string Bucket::GetStatsJson() {
     return merged.dump(2);
 }
 
+std::string Bucket::GetKVStoreStatsJson() {
+    nlohmann::json out = nlohmann::json::array();
+    for (uint16_t vbid = 0; vbid < numVBuckets_; vbid++) {
+        auto [st, ks] = GetShard(vbid).GetMagma()->GetKVStoreStats(vbid);
+        if (!st) {
+            continue;
+        }
+        out.push_back({{"kvid", vbid},
+                       {"shard", vbid % numShards_},
+                       {"NSets", ks.NSets},
+                       {"NInserts", ks.NInserts},
+                       {"BytesIncoming", ks.BytesIncoming},
+                       {"BytesOverwritten", ks.BytesOverwritten},
+                       {"NFlushes", ks.NFlushes},
+                       {"NCompacts", ks.NCompacts},
+                       {"NRetryCompacts", ks.NRetryCompacts},
+                       {"NFileCountCompacts", ks.NFileCountCompacts},
+                       {"NWriterCompacts", ks.NWriterCompacts},
+                       {"NWriteBytes", ks.NWriteBytes},
+                       {"NWriteBytesCompact", ks.NWriteBytesCompact},
+                       {"NReadBytesCompact", ks.NReadBytesCompact},
+                       {"NTableFiles", ks.NTableFiles},
+                       {"NTablesCreated", ks.NTablesCreated},
+                       {"NTablesDeleted", ks.NTablesDeleted}});
+    }
+    return out.dump();
+}
+
 namespace {
 // Per-IO-thread staging of writes by vbucket, flushed once per socket wake.
 struct StagedVB {

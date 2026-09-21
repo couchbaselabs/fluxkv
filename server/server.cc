@@ -427,6 +427,12 @@ void Server::Start() {
                     body = gDispStats.toJson();
                 } else if (strstr(buf, "/stats/tuner")) {
                     body = tuner_ ? tuner_->ToJson() : "{\"enabled\":false}";
+                } else if (strstr(buf, "/stats/kvstores")) {
+                    try {
+                        body = bucket_->GetKVStoreStatsJson();
+                    } catch (...) {
+                        body = "{\"error\":\"stats unavailable\"}";
+                    }
                 } else if (strstr(buf, "/stats/magma")) {
                     try {
                         body = bucket_->GetStatsJson();
