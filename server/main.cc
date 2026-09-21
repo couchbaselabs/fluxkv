@@ -146,6 +146,24 @@ struct Config {
     // (magma_fragmentation_percentage=50). Design write amp is 1/ratio, so
     // this is the single largest lever on write amplification.
     double lsdFragRatio = 0.5;
+
+    // Level size multiplier for the key index only. On small documents the
+    // key index dominates write amplification; a leveled tree costs about
+    // T*ln(R)/ln(T), so a smaller T trades levels for writes. 0 = magma's.
+    int keyLevelMultiplier = 0;
+
+    // Warm each new key-index table into the block cache on creation, so
+    // lookup-on-set does not pay a device read on freshly written blocks.
+    bool keyWarmNewTables = false;
+
+    // sstable writer buffer (magma default 64 KB). Device writes averaged
+    // 29 KB at 70K IOPS with the array 94% busy.
+    size_t sstableWriteBuffer = 0;
+
+    // Key-index data block size (magma default 32 KB). Every lookup-on-set
+    // decompresses one block to find a 12-byte key; at ~1M writes/s LZ4 and
+    // the in-block scan were ~8% of server CPU.
+    size_t keyBlockSize = 0;
     size_t lsmLevel0Tables = 0;
     size_t lsmMinCompactSize = 0;
     int lsmLevelMultiplier = 0;
@@ -247,6 +265,15 @@ static void printUsage(const char* prog) {
                  "sorts (default 0.05)\n"
               << "  --lsm-sstable-size N     max sstable bytes (magma "
                  "default 2MB)\n"
+              << "  --key-block-size N   key-index data block size in bytes "
+                 "(magma default 32768)\n"
+              << "  --sstable-write-buffer N  sstable writer buffer in bytes "
+                 "(magma default 65536)\n"
+              << "  --key-warm-new-tables  read each new key-index table "
+                 "into the block cache on creation\n"
+              << "  --key-level-multiplier N  key index level size "
+                 "multiplier (default 0, meaning magma's 10). Smaller trades "
+                 "levels for write amplification\n"
               << "  --lsd-frag-ratio F   seqIndex delta level size as a "
                  "fraction of the data level (default 0.5, matching "
                  "Couchbase; magma's own default is 0.25). Design write amp "
@@ -330,6 +357,10 @@ static Config parseArgs(int argc, char* argv[]) {
             {"lsm-sstable-size", required_argument, nullptr, 1053},
             {"lsm-base-level-size", required_argument, nullptr, 1054},
             {"lsd-frag-ratio", required_argument, nullptr, 1066},
+            {"key-level-multiplier", required_argument, nullptr, 1067},
+            {"key-warm-new-tables", no_argument, nullptr, 1072},
+            {"sstable-write-buffer", required_argument, nullptr, 1074},
+            {"key-block-size", required_argument, nullptr, 1075},
             {"lsm-level0-tables", required_argument, nullptr, 1055},
             {"lsm-min-compact-size", required_argument, nullptr, 1056},
             {"lsm-level-multiplier", required_argument, nullptr, 1057},
@@ -518,6 +549,18 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1066:
             cfg.lsdFragRatio = strtod(optarg, nullptr);
+            break;
+        case 1067:
+            cfg.keyLevelMultiplier = atoi(optarg);
+            break;
+        case 1072:
+            cfg.keyWarmNewTables = true;
+            break;
+        case 1074:
+            cfg.sstableWriteBuffer = strtoull(optarg, nullptr, 10);
+            break;
+        case 1075:
+            cfg.keyBlockSize = strtoull(optarg, nullptr, 10);
             break;
         case 1055:
             cfg.lsmLevel0Tables = strtoull(optarg, nullptr, 10);
@@ -711,6 +754,14 @@ int main(int argc, char* argv[]) {
         magmaCfg.LSMLSDMaxSSTableSize = cfg.lsmSSTableSize;
     }
     magmaCfg.LSDFragmentationRatio = cfg.lsdFragRatio;
+    magmaCfg.KeyLevelSizeMultiplier = cfg.keyLevelMultiplier;
+    magmaCfg.KeyTreeWarmNewTables = cfg.keyWarmNewTables;
+    if (cfg.sstableWriteBuffer > 0) {
+        magmaCfg.SSTableWriterBufferSize = cfg.sstableWriteBuffer;
+    }
+    if (cfg.keyBlockSize > 0) {
+        magmaCfg.KeyTreeBlockSize = cfg.keyBlockSize;
+    }
     if (cfg.lsmBaseLevelSize > 0) {
         magmaCfg.LSMMaxBaseLevelSize = cfg.lsmBaseLevelSize;
     }
