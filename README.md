@@ -48,6 +48,13 @@ cmake -B build \
 cmake --build build -j
 ```
 
+### magma branch
+
+`--key-warm-new-tables` and `--key-level-multiplier` set `Magma::Config`
+fields that exist only on `couchbaselabs/magma-research` branch `research`,
+which also carries the seqIndex compaction fixes the overwrite numbers depend
+on. Build against that branch.
+
 ### Dependencies pulled from the Couchbase tree
 
 The server sources include these directly, so the Couchbase build must provide
@@ -173,6 +180,22 @@ document cache, an 8-byte read costs 1.95 device reads and a 1 KB read costs
 (311 MB against a 17 GB cache), data block size and read size are all ruled
 out. The candidate is the seqIndex-then-keyIndex fall-through in
 `KVStore::Get`.
+
+### Overwrites
+
+Sustained non-blind overwrites of a 38.5 GiB live set, 1 KB values, 128
+kvstores, client 112 conns x pipe 128 on loopback, 600 s windows. Space is
+`du` over live bytes; write amp is device bytes from `/proc/diskstats` over
+ingest. Requires magma from `couchbaselabs/magma-research` branch `research`.
+
+| configuration | ops/s | ingest | device write | device read | space amp | write amp |
+|---|---|---|---|---|---|---|
+| baseline (64 kvstores, 32 writers) | 424K | 438 MB/s | 1.71 GB/s | 1.16 GB/s | 2.39 | 3.90 |
+| tuned (`bench/overwrite/configs/tuned.env`) | **1.07M** | 1.11 GB/s | 3.77 GB/s | 2.37 GB/s | 2.64 | 3.41 |
+
+At the tuned point the array is ~88% busy and the CPU ~90%. Each step
+between the two rows, and what did not help, is in `bench/overwrite/README.md`;
+`bench/overwrite/overwrite.sh` reproduces either row.
 
 ### Reading these numbers
 
