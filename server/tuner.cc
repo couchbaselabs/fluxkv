@@ -98,17 +98,14 @@ size_t ThreadTuner::roundToStep(size_t n, size_t step) const {
     return step > 0 ? (n / step) * step : n;
 }
 
-double ThreadTuner::recentSteady() const {
+double ThreadTuner::steadyLevel(size_t n) const {
     if (steadyRecent_.empty()) {
         return lastTput_;
     }
-    // The last three windows: the load may have moved since older ones.
-    size_t n = std::min<size_t>(3, steadyRecent_.size());
-    double s = 0;
-    for (size_t i = steadyRecent_.size() - n; i < steadyRecent_.size(); i++) {
-        s += steadyRecent_[i];
-    }
-    return s / n;
+    n = std::min(std::max<size_t>(n, 1), steadyRecent_.size());
+    std::vector<double> w(steadyRecent_.end() - n, steadyRecent_.end());
+    std::sort(w.begin(), w.end());
+    return w[w.size() / 2];
 }
 
 double ThreadTuner::steadyNoise() const {
@@ -156,24 +153,34 @@ void ThreadTuner::decide(double tput) {
     if (steady) {
         // A window with no load, or a step change in load, is not noise.
         // Keep the history to windows that describe the current load, or
-        // the ramp from idle would read as 100% variation.
-        if (tput <= 0 ||
-            (!steadyRecent_.empty() && tput < 0.5 * steadyRecent_.back())) {
+        // the ramp from idle would read as 100% variation. A step change
+        // persists; a single deep window is a stall (a flush storm takes
+        // one 2 s window to 400K under a 1.1M load) and stays in the
+        // history as the noise it is.
+        const bool deep = !steadyRecent_.empty() &&
+                          tput < 0.5 * steadyLevel(kLevelWindows);
+        stepLow_ = deep ? stepLow_ + 1 : 0;
+        if (tput <= 0 || stepLow_ >= 2) {
             steadyRecent_.clear();
+            stepLow_ = 0;
         }
         if (tput > 0) {
             steadyRecent_.push_back(tput);
         }
-        if (steadyRecent_.size() > 6) {
+        if (steadyRecent_.size() > kSteadyHistory) {
             steadyRecent_.erase(steadyRecent_.begin());
         }
-        if (tput > steadyBest_) {
-            steadyBest_ = tput;
-            steadyLowWindows_ = 0;
-        } else if (tput < steadyBest_ * (1.0 - 2 * cfg_.minGain) &&
-                   ++steadyLowWindows_ >= 3) {
-            steadyBest_ = tput; // the load itself went down
-            steadyLowWindows_ = 0;
+        // Track the level, not the window: see steadyBest_.
+        if (steadyRecent_.size() >= kLevelWindows) {
+            const double level = steadyLevel(kLevelWindows);
+            if (level > steadyBest_) {
+                steadyBest_ = level;
+                steadyLowDecisions_ = 0;
+            } else if (level < steadyBest_ * (1.0 - 2 * cfg_.minGain) &&
+                       ++steadyLowDecisions_ >= 3) {
+                steadyBest_ = level; // the load itself went down
+                steadyLowDecisions_ = 0;
+            }
         }
     }
     for (auto& ps : pools_) {
@@ -203,8 +210,9 @@ void ThreadTuner::decide(double tput) {
     }
 
     // Start nothing while throughput is still moving: the baseline for the
-    // next verdict would be wrong.
-    if (steadyRecent_.size() < 2) {
+    // next verdict would be wrong. The reference is a median over
+    // kLevelWindows, so that many steady windows must exist first.
+    if (steadyRecent_.size() < kLevelWindows) {
         return;
     }
     const double a = steadyRecent_[steadyRecent_.size() - 1];
@@ -317,18 +325,19 @@ bool ThreadTuner::startTrial(PoolState& ps) {
     ps.sizeBefore = size;
     // A grow must beat the current steady level; a shrink must hold the best
     // steady level seen, so consecutive shrinks cannot each lose a little.
-    ps.refTput = wantGrow ? recentSteady() : std::max(steadyBest_, lastTput_);
-    ps.busyBefore = busy;
+    // Both references are medians over at least as many windows as the
+    // verdict will use.
+    ps.noise = steadyNoise();
     ps.measure = static_cast<double>(n) / size < 2 * cfg_.minGain
                          ? cfg_.smallStepMeasureWindows
                          : cfg_.measureWindows;
-    // Noisy load: measure longer, up to 8 windows, so the verdict can still
-    // resolve a real change of a few percent.
-    ps.noise = steadyNoise();
     if (ps.noise > cfg_.minGain) {
         auto want = static_cast<size_t>(std::ceil(ps.noise / cfg_.minGain));
         ps.measure = std::min<size_t>(8, std::max(ps.measure, want));
     }
+    const double level = steadyLevel(std::max(ps.measure, kLevelWindows));
+    ps.refTput = wantGrow ? level : std::max(steadyBest_, level);
+    ps.busyBefore = busy;
     ps.tputWindows.clear();
     ps.windowsSinceChange = 0;
     ps.settledWindows = 0;

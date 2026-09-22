@@ -235,7 +235,10 @@ private:
     bool startTrial(PoolState& ps);
     void judge(PoolState& ps, double tput);
     size_t roundToStep(size_t n, size_t step) const;
-    double recentSteady() const;
+    // Median of the last `n` steady windows: the same estimator judge()
+    // applies to a trial's windows, so a reference and a verdict resolve
+    // the same load.
+    double steadyLevel(size_t n) const;
     // True while a pegged pool is still being given steps it keeps. Such a
     // pool does not need a settled baseline to know it wants more threads.
     bool rampingUp() const;
@@ -255,13 +258,19 @@ private:
     size_t nextPool_{0};
     double lastTput_{0};
     uint64_t lastOps_{0};
-    // Throughput in windows with no trial in flight: the last few (a grow is
-    // judged against their mean) and the best (a shrink is judged against
-    // it, so a run of small losses cannot add up). The best follows the load
-    // down after a few steady windows below it.
+    // Throughput in windows with no trial in flight. A grow is judged
+    // against the median of the last few; a shrink against the best such
+    // median seen, so a run of small losses cannot add up. The best follows
+    // the load down after a few medians below it. Raw windows never set
+    // either: a load that swings 2x within a few seconds (flush storms) puts
+    // a trough in every other window, and a reference taken from one made
+    // the next shrink look like a 27% gain.
     std::vector<double> steadyRecent_;
     double steadyBest_{0};
-    size_t steadyLowWindows_{0};
+    size_t steadyLowDecisions_{0};
+    size_t stepLow_{0};
+    static constexpr size_t kSteadyHistory = 16;
+    static constexpr size_t kLevelWindows = 4;
 };
 
 } // namespace kvserver
