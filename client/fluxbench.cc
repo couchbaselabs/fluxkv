@@ -985,10 +985,17 @@ int main(int argc, char** argv) {
                   << "s)\n";
     }
     std::atomic<bool> stop{false};
+    std::atomic<size_t> finished{0};
 
     const auto start = std::chrono::steady_clock::now();
     for (size_t i = 0; i < opts.conns; i++) {
         threads.emplace_back([&, i]() {
+            struct Done {
+                std::atomic<size_t>& n;
+                ~Done() {
+                    n.fetch_add(1, std::memory_order_relaxed);
+                }
+            } done{finished};
             if (opts.pregen > 0) {
                 runConnectionPregen(opts, i, stop, results[i]);
             } else if (opts.window) {
@@ -999,7 +1006,13 @@ int main(int argc, char** argv) {
         });
     }
 
-    std::this_thread::sleep_for(opts.runtime);
+    // A load pass ends when every connection has written its share; do not
+    // sit out the rest of -runtime.
+    const auto deadline = start + opts.runtime;
+    while (std::chrono::steady_clock::now() < deadline &&
+           finished.load(std::memory_order_relaxed) < opts.conns) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
     stop.store(true, std::memory_order_relaxed);
     for (auto& t : threads) {
         t.join();
