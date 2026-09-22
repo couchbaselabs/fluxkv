@@ -402,6 +402,26 @@ struct LatencyHist {
         }
         total += o.total;
     }
+    double mean() const {
+        if (total == 0) {
+            return 0;
+        }
+        double sum = 0;
+        for (size_t i = 0; i < kBuckets; i++) {
+            if (counts[i]) {
+                sum += static_cast<double>(counts[i]) * upper(i);
+            }
+        }
+        return sum / static_cast<double>(total);
+    }
+    uint32_t max() const {
+        for (size_t i = kBuckets; i-- > 0;) {
+            if (counts[i]) {
+                return upper(i);
+            }
+        }
+        return 0;
+    }
     uint32_t percentile(double p) const {
         if (total == 0) {
             return 0;
@@ -886,7 +906,10 @@ int main(int argc, char** argv) {
     std::cout << "LAT p50=" << all.percentile(0.50) << "us"
               << " p90=" << all.percentile(0.90) << "us"
               << " p99=" << all.percentile(0.99) << "us"
-              << " p999=" << all.percentile(0.999) << "us\n";
+              << " p999=" << all.percentile(0.999) << "us"
+              << " p9999=" << all.percentile(0.9999) << "us"
+              << " max=" << all.max() << "us"
+              << " mean=" << static_cast<uint64_t>(all.mean()) << "us\n";
 
     // Break the failures down by status. TmpFail dominating means the load
     // outran the disk, not that anything is wrong.
