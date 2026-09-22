@@ -1207,6 +1207,11 @@ void Connection::sendWriteResponse(Request* req) {
         bumpMax(gStages.writeMax, req->tWritten - req->tWriter);
         bumpMax(gStages.durableMax, req->tDurable - req->tWritten);
         bumpMax(gStages.respondMax, now - req->tDurable);
+        gStages.record(StageTimers::ToWriter, req->tWriter - req->tArrive);
+        gStages.record(StageTimers::Write, req->tWritten - req->tWriter);
+        gStages.record(StageTimers::Durable, req->tDurable - req->tWritten);
+        gStages.record(StageTimers::Respond, now - req->tDurable);
+        gStages.record(StageTimers::Total, now - req->tArrive);
     }
     if (!closing_) {
         McbpStatus status = req->resultStatus.IsOK()

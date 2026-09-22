@@ -121,6 +121,14 @@ std::string DispatcherStats::toJson() const {
                 gStages.durableMax.load(std::memory_order_relaxed) / 1e3;
         j["stage_max_respond_us"] =
                 gStages.respondMax.load(std::memory_order_relaxed) / 1e3;
+        static const char* kHistNames[] = {
+                "to_writer", "write", "durable", "respond", "total"};
+        for (int h = 0; h < StageTimers::NumHist; h++) {
+            auto& arr = j["stage_hist"][kHistNames[h]];
+            for (int b = 0; b < StageTimers::kBuckets; b++) {
+                arr.push_back(gStages.hist[h][b].load(std::memory_order_relaxed));
+            }
+        }
     }
     j["cmd_set"] = cmdSet.Sum();
     j["cmd_get"] = cmdGet.Sum();

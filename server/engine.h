@@ -172,6 +172,17 @@ struct StageTimers {
     std::atomic<uint64_t> writeMax{0};
     std::atomic<uint64_t> durableMax{0};
     std::atomic<uint64_t> respondMax{0};
+    // Cumulative log2(us) histograms per stage plus arrival -> respond: a
+    // pipelined client waits on its slowest op, so the tail sets throughput
+    // and a sampler diffs these into per-window percentiles.
+    static constexpr int kBuckets = 24;
+    enum Hist { ToWriter, Write, Durable, Respond, Total, NumHist };
+    std::atomic<uint64_t> hist[NumHist][kBuckets]{};
+    void record(Hist h, uint64_t ns) {
+        const uint64_t us = ns / 1000;
+        const int b = us ? std::min(kBuckets - 1, 64 - __builtin_clzll(us)) : 0;
+        hist[h][b].fetch_add(1, std::memory_order_relaxed);
+    }
 };
 inline void bumpMax(std::atomic<uint64_t>& m, uint64_t v) {
     uint64_t cur = m.load(std::memory_order_relaxed);
