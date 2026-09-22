@@ -170,6 +170,7 @@ struct Config {
     int lsdLevels = 0;
     bool lsdTieredL0 = false;
     double memLwmRatio = 0;
+    bool tuneWritersOnly = false;
     size_t lsmLevel0Tables = 0;
     size_t lsmMinCompactSize = 0;
     int lsmLevelMultiplier = 0;
@@ -232,6 +233,8 @@ static void printUsage(const char* prog) {
                  "hardware threads)\n"
               << "  --max-readers N       ceiling for --auto-tune (default: "
                  "4 x hardware threads)\n"
+              << "  --tune-writers-only   with --auto-tune, hold IO threads and "
+                 "readers at their configured sizes\n"
               << "  --max-writers N       ceiling for --auto-tune (default: "
                  "2 x hardware threads)\n"
               << "  --write-cache N       per-shard write cache in bytes "
@@ -376,6 +379,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"lsd-levels", required_argument, nullptr, 1077},
             {"lsd-tiered-l0", no_argument, nullptr, 1078},
             {"mem-lwm-ratio", required_argument, nullptr, 1079},
+            {"tune-writers-only", no_argument, nullptr, 1080},
             {"lsm-level0-tables", required_argument, nullptr, 1055},
             {"lsm-min-compact-size", required_argument, nullptr, 1056},
             {"lsm-level-multiplier", required_argument, nullptr, 1057},
@@ -585,6 +589,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1079:
             cfg.memLwmRatio = std::stod(optarg);
+            break;
+        case 1080:
+            cfg.tuneWritersOnly = true;
             break;
         case 1055:
             cfg.lsmLevel0Tables = strtoull(optarg, nullptr, 10);
@@ -932,6 +939,10 @@ int main(int argc, char* argv[]) {
                                cfg.maxWriters ? cfg.maxWriters : 2 * hw};
         io.max = std::max(io.max, static_cast<size_t>(cfg.ioThreads));
         rd.max = std::max(rd.max, static_cast<size_t>(cfg.readers));
+        if (cfg.tuneWritersOnly) {
+            io.min = io.max = cfg.ioThreads;
+            rd.min = rd.max = cfg.readers;
+        }
         wr.max = std::max(wr.max, static_cast<size_t>(cfg.writers));
         server.EnableAutoTune(TunerConfig{}, io, rd, wr);
         spdlog::info(
