@@ -171,6 +171,8 @@ struct Config {
     bool lsdTieredL0 = false;
     double memLwmRatio = 0;
     bool tuneWritersOnly = false;
+    size_t readAhead = 0;
+    bool noIndexCompression = false;
     size_t lsmLevel0Tables = 0;
     size_t lsmMinCompactSize = 0;
     int lsmLevelMultiplier = 0;
@@ -277,6 +279,10 @@ static void printUsage(const char* prog) {
               << "  --lsd-levels N       seqIndex LSD levels (magma default 5)\n"
               << "  --lsd-tiered-l0      tiered level-0 seqIndex GC (needs "
                  "--lsd-levels 3 and the magma research branch)\n"
+              << "  --read-ahead N       compaction read-ahead buffer bytes; with "
+                 "direct IO the reads bypass the page cache (magma default 0: "
+                 "buffered fd, kernel readahead)\n"
+              << "  --no-index-compression  override --index-compression-lz4\n"
               << "  --mem-lwm-ratio R    share of --mem-quota for the block cache "
                  "and write cache; the rest is the bloom filter quota (magma "
                  "default 0.2)\n"
@@ -380,6 +386,8 @@ static Config parseArgs(int argc, char* argv[]) {
             {"lsd-tiered-l0", no_argument, nullptr, 1078},
             {"mem-lwm-ratio", required_argument, nullptr, 1079},
             {"tune-writers-only", no_argument, nullptr, 1080},
+            {"read-ahead", required_argument, nullptr, 1081},
+            {"no-index-compression", no_argument, nullptr, 1082},
             {"lsm-level0-tables", required_argument, nullptr, 1055},
             {"lsm-min-compact-size", required_argument, nullptr, 1056},
             {"lsm-level-multiplier", required_argument, nullptr, 1057},
@@ -593,6 +601,12 @@ static Config parseArgs(int argc, char* argv[]) {
         case 1080:
             cfg.tuneWritersOnly = true;
             break;
+        case 1081:
+            cfg.readAhead = strtoull(optarg, nullptr, 10);
+            break;
+        case 1082:
+            cfg.noIndexCompression = true;
+            break;
         case 1055:
             cfg.lsmLevel0Tables = strtoull(optarg, nullptr, 10);
             break;
@@ -729,7 +743,7 @@ int main(int argc, char* argv[]) {
     // Index blocks are read-hot and compress well; keeping LZ4 on them shrinks
     // the keyIndex so more of it stays resident in the block cache, which is
     // what read amplification is actually bound by here.
-    if (cfg.indexCompressionLZ4) {
+    if (cfg.indexCompressionLZ4 && !cfg.noIndexCompression) {
         magmaCfg.Compression.IndexCompression =
                 magma::CompressionType::Create(magma::CompressionAlgo::LZ4);
     }
@@ -797,6 +811,9 @@ int main(int argc, char* argv[]) {
         magmaCfg.LSDNumLevels = cfg.lsdLevels;
     }
     magmaCfg.LSDTieredL0 = cfg.lsdTieredL0;
+    if (cfg.readAhead > 0) {
+        magmaCfg.ReadAheadSize = cfg.readAhead;
+    }
     if (cfg.memLwmRatio > 0) {
         magmaCfg.MemoryQuotaLowWaterMarkRatio = cfg.memLwmRatio;
     }
