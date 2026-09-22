@@ -171,6 +171,7 @@ struct Config {
     bool lsdTieredL0 = false;
     double memLwmRatio = 0;
     bool tuneWritersOnly = false;
+    std::string tunePools; // empty = all
     size_t readAhead = 0;
     bool noIndexCompression = false;
     size_t lsmLevel0Tables = 0;
@@ -279,6 +280,9 @@ static void printUsage(const char* prog) {
               << "  --lsd-levels N       seqIndex LSD levels (magma default 5)\n"
               << "  --lsd-tiered-l0      tiered level-0 seqIndex GC (needs "
                  "--lsd-levels 3 and the magma research branch)\n"
+              << "  --tune-pools LIST    comma list of io,readers,writers that "
+                 "--auto-tune may resize; the rest stay at their configured "
+                 "sizes (default all)\n"
               << "  --read-ahead N       compaction read-ahead buffer bytes; with "
                  "direct IO the reads bypass the page cache (magma default 0: "
                  "buffered fd, kernel readahead)\n"
@@ -387,6 +391,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"mem-lwm-ratio", required_argument, nullptr, 1079},
             {"tune-writers-only", no_argument, nullptr, 1080},
             {"read-ahead", required_argument, nullptr, 1081},
+            {"tune-pools", required_argument, nullptr, 1083},
             {"no-index-compression", no_argument, nullptr, 1082},
             {"lsm-level0-tables", required_argument, nullptr, 1055},
             {"lsm-min-compact-size", required_argument, nullptr, 1056},
@@ -606,6 +611,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1082:
             cfg.noIndexCompression = true;
+            break;
+        case 1083:
+            cfg.tunePools = optarg;
             break;
         case 1055:
             cfg.lsmLevel0Tables = strtoull(optarg, nullptr, 10);
@@ -959,6 +967,21 @@ int main(int argc, char* argv[]) {
         if (cfg.tuneWritersOnly) {
             io.min = io.max = cfg.ioThreads;
             rd.min = rd.max = cfg.readers;
+        }
+        if (!cfg.tunePools.empty()) {
+            auto has = [&](const char* n) {
+                return ("," + cfg.tunePools + ",").find(std::string(",") + n + ",") !=
+                       std::string::npos;
+            };
+            if (!has("io")) {
+                io.min = io.max = cfg.ioThreads;
+            }
+            if (!has("readers")) {
+                rd.min = rd.max = cfg.readers;
+            }
+            if (!has("writers")) {
+                wr.min = wr.max = cfg.writers;
+            }
         }
         wr.max = std::max(wr.max, static_cast<size_t>(cfg.writers));
         server.EnableAutoTune(TunerConfig{}, io, rd, wr);
