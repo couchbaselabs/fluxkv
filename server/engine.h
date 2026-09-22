@@ -117,6 +117,10 @@ extern Bucket* gStatsBucket;
 extern DocCache* gDocCache;
 // Runtime read-batch cap (set from main via --max-read-batch).
 extern size_t gMaxReadBatch;
+// Read-path FIFO diagnostics (gTraceLatency only): worst queue age at
+// dispatch and worst times any one request was requeued past kMaxReadBatch.
+extern std::atomic<uint64_t> gMaxReadQueueAgeNs;
+extern std::atomic<uint32_t> gMaxReadRequeues;
 
 // Write coalescing. A vbucket whose last WriteDocs finished less than
 // gWriteCoalesceNs ago and has fewer than gMinWriteBatch items queued is
@@ -289,6 +293,10 @@ struct alignas(64) Request {
 
     // Stage timestamps, only written when gTraceLatency.
     uint64_t tArrive{0}, tWriter{0}, tWritten{0}, tDurable{0};
+    // Read-path ordering diagnostics, only written when gTraceLatency: set
+    // once in EnqueueRead, read at dispatch to verify FIFO fairness.
+    uint64_t tReadEnqueue{0};
+    uint32_t readRequeues{0};
 
     // Result filled by engine thread
     Status resultStatus;
@@ -317,7 +325,8 @@ struct alignas(64) Request {
         conn = nullptr;
         evb = nullptr;
         ioOwner = nullptr;
-        tArrive = tWriter = tWritten = tDurable = 0;
+        tArrive = tWriter = tWritten = tDurable = tReadEnqueue = 0;
+        readRequeues = 0;
         resultStatus = Status();
         resultSeqno = 0;
         resultFlags = 0;
@@ -356,17 +365,34 @@ public:
     template <class F>
     void sweep(F&& fn) {
         while (Request* h = head_.exchange(nullptr, std::memory_order_acq_rel)) {
-            while (h) {
-                Request* next = h->hook.next;
-                // Each Request was last written by another thread; start
-                // its line coming while this one is processed.
-                __builtin_prefetch(next);
-                h->hook.next = nullptr;
-                fn(h);
-                h = next;
-            }
+            drainChain(h, fn);
         }
     }
+    // One exchange, one chain — no repeat grab. sweep()'s outer retry can
+    // append a second, later-arrived chain after the first; a single
+    // std::reverse() over the concatenation (as executeRead does for FIFO
+    // order) then puts that later chain's items ahead of older ones still
+    // waiting in the first chain. Use this where reverse() must yield FIFO.
+    template <class F>
+    void sweepOnce(F&& fn) {
+        drainChain(head_.exchange(nullptr, std::memory_order_acq_rel), fn);
+    }
+
+private:
+    template <class F>
+    static void drainChain(Request* h, F&& fn) {
+        while (h) {
+            Request* next = h->hook.next;
+            // Each Request was last written by another thread; start
+            // its line coming while this one is processed.
+            __builtin_prefetch(next);
+            h->hook.next = nullptr;
+            fn(h);
+            h = next;
+        }
+    }
+
+public:
 
 private:
     std::atomic<Request*> head_{nullptr};
@@ -381,6 +407,12 @@ struct alignas(64) VBQueue {
     // WriteDocs for this vbucket finished. Both drive write coalescing.
     std::atomic<uint32_t> pending{0};
     std::atomic<uint64_t> lastWriteNs{0};
+    // Read queues only: batch overflow past kMaxReadBatch, oldest-first via
+    // hook.next. Owned exclusively by the current reader (never touched by
+    // EnqueueRead), so it needs no atomics and can't race the lock-free
+    // list -- unlike reinserting overflow into `list`, which let requests
+    // that arrived later cut ahead of it on every subsequent sweep.
+    Request* overflow{nullptr};
 };
 
 // Tasks dispatched to writer/reader pools

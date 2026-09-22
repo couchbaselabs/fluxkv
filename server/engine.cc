@@ -18,6 +18,15 @@
 namespace magma {
 namespace kvserver {
 
+// libstdc++'s std::atomic::fetch_max isn't available on this toolchain.
+template <class T>
+static inline void atomicBumpMax(std::atomic<T>& a, T v) {
+    T cur = a.load(std::memory_order_relaxed);
+    while (v > cur && !a.compare_exchange_weak(cur, v,
+                                               std::memory_order_relaxed)) {
+    }
+}
+
 DispatcherStats gDispStats;
 std::atomic<int64_t> gPausedConns{0};
 std::atomic<int64_t> gRespPendingBytes{0};
@@ -30,6 +39,8 @@ DocCache* gDocCache = nullptr;
 // libaio + IOQueueDepth=16 sweet spot; lower (8-16) is better for sync
 // QD=1 multi-thread parallelism.
 size_t gMaxReadBatch = 128;
+std::atomic<uint64_t> gMaxReadQueueAgeNs{0};
+std::atomic<uint32_t> gMaxReadRequeues{0};
 size_t gMinWriteBatch = 64;
 BatchSort gBatchSort = BatchSort::Auto;
 bool gAsyncDurable = false;
@@ -145,6 +156,10 @@ std::string DispatcherStats::toJson() const {
     j["write_batches_sorted"] = writeBatchesSorted.Sum();
     j["read_batches"] = readBatches.Sum();
     j["read_batch_items"] = readBatchItems.Sum();
+    j["max_read_queue_age_us"] =
+            gMaxReadQueueAgeNs.load(std::memory_order_relaxed) / 1000;
+    j["max_read_requeues"] =
+            gMaxReadRequeues.load(std::memory_order_relaxed);
     j["tmp_fails"] = tmpFails.load(std::memory_order_relaxed);
     j["paused_conns"] = gPausedConns.load(std::memory_order_relaxed);
     j["resp_pending_bytes"] = gRespPendingBytes.load(std::memory_order_relaxed);
@@ -416,7 +431,19 @@ template <class Q, class Task>
 static inline void releaseVBQueue(VBQueue& vbq, Q& taskQueue, Task retask) {
     vbq.scheduled.store(false, std::memory_order_seq_cst);
     if (!vbq.list.empty() &&
-        !vbq.scheduled.exchange(true, std::memory_order_acq_rel)) {
+        !vbq.scheduled.exchange(true, std::memory_order_seq_cst)) {
+        taskQueue.blockingWrite(std::move(retask));
+    }
+}
+
+// Same as releaseVBQueue, but also re-arms for a non-empty owner-private
+// overflow (see VBQueue::overflow), which the lock-free list check above
+// can't see.
+template <class Q, class Task>
+static inline void releaseReadVBQueue(VBQueue& vbq, Q& taskQueue, Task retask) {
+    vbq.scheduled.store(false, std::memory_order_seq_cst);
+    if ((vbq.overflow || !vbq.list.empty()) &&
+        !vbq.scheduled.exchange(true, std::memory_order_seq_cst)) {
         taskQueue.blockingWrite(std::move(retask));
     }
 }
@@ -1074,41 +1101,73 @@ size_t ReaderPool::executeRead(ReadTask& task) {
     auto& vbq = shard->GetVBReadQueue(task.vbid);
     Magma::FetchBuffer idxBuf, seqBuf;
 
-    // Sweep pending reads for this vbucket, cap batch size to allow
-    // multiple reader threads to work on the same VB concurrently.
-    // Raised from 32 → 128 so a single executeRead call can hand magma::GetDocs
-    // a wide batch; with magmaCfg.IOQueueDepth=16 this keeps coroutines busy
-    // and pushes NVMe queue depth from aqu-sz≈37 (43%% of NVMe peak) toward
-    // saturation. Excess items are pushed back and re-scheduled to a peer
-    // reader thread, preserving multi-thread-per-vbucket parallelism.
+    // Cap batch size to allow multiple reader threads to work on the same VB
+    // concurrently. Raised from 32 → 128 so a single executeRead call can hand
+    // magma::GetDocs a wide batch; with magmaCfg.IOQueueDepth=16 this keeps
+    // coroutines busy and pushes NVMe queue depth from aqu-sz≈37 (43%% of
+    // NVMe peak) toward saturation.
     const size_t kMaxReadBatch = gMaxReadBatch;
     std::vector<Request*> batch;
     batch.reserve(kMaxReadBatch);
-    vbq.list.sweep([&](Request* req) { batch.push_back(req); });
+
+    // Drain the owner-private overflow first: those are strictly older than
+    // anything the lock-free list can hold right now (see VBQueue::overflow).
+    Request* ovf = vbq.overflow;
+    while (ovf && batch.size() < kMaxReadBatch) {
+        Request* next = ovf->hook.next;
+        ovf->hook.next = nullptr;
+        batch.push_back(ovf);
+        ovf = next;
+    }
+    vbq.overflow = ovf;
+
+    if (batch.size() < kMaxReadBatch) {
+        // sweepOnce, not sweep: a single reverse() below only recovers FIFO
+        // order for one coherent newest-first chain. See sweepOnce's comment.
+        std::vector<Request*> fresh;
+        vbq.list.sweepOnce([&](Request* req) { fresh.push_back(req); });
+        std::reverse(fresh.begin(), fresh.end());
+        batch.insert(batch.end(), fresh.begin(), fresh.end());
+    }
 
     if (batch.empty()) {
-        releaseVBQueue(vbq, taskQueue_, ReadTask{shard, task.vbid, nowNs()});
+        releaseReadVBQueue(vbq, taskQueue_, ReadTask{shard, task.vbid, nowNs()});
         return 0;
     }
-    std::reverse(batch.begin(), batch.end());
 
-    // If we swept more than kMaxReadBatch, push the excess back onto the list.
-    // Do NOT submit a second task here: that created a SECOND concurrent owner
-    // of this vbucket, and the two owners race on the scheduled-flag release,
-    // losing a wakeup - 16,384 requests stranded with every worker parked on an
-    // empty task queue. The excess is instead left in the list and picked up by
-    // the single re-submit releaseVBQueue() does at the tail of this function,
-    // preserving the invariant of exactly one owner per vbucket at a time.
+    // Whatever is left past the cap becomes the new overflow, oldest-first.
+    // Do NOT hand it back to the lock-free `list` (newest-at-head): a
+    // request that arrived later would land ahead of it there, so it would
+    // lose to fresh arrivals every round and starve under a steady deep
+    // pipeline instead of waiting a bounded ceil(backlog/kMaxReadBatch).
     if (batch.size() > kMaxReadBatch) {
-        for (size_t i = kMaxReadBatch; i < batch.size(); i++) {
-            vbq.list.insertHead(batch[i]);
+        for (size_t i = kMaxReadBatch; i + 1 < batch.size(); i++) {
+            if (gTraceLatency) {
+                batch[i]->readRequeues++;
+            }
+            batch[i]->hook.next = batch[i + 1];
         }
+        if (gTraceLatency) {
+            batch.back()->readRequeues++;
+        }
+        batch.back()->hook.next = nullptr;
+        vbq.overflow = batch[kMaxReadBatch];
         batch.resize(kMaxReadBatch);
     }
 
     hotStatAdd(gDispStats.readBatches);
     hotStatAdd(gDispStats.readBatchItems, batch.size());
     hotStatSub(gDispStats.queuedGets, batch.size());
+
+    if (gTraceLatency) {
+        const uint64_t now = steadyNowNs();
+        for (auto* req : batch) {
+            if (req->tReadEnqueue) {
+                atomicBumpMax(gMaxReadQueueAgeNs, now - req->tReadEnqueue);
+            }
+            atomicBumpMax(gMaxReadRequeues, req->readRequeues);
+        }
+    }
 
     if (batch.size() == 1) {
         // Single Get — no OperationsList overhead
@@ -1201,7 +1260,7 @@ size_t ReaderPool::executeRead(ReadTask& task) {
         accum.FlushAll();
     }
 
-    releaseVBQueue(vbq, taskQueue_, ReadTask{shard, task.vbid, nowNs()});
+    releaseReadVBQueue(vbq, taskQueue_, ReadTask{shard, task.vbid, nowNs()});
     return batch.size();
 }
 
@@ -1503,9 +1562,20 @@ void Bucket::EnqueueRead(Request* req) {
     auto& shard = GetShard(req->vbucket);
     auto& vbq = shard.GetVBReadQueue(req->vbucket);
 
+    if (gTraceLatency) {
+        req->tReadEnqueue = steadyNowNs();
+    }
     vbq.list.insertHead(req);
 
-    if (!vbq.scheduled.exchange(true, std::memory_order_acq_rel)) {
+    // seq_cst, matching releaseVBQueue's clearing store: acq_rel only
+    // synchronizes-with a prior release on `scheduled` itself, it does not
+    // order this exchange against releaseVBQueue's INDEPENDENT list.empty()
+    // load the way seq_cst's single total order does. Mismatched here, a
+    // push landing in the release/re-check window can see scheduled==true
+    // (stale) while the releaser sees the list as empty (stale) -- neither
+    // submits, and the request waits until an unrelated later push on the
+    // same vbucket happens to re-arm it.
+    if (!vbq.scheduled.exchange(true, std::memory_order_seq_cst)) {
         shard.GetReaderPool()->Submit({&shard, req->vbucket});
     }
 }
