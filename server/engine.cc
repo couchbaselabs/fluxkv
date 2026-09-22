@@ -20,6 +20,8 @@ namespace kvserver {
 
 DispatcherStats gDispStats;
 std::atomic<int64_t> gPausedConns{0};
+std::atomic<int64_t> gRespPendingBytes{0};
+std::atomic<int64_t> gMailDepth{0};
 Bucket* gStatsBucket{nullptr};
 
 DocCache* gDocCache = nullptr;
@@ -136,6 +138,8 @@ std::string DispatcherStats::toJson() const {
     j["read_batch_items"] = readBatchItems.Sum();
     j["tmp_fails"] = tmpFails.load(std::memory_order_relaxed);
     j["paused_conns"] = gPausedConns.load(std::memory_order_relaxed);
+    j["resp_pending_bytes"] = gRespPendingBytes.load(std::memory_order_relaxed);
+    j["mail_depth"] = gMailDepth.load(std::memory_order_relaxed);
     j["write_queue_bytes"] = gStatsBucket ? gStatsBucket->QueuedBytes() : 0;
     j["queued_gets"] = queuedGets.Sum();
     j["bad_magic"] = badMagic.load(std::memory_order_relaxed);

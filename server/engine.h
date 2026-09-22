@@ -101,6 +101,10 @@ extern DispatcherStats gDispStats;
 // Diagnostics for the write-queue backpressure: connections currently
 // read-paused, and the bucket whose queued bytes /stats reports.
 extern std::atomic<int64_t> gPausedConns;
+// Responses appended to connection output buffers and not yet handed to the
+// socket, and mailbox callbacks posted to IO threads and not yet run.
+extern std::atomic<int64_t> gRespPendingBytes;
+extern std::atomic<int64_t> gMailDepth;
 class Bucket;
 extern Bucket* gStatsBucket;
 // The bucket's document cache, or null. Published by Bucket::SetCache so the

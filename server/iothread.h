@@ -14,6 +14,9 @@
 #include <time.h>
 
 namespace magma {
+// Defined in engine.cc; mailbox callbacks posted and not yet run.
+extern std::atomic<int64_t> gMailDepth;
+
 namespace kvserver {
 
 class Connection;
@@ -78,6 +81,7 @@ struct IOThread {
             mail.push_back(std::move(fn));
         }
         hasMail.store(true, std::memory_order_release);
+        gMailDepth.fetch_add(1, std::memory_order_relaxed);
         evb->runInEventBaseThread([this]() { SchedulePump(); });
     }
 
@@ -97,6 +101,8 @@ struct IOThread {
                 batch.swap(owner->mail);
                 owner->hasMail.store(false, std::memory_order_release);
             }
+            gMailDepth.fetch_sub(static_cast<int64_t>(batch.size()),
+                                 std::memory_order_relaxed);
             for (auto& fn : batch) {
                 fn();
             }

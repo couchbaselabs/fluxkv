@@ -392,6 +392,7 @@ void Connection::flushPending() {
     if (pendingWriteBuf_.empty() || closing_) {
         return;
     }
+    gRespPendingBytes.fetch_sub(pendingWriteBuf_.size(), std::memory_order_relaxed);
     inflightBufs_.emplace_back(std::move(pendingWriteBuf_));
     pendingWriteBuf_.clear();
     auto& buf = inflightBufs_.back();
@@ -1211,8 +1212,11 @@ void Connection::sendWriteResponse(Request* req) {
         McbpStatus status = req->resultStatus.IsOK()
                                     ? McbpStatus::Success
                                     : McbpStatus::InternalError;
+        const size_t before = pendingWriteBuf_.size();
         appendEmptyResponse(
                 pendingWriteBuf_, req->opcode, status, req->opaque, req->resultSeqno);
+        gRespPendingBytes.fetch_add(pendingWriteBuf_.size() - before,
+                                    std::memory_order_relaxed);
         scheduleFlush();
     }
     releaseRequest(req);
