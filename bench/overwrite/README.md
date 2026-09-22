@@ -36,8 +36,8 @@ on md0 is 6 MB. CPU governor `performance`.
 
 ## Configurations
 
-`configs/baseline.env` and `configs/tuned.env` hold the full server flag
-set. Shared by both: 8 shards, 16 GiB quota, 1 GiB write queue, shared WAL
+`configs/baseline.env`, `configs/tuned.env` and `configs/tiered.env` hold the
+full server flag set. Shared by both: 8 shards, 16 GiB quota, 1 GiB write queue, shared WAL
 (24 x 8 MB chunks, 4 flushers), no value compression, lz4 index compression,
 4 KB seq data blocks, `--lsd-frag-ratio 0.5` (Couchbase's production value).
 
@@ -66,6 +66,7 @@ from the same branch were already in place for all rows.
 | + 1 MB sstable write buffer | 903K | 932 | 3,320 | 2,221 | 2.46 | 3.56 |
 | + 4 KB key-index blocks | 988K | 1,020 | 3,528 | 2,319 | 2.59 | 3.46 |
 | + auto-tuned writers (tuned) | **1,071K** (first window) | 1,105 | 3,774 | 2,374 | 2.64 | 3.41 |
+| + 3-level tiered-L0 seqIndex (tiered) | **1,093K** (first window) | 1,127 | 3,811 | 2,372 | **2.08** | 3.38 |
 
 At the tuned point the array is ~88% busy (three devices, `/proc/diskstats`
 io ticks) and the CPU ~90%. Per ingested byte the device sees about 6.5
@@ -73,6 +74,27 @@ bytes: WAL 1.0, memtable flush 1.0, compaction write 1.3, compaction read
 2.7, key index 0.5. The compaction read/write ratio is set by the 0.5
 fragmentation ratio (a range is rewritten at ~50% garbage) and is not a
 defect.
+
+### Tiered-L0 seqIndex (`configs/tiered.env`)
+
+`--lsd-levels 3 --lsd-tiered-l0` selects magma's `LSDTieredL0`: L0 tiered
+with no size floor, L1 sorted deltas sized at ratio x data, L2 data. GC picks
+the data table with the most delta bytes per byte, pulls in the overlapping
+L1 tables and the L0 tables over that range, and drops the surviving deltas.
+Same binary, flags on and off, 30 min each:
+
+| window | arm | ops/s | spaceAmp (du) | devWA | compWA |
+|---|---|---|---|---|---|
+| 600 | tiered | 1,093K | 2.08 | 3.38 | 1.00 |
+| 600 | tuned | 1,056K | 2.55 | 3.44 | 1.07 |
+| 1200 | tiered | 1,088K | 2.12 | 3.31 | 0.96 |
+| 1200 | tuned | 1,037K | 2.66 | 3.46 | 1.12 |
+| 1800 | tiered | 1,051K | 2.07 | 3.33 | 0.98 |
+| 1800 | tuned | 996K | 2.50 | 3.47 | 1.14 |
+
+Read check after the run: 71K get/s at 6.25 KB per get (tuned 53K, 6.66 KB).
+Space amp lands at the 0.5 fragmentation budget because garbage no longer
+has to cascade through three delta levels before it can be reclaimed.
 
 Before the compaction fixes on `research`, the baseline configuration ran at
 382K ops/s with device WA 4.55 at the same space amp; the fixes are
@@ -109,6 +131,7 @@ matrix. `value_sweep.sh` runs the sweep.
 # build fluxkv against magma-research/research, then:
 CONFIG=baseline DATA_DIR=/data/fluxkv-ow bench/overwrite/overwrite.sh
 CONFIG=tuned    DATA_DIR=/data/fluxkv-ow bench/overwrite/overwrite.sh
+CONFIG=tiered   DATA_DIR=/data/fluxkv-ow bench/overwrite/overwrite.sh
 CONFIG=tuned    DATA_DIR=/data/fluxkv-ow RUN=5400 bench/overwrite/overwrite.sh   # 90 min sustain
 CONFIG=tuned    DATA_DIR=/data/fluxkv-ow VS=256 LOAD=1500 bench/overwrite/overwrite.sh
 ```
