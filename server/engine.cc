@@ -211,6 +211,8 @@ Shard::Shard(uint16_t shardId,
     : shardId_(shardId), freeRequests_(kFreeRequestCap) {
     Magma::Config shardCfg = cfg;
     shardCfg.Path = path;
+    // Names the shard's stream in the shared WAL; must be unique per shard.
+    shardCfg.UID = "shard-" + std::to_string(shardId);
     magma_ = std::make_unique<Magma>(shardCfg);
 }
 
