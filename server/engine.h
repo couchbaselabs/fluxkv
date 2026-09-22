@@ -104,6 +104,10 @@ extern std::atomic<int64_t> gPausedConns;
 // Responses appended to connection output buffers and not yet handed to the
 // socket, and mailbox callbacks posted to IO threads and not yet run.
 extern std::atomic<int64_t> gRespPendingBytes;
+// Set by main when a shared log exists: appends its flush counters to /stats
+// as "shwal_*" keys (write/sync/seal/publish us, follower and backpressure
+// waits), so log commit latency can be read off the server.
+extern std::function<void(std::string&)> gExtraStatsJson;
 extern std::atomic<int64_t> gMailDepth;
 class Bucket;
 extern Bucket* gStatsBucket;

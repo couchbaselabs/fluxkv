@@ -792,6 +792,24 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         magmaCfg.SharedWAL = sharedWal;
+        gExtraStatsJson = [sharedWal](std::string& out) {
+            auto s = sharedWal->Log()->GetStats();
+            out = "{\"shwal_appends\":" + std::to_string(s.appends) +
+                  ",\"shwal_chunks\":" + std::to_string(s.chunksFlushed) +
+                  ",\"shwal_fsyncs\":" + std::to_string(s.fsyncs) +
+                  ",\"shwal_forced_seals\":" + std::to_string(s.forcedSeals) +
+                  ",\"shwal_backpressure_waits\":" + std::to_string(s.backpressureWaits) +
+                  ",\"shwal_leader_flushes\":" + std::to_string(s.leaderFlushes) +
+                  ",\"shwal_follower_waits\":" + std::to_string(s.followerWaits) +
+                  ",\"shwal_write_us_total\":" + std::to_string(s.writeUsTotal) +
+                  ",\"shwal_write_us_max\":" + std::to_string(s.writeUsMax) +
+                  ",\"shwal_sync_us_total\":" + std::to_string(s.syncUsTotal) +
+                  ",\"shwal_sync_us_max\":" + std::to_string(s.syncUsMax) +
+                  ",\"shwal_seal_wait_us_total\":" + std::to_string(s.sealWaitUsTotal) +
+                  ",\"shwal_publish_wait_us_total\":" + std::to_string(s.publishWaitUsTotal) +
+                  ",\"shwal_durable_lsn\":" + std::to_string(s.durableLSN) +
+                  ",\"shwal_tail_lsn\":" + std::to_string(s.tailLSN) + "}";
+        };
         spdlog::info(
                 "  shared-wal: path={} flushers={} chunks={} chunk={}MB "
                 "sync-commit={}",

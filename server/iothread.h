@@ -14,10 +14,9 @@
 #include <time.h>
 
 namespace magma {
+namespace kvserver {
 // Defined in engine.cc; mailbox callbacks posted and not yet run.
 extern std::atomic<int64_t> gMailDepth;
-
-namespace kvserver {
 
 class Connection;
 
