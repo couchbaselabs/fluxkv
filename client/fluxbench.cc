@@ -367,11 +367,65 @@ const char* statusName(uint16_t status) {
     }
 }
 
+// Latency histogram: 1 us .. ~1.7 s in buckets 1% apart (log2 with 64 sub-steps),
+// fixed size. The previous per-sample vector grew without bound (3.3 GB at
+// 700K ops/s over 20 min) and its reallocations stalled connections for long
+// enough to bend a durable run's throughput down 40% over the run.
+struct LatencyHist {
+    static constexpr size_t kSub = 64;
+    static constexpr size_t kBuckets = 31 * kSub;
+    std::vector<uint64_t> counts = std::vector<uint64_t>(kBuckets, 0);
+    uint64_t total = 0;
+    static size_t bucket(uint32_t us) {
+        if (us < 1) {
+            us = 1;
+        }
+        const uint32_t lg = 31 - __builtin_clz(us);
+        const uint32_t sub = lg >= 6 ? (us >> (lg - 6)) & (kSub - 1)
+                                     : (us << (6 - lg)) & (kSub - 1);
+        const size_t b = lg * kSub + sub;
+        return b < kBuckets ? b : kBuckets - 1;
+    }
+    static uint32_t upper(size_t b) {
+        const uint32_t lg = static_cast<uint32_t>(b / kSub);
+        const uint32_t sub = static_cast<uint32_t>(b % kSub) + 1;
+        return lg >= 6 ? ((1u << lg) + (sub << (lg - 6)))
+                       : ((1u << lg) + (sub >> (6 - lg)));
+    }
+    void add(uint32_t us) {
+        counts[bucket(us)]++;
+        total++;
+    }
+    void merge(const LatencyHist& o) {
+        for (size_t i = 0; i < kBuckets; i++) {
+            counts[i] += o.counts[i];
+        }
+        total += o.total;
+    }
+    uint32_t percentile(double p) const {
+        if (total == 0) {
+            return 0;
+        }
+        uint64_t want = static_cast<uint64_t>(p * static_cast<double>(total));
+        if (want >= total) {
+            want = total - 1;
+        }
+        uint64_t seen = 0;
+        for (size_t i = 0; i < kBuckets; i++) {
+            seen += counts[i];
+            if (seen > want) {
+                return upper(i);
+            }
+        }
+        return upper(kBuckets - 1);
+    }
+};
+
 struct Result {
     uint64_t ops = 0;
     uint64_t errors = 0;
     std::map<uint16_t, uint64_t> statusCounts;
-    std::vector<uint32_t> latenciesUs;
+    LatencyHist latencies;
 };
 
 // Streaming response counter for pre-generate mode. Walks the mcbp framing in
@@ -551,7 +605,6 @@ void runConnection(const Options& opts,
     std::vector<std::chrono::steady_clock::time_point> sentAt(opts.pipeline);
     std::vector<uint8_t> header(kHeaderSize);
     std::vector<uint8_t> body;
-    result.latenciesUs.reserve(1 << 16);
 
     // SET walks the keyspace in a stride, so one load pass writes every key
     // exactly once and a later GET pass can demand a zero-miss result.
@@ -640,7 +693,7 @@ void runConnection(const Options& opts,
             const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                                     now - sentAt[slot])
                                     .count();
-            result.latenciesUs.push_back(static_cast<uint32_t>(us));
+            result.latencies.add(static_cast<uint32_t>(us));
 
             result.statusCounts[status]++;
             if (status == 0) {
@@ -656,17 +709,6 @@ void runConnection(const Options& opts,
     }
 
     ::close(fd);
-}
-
-uint32_t percentile(std::vector<uint32_t>& sorted, double p) {
-    if (sorted.empty()) {
-        return 0;
-    }
-    size_t idx = static_cast<size_t>(p * static_cast<double>(sorted.size()));
-    if (idx >= sorted.size()) {
-        idx = sorted.size() - 1;
-    }
-    return sorted[idx];
 }
 
 void usage(const char* prog) {
@@ -826,26 +868,25 @@ int main(int argc, char** argv) {
 
     uint64_t ops = 0;
     uint64_t errors = 0;
-    std::vector<uint32_t> all;
+    LatencyHist all;
     std::map<uint16_t, uint64_t> statusCounts;
     for (auto& r : results) {
         ops += r.ops;
         errors += r.errors;
-        all.insert(all.end(), r.latenciesUs.begin(), r.latenciesUs.end());
+        all.merge(r.latencies);
         for (const auto& [status, count] : r.statusCounts) {
             statusCounts[status] += count;
         }
     }
-    std::sort(all.begin(), all.end());
 
     const double rate = (elapsed > 0) ? static_cast<double>(ops) / elapsed : 0;
 
     std::cout << "DONE ops=" << ops << " errs=" << errors << " secs="
               << elapsed << " rate=" << static_cast<uint64_t>(rate) << "\n";
-    std::cout << "LAT p50=" << percentile(all, 0.50) << "us"
-              << " p90=" << percentile(all, 0.90) << "us"
-              << " p99=" << percentile(all, 0.99) << "us"
-              << " p999=" << percentile(all, 0.999) << "us\n";
+    std::cout << "LAT p50=" << all.percentile(0.50) << "us"
+              << " p90=" << all.percentile(0.90) << "us"
+              << " p99=" << all.percentile(0.99) << "us"
+              << " p999=" << all.percentile(0.999) << "us\n";
 
     // Break the failures down by status. TmpFail dominating means the load
     // outran the disk, not that anything is wrong.
