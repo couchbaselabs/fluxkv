@@ -247,6 +247,7 @@ private:
     // length scale with it: a load whose throughput swings 8% between
     // windows on its own cannot support a 1% verdict after two windows.
     double steadyNoise() const;
+    double cv(const std::vector<double>& w) const;
     double tolerance(const PoolState& ps) const;
 
     TunerConfig cfg_;
@@ -269,6 +270,7 @@ private:
     double steadyBest_{0};
     size_t steadyLowDecisions_{0};
     size_t stepLow_{0};
+    double measuredNoise_{-1};
     static constexpr size_t kSteadyHistory = 16;
     static constexpr size_t kLevelWindows = 4;
 };

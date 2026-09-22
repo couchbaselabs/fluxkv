@@ -108,23 +108,35 @@ double ThreadTuner::steadyLevel(size_t n) const {
     return w[w.size() / 2];
 }
 
-double ThreadTuner::steadyNoise() const {
-    if (steadyRecent_.size() < 3) {
+double ThreadTuner::cv(const std::vector<double>& w) const {
+    if (w.size() < 3) {
         return 0;
     }
     double mean = 0;
-    for (double t : steadyRecent_) {
+    for (double t : w) {
         mean += t;
     }
-    mean /= steadyRecent_.size();
+    mean /= w.size();
     if (mean <= 0) {
         return 0;
     }
     double var = 0;
-    for (double t : steadyRecent_) {
+    for (double t : w) {
         var += (t - mean) * (t - mean);
     }
-    return std::sqrt(var / steadyRecent_.size()) / mean;
+    return std::sqrt(var / w.size()) / mean;
+}
+
+double ThreadTuner::steadyNoise() const {
+    // The last trial's measurement windows are consecutive and at one pool
+    // configuration, so their spread is the load's own variation. The steady
+    // history spans trials at different sizes and different throughput
+    // levels, which read as 25% noise on a load that varied 7%; it is only
+    // the fallback before any trial has been measured.
+    if (measuredNoise_ >= 0) {
+        return measuredNoise_;
+    }
+    return cv(steadyRecent_);
 }
 
 double ThreadTuner::tolerance(const PoolState& ps) const {
@@ -368,6 +380,9 @@ void ThreadTuner::judge(PoolState& ps, double tput) {
     const bool grew = ps.trial == Trial::Grow;
     const size_t delta = grew ? size - ps.sizeBefore : ps.sizeBefore - size;
     const double ratio = ps.refTput > 0 ? tput / ps.refTput : 1.0;
+    if (ps.tputWindows.size() >= 3) {
+        measuredNoise_ = cv(ps.tputWindows);
+    }
 
     // With no load to measure against, fewer idle threads is simply fine
     // and more is not. Otherwise throughput alone decides: a grow must have
