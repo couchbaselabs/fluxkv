@@ -172,6 +172,7 @@ struct Config {
     double memLwmRatio = 0;
     bool tuneWritersOnly = false;
     std::string tunePools; // empty = all
+    std::string blockCachePolicy;
     size_t readAhead = 0;
     bool noIndexCompression = false;
     size_t lsmLevel0Tables = 0;
@@ -283,6 +284,8 @@ static void printUsage(const char* prog) {
               << "  --tune-pools LIST    comma list of io,readers,writers that "
                  "--auto-tune may resize; the rest stay at their configured "
                  "sizes (default all)\n"
+              << "  --block-cache-policy P  block cache eviction: LRU (magma "
+                 "default), DFR (delayed FIFO reinsertion) or C2QP (Clock2Q+)\n"
               << "  --read-ahead N       compaction read-ahead buffer bytes; with "
                  "direct IO the reads bypass the page cache (magma default 0: "
                  "buffered fd, kernel readahead)\n"
@@ -392,6 +395,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"tune-writers-only", no_argument, nullptr, 1080},
             {"read-ahead", required_argument, nullptr, 1081},
             {"tune-pools", required_argument, nullptr, 1083},
+            {"block-cache-policy", required_argument, nullptr, 1084},
             {"no-index-compression", no_argument, nullptr, 1082},
             {"lsm-level0-tables", required_argument, nullptr, 1055},
             {"lsm-min-compact-size", required_argument, nullptr, 1056},
@@ -615,6 +619,9 @@ static Config parseArgs(int argc, char* argv[]) {
         case 1083:
             cfg.tunePools = optarg;
             break;
+        case 1084:
+            cfg.blockCachePolicy = optarg;
+            break;
         case 1055:
             cfg.lsmLevel0Tables = strtoull(optarg, nullptr, 10);
             break;
@@ -837,6 +844,9 @@ int main(int argc, char* argv[]) {
         magmaCfg.LSDNumLevels = cfg.lsdLevels;
     }
     magmaCfg.LSDTieredL0 = cfg.lsdTieredL0;
+    if (!cfg.blockCachePolicy.empty()) {
+        magmaCfg.BlockCacheEvictionPolicy = cfg.blockCachePolicy;
+    }
     if (cfg.readAhead > 0) {
         magmaCfg.ReadAheadSize = cfg.readAhead;
     }
