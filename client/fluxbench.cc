@@ -62,6 +62,10 @@ struct Options {
     // front, each holding `batch` requests. 0 keeps the latency-measuring path.
     size_t pregen = 0;
     size_t batch = 0; // requests per pre-generated buffer; 0 => pipeline
+    // Sliding window: keep `pipeline` requests in flight and refill each
+    // slot as its response lands, instead of sending a batch and waiting for
+    // all of it. The batch mode's rate is set by the slowest op per batch.
+    bool window = false;
     // Fixed key length. Every byte of key is a byte on the wire in both
     // directions, so a variable-length "key_123" costs throughput once the
     // link saturates: at 8-byte values the request IS mostly key and header.
@@ -594,6 +598,114 @@ void runConnectionPregen(const Options& opts,
     ::close(fd);
 }
 
+// Window path: every connection keeps `pipeline` requests outstanding and
+// replaces each one as soon as it completes, so one slow op holds one slot
+// rather than the whole batch. Latency is still measured per request.
+void runConnectionWindow(const Options& opts,
+                         size_t threadIndex,
+                         std::atomic<bool>& stop,
+                         Result& result) {
+    int fd = connectTo(opts.host, opts.port);
+    if (fd < 0) {
+        result.errors++;
+        return;
+    }
+    int bufSize = 8 << 20;
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufSize, sizeof(bufSize));
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufSize, sizeof(bufSize));
+
+    std::mt19937_64 rng(opts.seed + threadIndex);
+    const bool doSet = (opts.mode == "set");
+    std::string value;
+    if (doSet) {
+        value.resize(opts.valsize);
+        if (opts.randvals) {
+            for (auto& c : value) {
+                c = static_cast<char>(rng() & 0xFF);
+            }
+        } else {
+            std::fill(value.begin(), value.end(), 'x');
+        }
+    }
+
+    const size_t slots = opts.pipeline;
+    std::vector<std::chrono::steady_clock::time_point> sentAt(slots);
+    std::vector<uint32_t> freed;
+    freed.reserve(slots);
+    for (uint32_t i = 0; i < slots; i++) {
+        freed.push_back(i);
+    }
+    std::vector<uint8_t> sendBuf;
+    std::vector<uint8_t> rx(1 << 20);
+    size_t have = 0;
+
+    while (!stop.load(std::memory_order_relaxed)) {
+        if (!freed.empty()) {
+            sendBuf.clear();
+            const auto now = std::chrono::steady_clock::now();
+            for (uint32_t slot : freed) {
+                const std::string key = keyFor(pickKey(opts, rng));
+                appendRequest(sendBuf,
+                              doSet ? kOpSet : kOpGet,
+                              key,
+                              vbucketFor(key, opts.vbuckets),
+                              slot,
+                              doSet ? &value : nullptr);
+                sentAt[slot] = now;
+            }
+            freed.clear();
+            if (!writeFully(fd, sendBuf.data(), sendBuf.size())) {
+                result.errors++;
+                break;
+            }
+        }
+        if (have == rx.size()) {
+            rx.resize(rx.size() * 2);
+        }
+        const ssize_t n = ::recv(fd, rx.data() + have, rx.size() - have, 0);
+        if (n <= 0) {
+            result.errors++;
+            break;
+        }
+        have += static_cast<size_t>(n);
+        const auto now = std::chrono::steady_clock::now();
+        size_t p = 0;
+        while (have - p >= kHeaderSize) {
+            const uint8_t* h = rx.data() + p;
+            const uint32_t bodyLen = getU32(h + 8);
+            if (have - p < kHeaderSize + bodyLen) {
+                break;
+            }
+            if (h[0] != kResponseMagic) {
+                result.errors++;
+                ::close(fd);
+                return;
+            }
+            const uint32_t opaque = getU32(h + 12);
+            const uint16_t status = getU16(h + 6);
+            if (opaque < slots) {
+                result.latencies.add(static_cast<uint32_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                                now - sentAt[opaque])
+                                .count()));
+                freed.push_back(opaque);
+            }
+            result.statusCounts[status]++;
+            if (status == 0) {
+                result.ops++;
+            } else {
+                result.errors++;
+            }
+            p += kHeaderSize + bodyLen;
+        }
+        if (p > 0) {
+            std::memmove(rx.data(), rx.data() + p, have - p);
+            have -= p;
+        }
+    }
+    ::close(fd);
+}
+
 void runConnection(const Options& opts,
                    size_t threadIndex,
                    std::atomic<bool>& stop,
@@ -738,6 +850,8 @@ void usage(const char* prog) {
             << "  -conns N          connections, one thread each (default 8)\n"
             << "  -pipeline N       requests in flight per connection "
                "(default 8)\n"
+            << "  -window           keep -pipeline requests in flight, refilling each "
+               "as it completes (default: send a batch, wait for all of it)\n"
             << "  -pregen N         pre-generate N request buffers per "
                "connection and measure throughput only (no per-op latency); "
                "use this above ~1M ops/s or the client is what you measure\n"
@@ -799,6 +913,8 @@ int main(int argc, char** argv) {
             opts.conns = std::stoul(next());
         } else if (arg == "-pipeline") {
             opts.pipeline = std::stoul(next());
+        } else if (arg == "-window") {
+            opts.window = true;
         } else if (arg == "-pregen") {
             opts.pregen = std::stoul(next());
         } else if (arg == "-batch") {
@@ -841,6 +957,10 @@ int main(int argc, char** argv) {
         std::cerr << "-mode must be get or set\n";
         return 2;
     }
+    if (opts.window && opts.rate > 0) {
+        std::cerr << "-window is closed loop; it does not combine with -rate\n";
+        return 1;
+    }
     if (opts.conns == 0 || opts.pipeline == 0 || opts.keys == 0) {
         std::cerr << "-conns, -pipeline and -keys must be non-zero\n";
         return 2;
@@ -871,6 +991,8 @@ int main(int argc, char** argv) {
         threads.emplace_back([&, i]() {
             if (opts.pregen > 0) {
                 runConnectionPregen(opts, i, stop, results[i]);
+            } else if (opts.window) {
+                runConnectionWindow(opts, i, stop, results[i]);
             } else {
                 runConnection(opts, i, stop, results[i]);
             }
