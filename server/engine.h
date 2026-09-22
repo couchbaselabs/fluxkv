@@ -19,6 +19,7 @@
 #include <mutex>
 #include <chrono>
 #include <memory>
+#include <functional>
 #include <string>
 #include <thread>
 #include <vector>

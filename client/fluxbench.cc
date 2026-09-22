@@ -55,6 +55,9 @@ struct Options {
     bool randvals = false;
     uint64_t seed = 1;
     std::chrono::seconds runtime{30};
+    // Paced load: total ops/s across all connections, each connection
+    // sending one pipeline-sized batch per interval. 0 = closed loop.
+    double rate = 0;
     // Pre-generate mode: build `pregen` request buffers per connection up
     // front, each holding `batch` requests. 0 keeps the latency-measuring path.
     size_t pregen = 0;
@@ -555,8 +558,26 @@ void runConnection(const Options& opts,
     // Choosing keys at random instead leaves part of the keyspace unwritten,
     // and the misses that follow are cheap - which inflates the read rate.
     size_t setCursor = threadIndex;
+    std::chrono::steady_clock::time_point nextSend{};
 
     while (!stop.load(std::memory_order_relaxed)) {
+        if (opts.rate > 0) {
+            const double perConn = opts.rate / static_cast<double>(opts.conns);
+            const auto interval = std::chrono::duration_cast<
+                    std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(
+                            static_cast<double>(opts.pipeline) / perConn));
+            if (nextSend == std::chrono::steady_clock::time_point{}) {
+                nextSend = std::chrono::steady_clock::now();
+            }
+            std::this_thread::sleep_until(nextSend);
+            nextSend += interval;
+            // A stall longer than the interval is not made up for: catching up
+            // would burst and measure the burst.
+            if (nextSend < std::chrono::steady_clock::now()) {
+                nextSend = std::chrono::steady_clock::now();
+            }
+        }
         sendBuf.clear();
         auto batch = opts.pipeline;
         if (doSet && !gZipfOn) {
@@ -677,6 +698,9 @@ void usage(const char* prog) {
                "uniform. With -mode set this also switches SET from the "
                "one-pass stride load to sustained random writes\n"
             << "  -seed N           RNG seed (default 1)\n"
+            << "  -rate N           paced load, total ops/s across connections "
+               "(default 0: closed loop); use with a small -pipeline for "
+               "latency at a fixed rate\n"
             << "  -runtime Ns       run duration in seconds (default 30s)\n";
 }
 
@@ -731,6 +755,8 @@ int main(int argc, char** argv) {
             opts.zipf = std::stod(next());
         } else if (arg == "-randvals") {
             opts.randvals = true;
+        } else if (arg == "-rate") {
+            opts.rate = std::stod(next());
         } else if (arg == "-seed") {
             opts.seed = std::stoull(next());
         } else if (arg == "-runtime") {
