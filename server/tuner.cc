@@ -139,6 +139,10 @@ double ThreadTuner::steadyNoise() const {
     return cv(steadyRecent_);
 }
 
+ThreadTuner::Direction& ThreadTuner::dirRef(PoolState& ps, bool grew) {
+    return grew ? ps.grow : ps.shrink;
+}
+
 double ThreadTuner::tolerance(const PoolState& ps) const {
     // Averaging `measure` windows divides the noise by sqrt(measure).
     const double n = ps.measure > 0 ? static_cast<double>(ps.measure) : 1.0;
@@ -395,6 +399,11 @@ void ThreadTuner::judge(PoolState& ps, double tput) {
     // Shrinks stay strict: widening their allowance to the noise would let
     // a series of them each lose a few percent for real.
     const double tol = tolerance(ps);
+    // A move must also hold the level the streak started from.
+    const double streakRatio =
+            dirRef(ps, grew).streakRef > 0
+                    ? tput / dirRef(ps, grew).streakRef
+                    : 1.0;
     bool keep;
     if (ps.refTput == 0) {
         keep = !grew;
@@ -407,7 +416,8 @@ void ThreadTuner::judge(PoolState& ps, double tput) {
     } else if (grew) {
         keep = ratio >= 1.0 + tol;
     } else {
-        keep = ratio >= 1.0 - std::max(cfg_.maxLoss, std::min(tol, 0.02));
+        const double allow = std::max(cfg_.maxLoss, std::min(tol, 0.02));
+        keep = ratio >= 1.0 - allow && streakRatio >= 1.0 - allow;
     }
 
     spdlog::info("tuner: {} {} {} (tput {:.0f} -> {:.0f}/s, {:+.1f}%, "
@@ -426,10 +436,14 @@ void ThreadTuner::judge(PoolState& ps, double tput) {
     if (keep) {
         dir.cap = 0;
         dir.nextBackoff = 0;
+        if (dir.keptStreak == 0) {
+            dir.streakRef = ps.refTput;
+        }
         dir.keptStreak++;
     } else {
         ps.reverts++;
         dir.keptStreak = 0;
+        dir.streakRef = 0;
         if (grew) {
             pool->Shrink(delta);
         } else {

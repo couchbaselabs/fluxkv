@@ -198,6 +198,12 @@ private:
         // ramping, not searching, so the step escalates; any revert
         // resets it and the halving search takes over.
         size_t keptStreak{0};
+        // Throughput before the first move of the current streak. Each move
+        // is judged against it as well as against the last level, so a run
+        // of moves that each lose a little cannot add up to a large loss:
+        // measured, readers walked 112 -> 40 and writers 80 -> 48, each step
+        // "kept" inside a 1.1% tolerance, for a 10% loss overall.
+        double streakRef{0};
     };
 
     struct PoolState {
@@ -249,6 +255,7 @@ private:
     double steadyNoise() const;
     double cv(const std::vector<double>& w) const;
     double tolerance(const PoolState& ps) const;
+    static Direction& dirRef(PoolState& ps, bool grew);
 
     TunerConfig cfg_;
     std::function<uint64_t()> opsCounter_;
