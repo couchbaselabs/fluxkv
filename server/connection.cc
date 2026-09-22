@@ -192,6 +192,9 @@ void Connection::destroy() {
     if (resumeTimeout_ && resumeTimeout_->isScheduled()) {
         resumeTimeout_->cancelTimeout();
     }
+    if (readPaused_) {
+        gPausedConns.fetch_sub(1, std::memory_order_relaxed);
+    }
     readPaused_ = false;
     if (migrating_ && migrateTarget_) {
         migrateTarget_->Unreserve();
@@ -302,6 +305,9 @@ void Connection::tryFinishMigrate() {
         resumeTimeout_->cancelTimeout();
     }
     resumeTimeout_.reset();
+    if (readPaused_) {
+        gPausedConns.fetch_sub(1, std::memory_order_relaxed);
+    }
     readPaused_ = false;
     if (owner_) {
         owner_->Remove(this);
@@ -406,6 +412,7 @@ void Connection::pauseForQueue() {
         return;
     }
     readPaused_ = true;
+    gPausedConns.fetch_add(1, std::memory_order_relaxed);
     socket_->setReadCB(nullptr);
     if (!resumeTimeout_) {
         resumeTimeout_ = std::make_unique<ResumeTimeout>(evb);
@@ -420,6 +427,7 @@ void Connection::resumeAfterQueue() {
     }
     if (closing_ || migrating_) {
         readPaused_ = false;
+        gPausedConns.fetch_sub(1, std::memory_order_relaxed);
         return;
     }
     if (!bucket_->WriteQueueHasRoom()) {
@@ -427,6 +435,7 @@ void Connection::resumeAfterQueue() {
         return;
     }
     readPaused_ = false;
+    gPausedConns.fetch_sub(1, std::memory_order_relaxed);
     socket_->setReadCB(this);
     // Bytes may already be buffered from before the pause.
     while (!closing_ && !stageFull_ && parseAndDispatch()) {

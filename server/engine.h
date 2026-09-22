@@ -98,6 +98,11 @@ struct DispatcherStats {
 
 // Global singleton
 extern DispatcherStats gDispStats;
+// Diagnostics for the write-queue backpressure: connections currently
+// read-paused, and the bucket whose queued bytes /stats reports.
+extern std::atomic<int64_t> gPausedConns;
+class Bucket;
+extern Bucket* gStatsBucket;
 // The bucket's document cache, or null. Published by Bucket::SetCache so the
 // stats endpoint can report it alongside the dispatcher counters.
 extern DocCache* gDocCache;
@@ -650,6 +655,9 @@ public:
     bool StageWrite(Request* req);
     // Room for more staged writes? Used to lift read backpressure; the
     // margin keeps a connection from resuming straight back into a refusal.
+    size_t QueuedBytes() const {
+        return queuedBytes_.load(std::memory_order_relaxed);
+    }
     bool WriteQueueHasRoom() const {
         return queuedBytes_.load(std::memory_order_relaxed) <
                writeQueueMemLimit_ - writeQueueMemLimit_ / 8;

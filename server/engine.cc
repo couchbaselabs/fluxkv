@@ -19,6 +19,8 @@ namespace magma {
 namespace kvserver {
 
 DispatcherStats gDispStats;
+std::atomic<int64_t> gPausedConns{0};
+Bucket* gStatsBucket{nullptr};
 
 DocCache* gDocCache = nullptr;
 // Runtime-tunable read-batch cap (--max-read-batch). 128 matches the
@@ -133,6 +135,8 @@ std::string DispatcherStats::toJson() const {
     j["read_batches"] = readBatches.Sum();
     j["read_batch_items"] = readBatchItems.Sum();
     j["tmp_fails"] = tmpFails.load(std::memory_order_relaxed);
+    j["paused_conns"] = gPausedConns.load(std::memory_order_relaxed);
+    j["write_queue_bytes"] = gStatsBucket ? gStatsBucket->QueuedBytes() : 0;
     j["queued_gets"] = queuedGets.Sum();
     j["bad_magic"] = badMagic.load(std::memory_order_relaxed);
     j["bad_opcode"] = badOpcode.load(std::memory_order_relaxed);
@@ -1201,6 +1205,7 @@ Bucket::Bucket(const std::string& name,
       durable_(durable),
       writeQueueMemLimit_(writeQueueMemLimit),
       echoGetSize_(echoGetSize) {
+    gStatsBucket = this;
     if (echoGetSize_ > 0) {
         echoGetValue_.assign(echoGetSize_, 'X');
     }
