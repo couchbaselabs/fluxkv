@@ -75,13 +75,27 @@ struct IOThread {
     // Either way the mail runs as a loop callback, a plain top-level
     // context, at the end of the current iteration.
     void Post(std::function<void()> fn) {
+        // Only wake on the empty -> non-empty transition: the pump swaps
+        // `mail` under this same lock, so a post that finds mail already
+        // non-empty knows an earlier post already scheduled a pump that
+        // hasn't drained yet, and a post right after that drain sees empty
+        // and wakes again. Without this, every Post() paid its own
+        // runInEventBaseThread regardless of how many were already queued -
+        // "mailbox coalescing" only batched the closures, not the wake -
+        // which flooded the loop's NotificationQueue under a burst of
+        // back-to-back posts (e.g. per-completion read dispatch at
+        // saturation).
+        bool first;
         {
             std::lock_guard<std::mutex> g(mailMu);
+            first = mail.empty();
             mail.push_back(std::move(fn));
         }
         hasMail.store(true, std::memory_order_release);
         gMailDepth.fetch_add(1, std::memory_order_relaxed);
-        evb->runInEventBaseThread([this]() { SchedulePump(); });
+        if (first) {
+            evb->runInEventBaseThread([this]() { SchedulePump(); });
+        }
     }
 
     // Loop thread only.
