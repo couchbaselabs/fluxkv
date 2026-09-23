@@ -117,6 +117,9 @@ extern Bucket* gStatsBucket;
 extern DocCache* gDocCache;
 // Runtime read-batch cap (set from main via --max-read-batch).
 extern size_t gMaxReadBatch;
+// Max concurrent owners one vbucket's reads can have (--max-read-owners).
+// 1 keeps the old single-owner behavior.
+extern uint32_t gMaxReadOwners;
 // Read-path FIFO diagnostics (gTraceLatency only): worst queue age at
 // dispatch and worst times any one request was requeued past kMaxReadBatch.
 extern std::atomic<uint64_t> gMaxReadQueueAgeNs;
@@ -413,12 +416,25 @@ struct alignas(64) VBQueue {
     // WriteDocs for this vbucket finished. Both drive write coalescing.
     std::atomic<uint32_t> pending{0};
     std::atomic<uint64_t> lastWriteNs{0};
-    // Read queues only: batch overflow past kMaxReadBatch, oldest-first via
-    // hook.next. Owned exclusively by the current reader (never touched by
-    // EnqueueRead), so it needs no atomics and can't race the lock-free
-    // list -- unlike reinserting overflow into `list`, which let requests
-    // that arrived later cut ahead of it on every subsequent sweep.
-    Request* overflow{nullptr};
+
+    // Read queues only, below. Reads need no per-vbucket ordering (magma's
+    // Get/GetDocs are safe for concurrent callers), so a backed-up vbucket
+    // can recruit more than one reader instead of grinding through rounds
+    // alone while the rest of the pool spins idle. `scheduled` above is not
+    // reused for this: it stays a plain owner/no-owner bool for writes.
+    std::atomic<uint32_t> readOwners{0};
+    // Approximate backlog: EnqueueRead ++, executeRead -= batch taken. Only
+    // used to decide whether a second/third/fourth owner is worth starting;
+    // never required to be exact.
+    std::atomic<int64_t> readDepth{0};
+    // Batch overflow past kMaxReadBatch, oldest-first via hook.next. With
+    // more than one owner this is no longer owner-private, so it is mutex-
+    // guarded rather than the single-owner lock-free `list`: pushing excess
+    // back into `list` let requests that arrived later cut ahead of it on
+    // every subsequent sweep (see the reader starvation fix).
+    std::mutex overflowMu;
+    Request* overflowHead{nullptr};
+    Request* overflowTail{nullptr};
 };
 
 // Tasks dispatched to writer/reader pools

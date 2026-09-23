@@ -39,6 +39,7 @@ DocCache* gDocCache = nullptr;
 // libaio + IOQueueDepth=16 sweet spot; lower (8-16) is better for sync
 // QD=1 multi-thread parallelism.
 size_t gMaxReadBatch = 128;
+uint32_t gMaxReadOwners = 1;
 std::atomic<uint64_t> gMaxReadQueueAgeNs{0};
 std::atomic<uint32_t> gMaxReadRequeues{0};
 std::atomic<uint64_t> gVbidServed[kMaxVbidStats]{};
@@ -438,15 +439,29 @@ static inline void releaseVBQueue(VBQueue& vbq, Q& taskQueue, Task retask) {
     }
 }
 
-// Same as releaseVBQueue, but also re-arms for a non-empty owner-private
-// overflow (see VBQueue::overflow), which the lock-free list check above
-// can't see.
+// Same shape as releaseVBQueue, adapted for reads: one of possibly several
+// concurrent owners (gMaxReadOwners) steps down, then re-checks depth/list/
+// overflow and re-arms an owner slot if work remains -- same seq_cst
+// store-then-recheck pattern, now against a counter instead of a bool.
 template <class Q, class Task>
 static inline void releaseReadVBQueue(VBQueue& vbq, Q& taskQueue, Task retask) {
-    vbq.scheduled.store(false, std::memory_order_seq_cst);
-    if ((vbq.overflow || !vbq.list.empty()) &&
-        !vbq.scheduled.exchange(true, std::memory_order_seq_cst)) {
-        taskQueue.blockingWrite(std::move(retask));
+    vbq.readOwners.fetch_sub(1, std::memory_order_seq_cst);
+    bool hasOverflow;
+    {
+        std::lock_guard<std::mutex> lk(vbq.overflowMu);
+        hasOverflow = vbq.overflowHead != nullptr;
+    }
+    if (!hasOverflow && vbq.list.empty() &&
+        vbq.readDepth.load(std::memory_order_seq_cst) <= 0) {
+        return;
+    }
+    uint32_t owners = vbq.readOwners.load(std::memory_order_seq_cst);
+    while (owners < gMaxReadOwners) {
+        if (vbq.readOwners.compare_exchange_weak(
+                    owners, owners + 1, std::memory_order_seq_cst)) {
+            taskQueue.blockingWrite(std::move(retask));
+            return;
+        }
     }
 }
 
@@ -1112,16 +1127,24 @@ size_t ReaderPool::executeRead(ReadTask& task) {
     std::vector<Request*> batch;
     batch.reserve(kMaxReadBatch);
 
-    // Drain the owner-private overflow first: those are strictly older than
-    // anything the lock-free list can hold right now (see VBQueue::overflow).
-    Request* ovf = vbq.overflow;
-    while (ovf && batch.size() < kMaxReadBatch) {
-        Request* next = ovf->hook.next;
-        ovf->hook.next = nullptr;
-        batch.push_back(ovf);
-        ovf = next;
+    // Drain the overflow first: those are strictly older than anything the
+    // lock-free list can hold right now (see VBQueue::overflow*). Mutex-
+    // guarded because gMaxReadOwners>1 lets several owners hit this
+    // concurrently for the same vbucket.
+    {
+        std::lock_guard<std::mutex> lk(vbq.overflowMu);
+        Request* ovf = vbq.overflowHead;
+        while (ovf && batch.size() < kMaxReadBatch) {
+            Request* next = ovf->hook.next;
+            ovf->hook.next = nullptr;
+            batch.push_back(ovf);
+            ovf = next;
+        }
+        vbq.overflowHead = ovf;
+        if (!ovf) {
+            vbq.overflowTail = nullptr;
+        }
     }
-    vbq.overflow = ovf;
 
     if (batch.size() < kMaxReadBatch) {
         // sweepOnce, not sweep: a single reverse() below only recovers FIFO
@@ -1153,9 +1176,23 @@ size_t ReaderPool::executeRead(ReadTask& task) {
             batch.back()->readRequeues++;
         }
         batch.back()->hook.next = nullptr;
-        vbq.overflow = batch[kMaxReadBatch];
+        Request* newHead = batch[kMaxReadBatch];
+        Request* newTail = batch.back();
+        {
+            std::lock_guard<std::mutex> lk(vbq.overflowMu);
+            // Append after whatever another concurrent owner already left
+            // (older); a fresh sweep's excess is always newer than that.
+            if (vbq.overflowTail) {
+                vbq.overflowTail->hook.next = newHead;
+            } else {
+                vbq.overflowHead = newHead;
+            }
+            vbq.overflowTail = newTail;
+        }
         batch.resize(kMaxReadBatch);
     }
+    vbq.readDepth.fetch_sub(static_cast<int64_t>(batch.size()),
+                           std::memory_order_relaxed);
 
     hotStatAdd(gDispStats.readBatches);
     hotStatAdd(gDispStats.readBatchItems, batch.size());
@@ -1596,17 +1633,33 @@ void Bucket::EnqueueRead(Request* req) {
         req->tReadEnqueue = steadyNowNs();
     }
     vbq.list.insertHead(req);
+    const int64_t depth =
+            vbq.readDepth.fetch_add(1, std::memory_order_seq_cst) + 1;
 
-    // seq_cst, matching releaseVBQueue's clearing store: acq_rel only
-    // synchronizes-with a prior release on `scheduled` itself, it does not
-    // order this exchange against releaseVBQueue's INDEPENDENT list.empty()
-    // load the way seq_cst's single total order does. Mismatched here, a
-    // push landing in the release/re-check window can see scheduled==true
-    // (stale) while the releaser sees the list as empty (stale) -- neither
-    // submits, and the request waits until an unrelated later push on the
-    // same vbucket happens to re-arm it.
-    if (!vbq.scheduled.exchange(true, std::memory_order_seq_cst)) {
-        shard.GetReaderPool()->Submit({&shard, req->vbucket});
+    // seq_cst: acq_rel only synchronizes-with a prior release on readOwners
+    // itself, it does not order this CAS against a releasing owner's
+    // INDEPENDENT depth/list check the way seq_cst's single total order
+    // does. Mismatched, a push landing in the release/re-check window can
+    // be missed by both sides and wait for an unrelated later push to
+    // re-arm the vbucket (this bit fluxkv once already, see the starvation
+    // fix's seq_cst commit).
+    uint32_t owners = vbq.readOwners.load(std::memory_order_seq_cst);
+    for (;;) {
+        // First owner always starts. Past that, only add another owner
+        // once the backlog is deep enough that one more full round
+        // (gMaxReadBatch items) is already queued behind the existing
+        // owners -- otherwise extra owners would just contend over a
+        // small batch for no throughput gain.
+        if (owners != 0 &&
+            (owners >= gMaxReadOwners ||
+             depth <= static_cast<int64_t>(owners * gMaxReadBatch))) {
+            return;
+        }
+        if (vbq.readOwners.compare_exchange_weak(
+                    owners, owners + 1, std::memory_order_seq_cst)) {
+            shard.GetReaderPool()->Submit({&shard, req->vbucket});
+            return;
+        }
     }
 }
 

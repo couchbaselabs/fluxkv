@@ -84,6 +84,7 @@ struct Config {
     size_t echoGetSize = 0; // 0 = disabled; >0 = echo fixed-size value on GET
     size_t ioQueueDepth = 16; // magma per-batch coroutine read parallelism
     size_t maxReadBatch = 64; // per-reader-thread sweep cap
+    uint32_t maxReadOwners = 1; // max concurrent readers sharing one vbucket
     bool cacheDecompressed = false; // store data blocks decompressed
     bool compressIndexCache = false; // cache index blocks compressed
     bool dataBlockAutoTune = false; // keep physical data block ~= target
@@ -216,6 +217,8 @@ static void printUsage(const char* prog) {
               << "  --io-queue-depth N   magma GetDocs coroutine fanout per "
                  "batch (default 16; raises NVMe queue depth)\n"
               << "  --max-read-batch N   reader-thread sweep cap (default 64)\n"
+              << "  --max-read-owners N  concurrent readers allowed on one "
+                 "vbucket's backlog (default 1)\n"
               << "  --cache-decompressed-data  store data blocks decompressed "
                  "in block cache (skips LZ4 on cache hits, costs ~6× memory)\n"
               << "  --align-512           pad SSTable blocks to 512 bytes "
@@ -345,6 +348,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"echo-get", required_argument, nullptr, 'E'},
             {"io-queue-depth", required_argument, nullptr, 1001},
             {"max-read-batch", required_argument, nullptr, 1002},
+            {"max-read-owners", required_argument, nullptr, 1085},
             {"cache-decompressed-data", no_argument, nullptr, 1003},
             {"compress-index-cache", no_argument, nullptr, 1009},
             {"enable-data-block-autotuning", no_argument, nullptr, 1010},
@@ -465,6 +469,10 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1002:
             cfg.maxReadBatch = strtoull(optarg, nullptr, 10);
+            break;
+        case 1085:
+            cfg.maxReadOwners =
+                    static_cast<uint32_t>(strtoul(optarg, nullptr, 10));
             break;
         case 1003:
             cfg.cacheDecompressed = true;
@@ -695,6 +703,7 @@ int main(int argc, char* argv[]) {
     magmaCfg.BlockCacheNumPartitions =
             std::max<size_t>(64, 4 * cfg.readers);
     kvserver::gMaxReadBatch = cfg.maxReadBatch;
+    kvserver::gMaxReadOwners = std::max<uint32_t>(1, cfg.maxReadOwners);
     kvserver::gWriteCoalesceNs = cfg.writeCoalesceUs * 1000;
     kvserver::gMinWriteBatch = cfg.minWriteBatch;
     kvserver::gSortDupThreshold = cfg.sortDupThreshold;
