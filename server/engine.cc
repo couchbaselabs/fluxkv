@@ -1209,12 +1209,10 @@ size_t ReaderPool::executeRead(ReadTask& task) {
         req->evb->runInEventBaseThread(
                 [conn, req]() { conn->sendGetResponse(req); });
     } else {
-        // Batch GetDocs, deduped by key: under skew (zipf 0.99) the same
-        // hot key repeats heavily within one batch -- one GetOperation per
-        // distinct key, and its "followers" get a copy of the same result.
-        // Without this every repeat cost a full key-index lookup and a
-        // device read of the same data block (seqIndex data blocks are not
-        // cached by policy), which is what capped a hot vbucket's rate.
+        // Batch GetDocs, deduped by key: under zipf skew a hot key repeats
+        // heavily within one batch, each repeat otherwise paying its own
+        // key-index lookup and device read. One GetOperation per distinct
+        // key; followers get a copy of that op's result.
         folly::F14FastMap<std::string_view, std::vector<Request*>> byKey;
         byKey.reserve(batch.size());
         for (auto* req : batch) {
