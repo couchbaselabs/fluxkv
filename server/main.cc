@@ -83,7 +83,7 @@ struct Config {
     size_t writeQueueMem = 256ULL * 1024 * 1024; // 256MB
     size_t echoGetSize = 0; // 0 = disabled; >0 = echo fixed-size value on GET
     size_t ioQueueDepth = 16; // magma per-batch coroutine read parallelism
-    size_t maxReadBatch = 64; // per-reader-thread sweep cap
+    size_t maxReadBatch = 256; // per-reader-thread sweep cap
     uint32_t maxReadOwners = 1; // max concurrent readers sharing one vbucket
     bool cacheDecompressed = false; // store data blocks decompressed
     bool compressIndexCache = false; // cache index blocks compressed
@@ -216,7 +216,7 @@ static void printUsage(const char* prog) {
                  "GET (bypass magma, measure network throughput)\n"
               << "  --io-queue-depth N   magma GetDocs coroutine fanout per "
                  "batch (default 16; raises NVMe queue depth)\n"
-              << "  --max-read-batch N   reader-thread sweep cap (default 64)\n"
+              << "  --max-read-batch N   reader-thread sweep cap (default 256)\n"
               << "  --max-read-owners N  concurrent readers allowed on one "
                  "vbucket's backlog (default 1)\n"
               << "  --cache-decompressed-data  store data blocks decompressed "
