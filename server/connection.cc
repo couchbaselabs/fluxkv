@@ -1234,6 +1234,25 @@ void Connection::sendWriteResponse(Request* req) {
 }
 
 void Connection::sendGetResponse(Request* req) {
+    if (gTraceLatency && req->tReadEnqueue &&
+        req->tReadDispatch >= req->tReadEnqueue &&
+        req->tReadDone >= req->tReadDispatch) {
+        const uint64_t now = steadyNowNs();
+        const uint64_t queueWait = req->tReadDispatch - req->tReadEnqueue;
+        const uint64_t magmaGet = req->tReadDone - req->tReadDispatch;
+        const uint64_t respond = now - req->tReadDone;
+        gReadStages.queueWaitNs.fetch_add(queueWait, std::memory_order_relaxed);
+        gReadStages.magmaGetNs.fetch_add(magmaGet, std::memory_order_relaxed);
+        gReadStages.respondNs.fetch_add(respond, std::memory_order_relaxed);
+        gReadStages.count.fetch_add(1, std::memory_order_relaxed);
+        bumpMax(gReadStages.queueWaitMax, queueWait);
+        bumpMax(gReadStages.magmaGetMax, magmaGet);
+        bumpMax(gReadStages.respondMax, respond);
+        gReadStages.record(ReadStageTimers::QueueWait, queueWait);
+        gReadStages.record(ReadStageTimers::MagmaGet, magmaGet);
+        gReadStages.record(ReadStageTimers::Respond, respond);
+        gReadStages.record(ReadStageTimers::Total, now - req->tReadEnqueue);
+    }
     if (!closing_) {
         if (!req->resultStatus.IsOK()) {
             appendEmptyResponse(pendingWriteBuf_,

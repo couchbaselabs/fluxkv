@@ -44,6 +44,8 @@ std::atomic<uint64_t> gMaxReadQueueAgeNs{0};
 std::atomic<uint32_t> gMaxReadRequeues{0};
 std::atomic<uint64_t> gVbidServed[kMaxVbidStats]{};
 std::atomic<uint64_t> gVbidRounds[kMaxVbidStats]{};
+std::atomic<uint64_t> gVbidMaxQueueAgeNs[kMaxVbidStats]{};
+ReadStageTimers gReadStages;
 size_t gMinWriteBatch = 64;
 BatchSort gBatchSort = BatchSort::Auto;
 bool gAsyncDurable = false;
@@ -141,6 +143,33 @@ std::string DispatcherStats::toJson() const {
             auto& arr = j["stage_hist"][kHistNames[h]];
             for (int b = 0; b < StageTimers::kBuckets; b++) {
                 arr.push_back(gStages.hist[h][b].load(std::memory_order_relaxed));
+            }
+        }
+    }
+    if (const uint64_t n = gReadStages.count.load(std::memory_order_relaxed)) {
+        j["read_stage_queue_wait_us"] =
+                gReadStages.queueWaitNs.load(std::memory_order_relaxed) / 1e3 /
+                n;
+        j["read_stage_magma_get_us"] =
+                gReadStages.magmaGetNs.load(std::memory_order_relaxed) / 1e3 /
+                n;
+        j["read_stage_respond_us"] =
+                gReadStages.respondNs.load(std::memory_order_relaxed) / 1e3 /
+                n;
+        j["read_stage_count"] = n;
+        j["read_stage_max_queue_wait_us"] =
+                gReadStages.queueWaitMax.load(std::memory_order_relaxed) / 1e3;
+        j["read_stage_max_magma_get_us"] =
+                gReadStages.magmaGetMax.load(std::memory_order_relaxed) / 1e3;
+        j["read_stage_max_respond_us"] =
+                gReadStages.respondMax.load(std::memory_order_relaxed) / 1e3;
+        static const char* kReadHistNames[] = {
+                "queue_wait", "magma_get", "respond", "total"};
+        for (int h = 0; h < ReadStageTimers::NumHist; h++) {
+            auto& arr = j["read_stage_hist"][kReadHistNames[h]];
+            for (int b = 0; b < ReadStageTimers::kBuckets; b++) {
+                arr.push_back(
+                        gReadStages.hist[h][b].load(std::memory_order_relaxed));
             }
         }
     }
@@ -1202,9 +1231,17 @@ size_t ReaderPool::executeRead(ReadTask& task) {
         const uint64_t now = steadyNowNs();
         for (auto* req : batch) {
             if (req->tReadEnqueue) {
-                atomicBumpMax(gMaxReadQueueAgeNs, now - req->tReadEnqueue);
+                const uint64_t age = now - req->tReadEnqueue;
+                atomicBumpMax(gMaxReadQueueAgeNs, age);
+                if (task.vbid < kMaxVbidStats) {
+                    atomicBumpMax(gVbidMaxQueueAgeNs[task.vbid], age);
+                }
             }
             atomicBumpMax(gMaxReadRequeues, req->readRequeues);
+            // Dispatch start for this round: queue wait ends here, the
+            // magma call (measured to this request's own completion,
+            // per-key for GetDocs) starts here.
+            req->tReadDispatch = now;
         }
         if (task.vbid < kMaxVbidStats) {
             gVbidServed[task.vbid].fetch_add(batch.size(),
@@ -1219,6 +1256,9 @@ size_t ReaderPool::executeRead(ReadTask& task) {
         Slice meta, value;
         auto status = shard->GetMagma()->Get(
                 task.vbid, req->key, idxBuf, seqBuf, meta, value);
+        if (gTraceLatency) {
+            req->tReadDone = steadyNowNs();
+        }
         if (status.IsOK() && !status.IsOkDocNotFound()) {
             req->resultStatus = status;
             auto dm = DocMeta::decode(meta);
@@ -1277,7 +1317,10 @@ size_t ReaderPool::executeRead(ReadTask& task) {
                     if (hit) {
                         dm = DocMeta::decode(meta);
                     }
+                    const uint64_t tReadDone =
+                            gTraceLatency ? steadyNowNs() : 0;
                     for (auto* req : *reqs) {
+                        req->tReadDone = tReadDone;
                         req->resultStatus = s;
                         if (hit) {
                             req->resultFlags = dm.flags;
@@ -1559,7 +1602,11 @@ std::string Bucket::GetKVStoreStatsJson() {
                        {"ReadsServed",
                         gVbidServed[vbid].load(std::memory_order_relaxed)},
                        {"ReadRounds",
-                        gVbidRounds[vbid].load(std::memory_order_relaxed)}});
+                        gVbidRounds[vbid].load(std::memory_order_relaxed)},
+                       {"MaxReadQueueAgeUs",
+                        gVbidMaxQueueAgeNs[vbid].load(
+                                std::memory_order_relaxed) /
+                                1000}});
     }
     return out.dump();
 }

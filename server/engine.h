@@ -130,6 +130,10 @@ extern std::atomic<uint32_t> gMaxReadRequeues;
 constexpr size_t kMaxVbidStats = 1024;
 extern std::atomic<uint64_t> gVbidServed[kMaxVbidStats];
 extern std::atomic<uint64_t> gVbidRounds[kMaxVbidStats];
+// Worst read-queue age seen on each vbucket (gTraceLatency only), to compare
+// a hot vbucket's tail against the median — a global max hides which
+// vbucket owns it.
+extern std::atomic<uint64_t> gVbidMaxQueueAgeNs[kMaxVbidStats];
 
 // Write coalescing. A vbucket whose last WriteDocs finished less than
 // gWriteCoalesceNs ago and has fewer than gMinWriteBatch items queued is
@@ -197,6 +201,29 @@ struct StageTimers {
         hist[h][b].fetch_add(1, std::memory_order_relaxed);
     }
 };
+// Read-path equivalent of StageTimers: queue wait (enqueue -> a reader
+// starts the magma call for this request's batch), the magma call itself
+// (dispatch -> this request's own GetDocs completion), and respond
+// (completion -> response appended on the IO thread).
+struct ReadStageTimers {
+    std::atomic<uint64_t> queueWaitNs{0};
+    std::atomic<uint64_t> magmaGetNs{0};
+    std::atomic<uint64_t> respondNs{0};
+    std::atomic<uint64_t> count{0};
+    std::atomic<uint64_t> queueWaitMax{0};
+    std::atomic<uint64_t> magmaGetMax{0};
+    std::atomic<uint64_t> respondMax{0};
+    static constexpr int kBuckets = 24;
+    enum Hist { QueueWait, MagmaGet, Respond, Total, NumHist };
+    std::atomic<uint64_t> hist[NumHist][kBuckets]{};
+    void record(Hist h, uint64_t ns) {
+        const uint64_t us = ns / 1000;
+        const int b = us ? std::min(kBuckets - 1, 64 - __builtin_clzll(us)) : 0;
+        hist[h][b].fetch_add(1, std::memory_order_relaxed);
+    }
+};
+extern ReadStageTimers gReadStages;
+
 inline void bumpMax(std::atomic<uint64_t>& m, uint64_t v) {
     uint64_t cur = m.load(std::memory_order_relaxed);
     while (v > cur && !m.compare_exchange_weak(cur, v,
@@ -306,6 +333,14 @@ struct alignas(64) Request {
     // once in EnqueueRead, read at dispatch to verify FIFO fairness.
     uint64_t tReadEnqueue{0};
     uint32_t readRequeues{0};
+    // Read-path stage timestamps (gTraceLatency only): tReadDispatch is set
+    // for the whole batch when executeRead starts the magma call; tReadDone
+    // is set per-request, in the GetDocs completion callback for that
+    // request's key (or right after Get() on the single-item path). The gap
+    // to tReadEnqueue is queue wait, tReadDone-tReadDispatch is the magma
+    // call, and respond is measured from tReadDone in sendGetResponse.
+    uint64_t tReadDispatch{0};
+    uint64_t tReadDone{0};
 
     // Result filled by engine thread
     Status resultStatus;
@@ -335,6 +370,7 @@ struct alignas(64) Request {
         evb = nullptr;
         ioOwner = nullptr;
         tArrive = tWriter = tWritten = tDurable = tReadEnqueue = 0;
+        tReadDispatch = tReadDone = 0;
         readRequeues = 0;
         resultStatus = Status();
         resultSeqno = 0;
