@@ -1252,6 +1252,26 @@ void Connection::sendGetResponse(Request* req) {
         gReadStages.record(ReadStageTimers::MagmaGet, magmaGet);
         gReadStages.record(ReadStageTimers::Respond, respond);
         gReadStages.record(ReadStageTimers::Total, now - req->tReadEnqueue);
+
+        if (req->tReadPosted >= req->tReadDone &&
+            req->tReadPickedUp >= req->tReadPosted) {
+            const uint64_t mailboxEnqueue = req->tReadPosted - req->tReadDone;
+            const uint64_t mailboxPickup =
+                    req->tReadPickedUp - req->tReadPosted;
+            const uint64_t writeResp = now - req->tReadPickedUp;
+            gReadStages.mailboxEnqueueNs.fetch_add(
+                    mailboxEnqueue, std::memory_order_relaxed);
+            gReadStages.mailboxPickupNs.fetch_add(
+                    mailboxPickup, std::memory_order_relaxed);
+            gReadStages.writeRespNs.fetch_add(
+                    writeResp, std::memory_order_relaxed);
+            bumpMax(gReadStages.mailboxEnqueueMax, mailboxEnqueue);
+            bumpMax(gReadStages.mailboxPickupMax, mailboxPickup);
+            bumpMax(gReadStages.writeRespMax, writeResp);
+            gReadStages.record(ReadStageTimers::MailboxEnqueue, mailboxEnqueue);
+            gReadStages.record(ReadStageTimers::MailboxPickup, mailboxPickup);
+            gReadStages.record(ReadStageTimers::WriteResp, writeResp);
+        }
     }
     if (!closing_) {
         if (!req->resultStatus.IsOK()) {

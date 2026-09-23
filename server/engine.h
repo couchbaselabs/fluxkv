@@ -213,8 +213,27 @@ struct ReadStageTimers {
     std::atomic<uint64_t> queueWaitMax{0};
     std::atomic<uint64_t> magmaGetMax{0};
     std::atomic<uint64_t> respondMax{0};
+    // respond broken down further: completion -> posted to the IO thread's
+    // EventBase mailbox (DispatchAccum buffering), posted -> the IO thread's
+    // loop actually picks the callback up (folly wake latency), and
+    // pickup -> response appended + flush scheduled. Sums to respondNs.
+    std::atomic<uint64_t> mailboxEnqueueNs{0};
+    std::atomic<uint64_t> mailboxPickupNs{0};
+    std::atomic<uint64_t> writeRespNs{0};
+    std::atomic<uint64_t> mailboxEnqueueMax{0};
+    std::atomic<uint64_t> mailboxPickupMax{0};
+    std::atomic<uint64_t> writeRespMax{0};
     static constexpr int kBuckets = 24;
-    enum Hist { QueueWait, MagmaGet, Respond, Total, NumHist };
+    enum Hist {
+        QueueWait,
+        MagmaGet,
+        Respond,
+        Total,
+        MailboxEnqueue,
+        MailboxPickup,
+        WriteResp,
+        NumHist
+    };
     std::atomic<uint64_t> hist[NumHist][kBuckets]{};
     void record(Hist h, uint64_t ns) {
         const uint64_t us = ns / 1000;
@@ -341,6 +360,12 @@ struct alignas(64) Request {
     // call, and respond is measured from tReadDone in sendGetResponse.
     uint64_t tReadDispatch{0};
     uint64_t tReadDone{0};
+    // Further breakdown of respond (gTraceLatency only): tReadPosted is set
+    // when the completed request is handed to evb->runInEventBaseThread
+    // (DispatchAccum may buffer it briefly first); tReadPickedUp is set at
+    // the top of the lambda the IO thread's loop actually runs.
+    uint64_t tReadPosted{0};
+    uint64_t tReadPickedUp{0};
 
     // Result filled by engine thread
     Status resultStatus;
@@ -371,6 +396,7 @@ struct alignas(64) Request {
         ioOwner = nullptr;
         tArrive = tWriter = tWritten = tDurable = tReadEnqueue = 0;
         tReadDispatch = tReadDone = 0;
+        tReadPosted = tReadPickedUp = 0;
         readRequeues = 0;
         resultStatus = Status();
         resultSeqno = 0;

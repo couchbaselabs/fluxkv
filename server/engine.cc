@@ -163,8 +163,30 @@ std::string DispatcherStats::toJson() const {
                 gReadStages.magmaGetMax.load(std::memory_order_relaxed) / 1e3;
         j["read_stage_max_respond_us"] =
                 gReadStages.respondMax.load(std::memory_order_relaxed) / 1e3;
-        static const char* kReadHistNames[] = {
-                "queue_wait", "magma_get", "respond", "total"};
+        j["read_stage_mailbox_enqueue_us"] =
+                gReadStages.mailboxEnqueueNs.load(std::memory_order_relaxed) /
+                1e3 / n;
+        j["read_stage_mailbox_pickup_us"] =
+                gReadStages.mailboxPickupNs.load(std::memory_order_relaxed) /
+                1e3 / n;
+        j["read_stage_write_resp_us"] =
+                gReadStages.writeRespNs.load(std::memory_order_relaxed) / 1e3 /
+                n;
+        j["read_stage_max_mailbox_enqueue_us"] =
+                gReadStages.mailboxEnqueueMax.load(std::memory_order_relaxed) /
+                1e3;
+        j["read_stage_max_mailbox_pickup_us"] =
+                gReadStages.mailboxPickupMax.load(std::memory_order_relaxed) /
+                1e3;
+        j["read_stage_max_write_resp_us"] =
+                gReadStages.writeRespMax.load(std::memory_order_relaxed) / 1e3;
+        static const char* kReadHistNames[] = {"queue_wait",
+                                               "magma_get",
+                                               "respond",
+                                               "total",
+                                               "mailbox_enqueue",
+                                               "mailbox_pickup",
+                                               "write_resp"};
         for (int h = 0; h < ReadStageTimers::NumHist; h++) {
             auto& arr = j["read_stage_hist"][kReadHistNames[h]];
             for (int b = 0; b < ReadStageTimers::kBuckets; b++) {
@@ -641,9 +663,16 @@ class DispatchAccum {
 public:
     void Add(Request* req) {
         if (gDispatchBatch <= 1) {
+            if (gTraceLatency) {
+                req->tReadPosted = steadyNowNs();
+            }
             auto* conn = req->conn;
-            req->evb->runInEventBaseThread(
-                    [conn, req]() { conn->sendGetResponse(req); });
+            req->evb->runInEventBaseThread([conn, req]() {
+                if (gTraceLatency) {
+                    req->tReadPickedUp = steadyNowNs();
+                }
+                conn->sendGetResponse(req);
+            });
             return;
         }
         auto& vec = slotFor(req->evb);
@@ -678,7 +707,19 @@ private:
     static void post(folly::EventBase* evb, std::vector<Request*>& vec) {
         std::vector<Request*> batch;
         batch.swap(vec);
+        if (gTraceLatency) {
+            const uint64_t now = steadyNowNs();
+            for (auto* r : batch) {
+                r->tReadPosted = now;
+            }
+        }
         evb->runInEventBaseThread([batch = std::move(batch)]() mutable {
+            if (gTraceLatency) {
+                const uint64_t now = steadyNowNs();
+                for (auto* r : batch) {
+                    r->tReadPickedUp = now;
+                }
+            }
             for (auto* r : batch) {
                 r->conn->sendGetResponse(r);
             }
@@ -1282,9 +1323,16 @@ size_t ReaderPool::executeRead(ReadTask& task) {
                             : status;
             hotStatAdd(gDispStats.cmdGetRespMiss);
         }
+        if (gTraceLatency) {
+            req->tReadPosted = steadyNowNs();
+        }
         auto* conn = req->conn;
-        req->evb->runInEventBaseThread(
-                [conn, req]() { conn->sendGetResponse(req); });
+        req->evb->runInEventBaseThread([conn, req]() {
+            if (gTraceLatency) {
+                req->tReadPickedUp = steadyNowNs();
+            }
+            conn->sendGetResponse(req);
+        });
     } else {
         // Batch GetDocs, deduped by key: under zipf skew a hot key repeats
         // heavily within one batch, each repeat otherwise paying its own
