@@ -348,6 +348,8 @@ int connectTo(const std::string& host, uint16_t port) {
 // mcbp status codes the server can return. Knowing which one came back
 // matters: TmpFail means the engine applied backpressure and the load was
 // simply too heavy for the disk, while KeyNotFound means a read missed.
+constexpr uint16_t kStatusTmpFail = 0x0086;
+
 const char* statusName(uint16_t status) {
     switch (status) {
     case 0x0000:
@@ -448,6 +450,7 @@ struct LatencyHist {
 struct Result {
     uint64_t ops = 0;
     uint64_t errors = 0;
+    uint64_t retries = 0; // TmpFail'd load SETs that were resent
     std::map<uint16_t, uint64_t> statusCounts;
     LatencyHist latencies;
 };
@@ -743,6 +746,11 @@ void runConnection(const Options& opts,
     // Choosing keys at random instead leaves part of the keyspace unwritten,
     // and the misses that follow are cheap - which inflates the read rate.
     size_t setCursor = threadIndex;
+    const bool strideLoad = doSet && !gZipfOn;
+    // A TmpFail'd SET left its key unwritten; resend it before moving on, or
+    // the read pass misses those keys.
+    std::vector<size_t> keyOfSlot(opts.pipeline);
+    std::vector<size_t> retry;
     std::chrono::steady_clock::time_point nextSend{};
 
     while (!stop.load(std::memory_order_relaxed)) {
@@ -765,18 +773,24 @@ void runConnection(const Options& opts,
         }
         sendBuf.clear();
         auto batch = opts.pipeline;
-        if (doSet && !gZipfOn) {
-            if (setCursor >= opts.keys) {
+        if (strideLoad) {
+            if (setCursor >= opts.keys && retry.empty()) {
                 break; // this connection's share of the keyspace is written
             }
-            const size_t remaining = (opts.keys - setCursor + opts.conns - 1) /
-                                     opts.conns;
-            batch = std::min(batch, remaining);
+            const size_t remaining =
+                    setCursor >= opts.keys
+                            ? 0
+                            : (opts.keys - setCursor + opts.conns - 1) /
+                                      opts.conns;
+            batch = std::min(batch, remaining + retry.size());
         }
 
         for (size_t i = 0; i < batch; i++) {
             size_t keyIndex;
-            if (doSet && !gZipfOn) {
+            if (strideLoad && !retry.empty()) {
+                keyIndex = retry.back();
+                retry.pop_back();
+            } else if (strideLoad) {
                 keyIndex = setCursor;
                 setCursor += opts.conns;
             } else {
@@ -790,6 +804,7 @@ void runConnection(const Options& opts,
                           static_cast<uint32_t>(i),
                           doSet ? &value : nullptr);
             sentAt[i] = std::chrono::steady_clock::now();
+            keyOfSlot[i] = keyIndex;
         }
 
         if (!writeFully(fd, sendBuf.data(), sendBuf.size())) {
@@ -830,6 +845,9 @@ void runConnection(const Options& opts,
             result.statusCounts[status]++;
             if (status == 0) {
                 result.ops++;
+            } else if (strideLoad && status == kStatusTmpFail) {
+                retry.push_back(keyOfSlot[slot]);
+                result.retries++;
             } else {
                 result.errors++;
             }
@@ -1023,11 +1041,13 @@ int main(int argc, char** argv) {
 
     uint64_t ops = 0;
     uint64_t errors = 0;
+    uint64_t retries = 0;
     LatencyHist all;
     std::map<uint16_t, uint64_t> statusCounts;
     for (auto& r : results) {
         ops += r.ops;
         errors += r.errors;
+        retries += r.retries;
         all.merge(r.latencies);
         for (const auto& [status, count] : r.statusCounts) {
             statusCounts[status] += count;
@@ -1037,7 +1057,8 @@ int main(int argc, char** argv) {
     const double rate = (elapsed > 0) ? static_cast<double>(ops) / elapsed : 0;
 
     std::cout << "DONE ops=" << ops << " errs=" << errors << " secs="
-              << elapsed << " rate=" << static_cast<uint64_t>(rate) << "\n";
+              << elapsed << " rate=" << static_cast<uint64_t>(rate)
+              << " retries=" << retries << "\n";
     std::cout << "LAT p50=" << all.percentile(0.50) << "us"
               << " p90=" << all.percentile(0.90) << "us"
               << " p99=" << all.percentile(0.99) << "us"
@@ -1048,7 +1069,7 @@ int main(int argc, char** argv) {
 
     // Break the failures down by status. TmpFail dominating means the load
     // outran the disk, not that anything is wrong.
-    if (errors > 0) {
+    if (errors > 0 || retries > 0) {
         std::cout << "STATUS";
         for (const auto& [status, count] : statusCounts) {
             if (status != 0) {
