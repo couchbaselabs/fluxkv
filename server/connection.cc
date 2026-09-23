@@ -580,6 +580,7 @@ bool Connection::parseAndDispatch() {
                 const char* p = reinterpret_cast<const char*>(front->data());
                 std::string_view key(p + kHeaderSize + hdr.extrasLen,
                                      hdr.keyLen);
+                prefetchAhead(cache, front, totalLen);
                 CachedDoc doc;
                 size_t valueLen = 0;
                 const auto res = cache->GetCopy(hdr.specific,
@@ -630,6 +631,50 @@ bool Connection::parseAndDispatch() {
 
     dispatch(hdr, std::move(body));
     return true;
+}
+
+// Index lines are prefetched kGetPrefetchDepth requests ahead and entries
+// half that: deep enough to cover a miss at our per-GET cost, shallow enough
+// that the lines are still in L1/L2 when their GET runs.
+void Connection::prefetchAhead(DocCache* cache,
+                               const folly::IOBuf* front,
+                               size_t curLen) {
+    const uint8_t* cur = front->data();
+    const uint8_t* end = front->tail();
+    if (front != pfBuf_ || pfNext_ <= cur || pfNext_ > end) {
+        pfBuf_ = front;
+        pfNext_ = cur + curLen;
+        pfAhead_ = 0;
+    } else if (pfAhead_ > 0) {
+        pfAhead_--; // the current request was prefetched earlier
+    }
+    constexpr int kHalf = kGetPrefetchDepth / 2;
+    while (pfAhead_ < kGetPrefetchDepth &&
+           static_cast<size_t>(end - pfNext_) >= kHeaderSize) {
+        McbpHeader h;
+        std::memcpy(&h, pfNext_, kHeaderSize);
+        if (h.magic != kRequestMagic ||
+            static_cast<Opcode>(h.opcode) != Opcode::Get) {
+            break;
+        }
+        h.ntoh();
+        const size_t len = kHeaderSize + h.bodyLen;
+        if (static_cast<size_t>(end - pfNext_) < len ||
+            h.extrasLen + h.keyLen > h.bodyLen) {
+            break;
+        }
+        pfTok_[pfSeq_ % kGetPrefetchDepth] = cache->PrefetchSlot(
+                h.specific,
+                {reinterpret_cast<const char*>(pfNext_) + kHeaderSize +
+                         h.extrasLen,
+                 h.keyLen});
+        pfNext_ += len;
+        pfAhead_++;
+        if (pfAhead_ > kHalf) {
+            cache->PrefetchEntry(pfTok_[(pfSeq_ - kHalf) % kGetPrefetchDepth]);
+        }
+        pfSeq_++;
+    }
 }
 
 void Connection::dispatch(McbpHeader& hdr, std::unique_ptr<folly::IOBuf> body) {

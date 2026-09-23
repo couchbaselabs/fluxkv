@@ -122,6 +122,16 @@ private:
     // Cache fast path copies the value here under the cache lock; larger
     // values take the generic path.
     uint8_t valueScratch_[4096];
+    // Cached-GET lookahead: requests in [front data, pfNext_) of pfBuf_ have
+    // had their index line prefetched; pfAhead_ counts those not yet served.
+    // pfTok_ holds their tokens for the second-stage entry prefetch.
+    static constexpr int kGetPrefetchDepth = 8;
+    void prefetchAhead(DocCache* cache, const folly::IOBuf* front, size_t curLen);
+    const folly::IOBuf* pfBuf_{nullptr};
+    const uint8_t* pfNext_{nullptr};
+    int pfAhead_{0};
+    uint32_t pfSeq_{0};
+    uint64_t pfTok_[kGetPrefetchDepth]{};
     // In-flight send buffers awaiting writeSuccess. AsyncSocket::write() does
     // not own the data; we keep it alive here until the callback fires.
     std::list<std::vector<uint8_t>> inflightBufs_;

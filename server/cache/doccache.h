@@ -79,6 +79,19 @@ public:
     // value), or Hit with the value length written to *valueLen. A value
     // larger than bufCap reports TooLarge and the caller falls back to Get().
     enum class GetResult { Miss, Hit, Tombstone, TooLarge };
+
+    // Hints that GetCopy(vbid, key) follows soon, so pipelined GETs overlap
+    // their cache misses; no effect on results. PrefetchSlot starts the index
+    // load and returns a token; PrefetchEntry(token), issued once that load
+    // has had time to land, starts the entry load.
+    virtual uint64_t PrefetchSlot(uint16_t vbid, std::string_view key) const {
+        (void)vbid;
+        (void)key;
+        return 0;
+    }
+    virtual void PrefetchEntry(uint64_t token) const {
+        (void)token;
+    }
     virtual GetResult GetCopy(uint16_t vbid,
                               std::string_view key,
                               CachedDoc* out,

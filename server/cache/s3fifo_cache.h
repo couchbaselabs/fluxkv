@@ -34,6 +34,8 @@ public:
     bool Get(uint16_t vbid,
              std::string_view key,
              const std::function<void(const CachedDoc&)>& fn) override;
+    uint64_t PrefetchSlot(uint16_t vbid, std::string_view key) const override;
+    void PrefetchEntry(uint64_t token) const override;
     GetResult GetCopy(uint16_t vbid,
                       std::string_view key,
                       CachedDoc* out,

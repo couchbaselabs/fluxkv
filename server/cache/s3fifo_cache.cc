@@ -158,11 +158,159 @@ struct Fifo {
 };
 } // namespace
 
+// Open-addressing index from key hash to entry, linear probing with
+// backward-shift deletion. A slot is 16 bytes, so a hit touches one index
+// line and then the entry, where F14 touched its tag line, an item line and
+// the entry. Both can be prefetched from the hash alone (prefetchSlot,
+// prefetchEntry) without the shard lock: slots are atomics, and a table
+// replaced by grow() is kept until clear() so an unlocked reader never
+// touches freed memory (the retired tables together are smaller than the
+// live one).
+template <typename E>
+class FlatIndex {
+public:
+    template <typename Eq>
+    E* find(uint64_t h, Eq&& eq) const {
+        const Table* t = t_.load(std::memory_order_acquire);
+        if (t == nullptr) {
+            return nullptr;
+        }
+        for (size_t i = h & t->mask;; i = (i + 1) & t->mask) {
+            E* e = t->slots[i].e.load(std::memory_order_relaxed);
+            if (e == nullptr) {
+                return nullptr;
+            }
+            if (t->slots[i].hash.load(std::memory_order_relaxed) == h && eq(e)) {
+                return e;
+            }
+        }
+    }
+
+    // Caller guarantees the key is absent.
+    void insert(uint64_t h, E* e) {
+        Table* t = t_.load(std::memory_order_relaxed);
+        if (t == nullptr || (count_ + 1) * 10 > (t->mask + 1) * 7) {
+            t = grow(t);
+        }
+        place(*t, h, e);
+        count_++;
+    }
+
+    void erase(uint64_t h, E* e) {
+        Table* t = t_.load(std::memory_order_relaxed);
+        if (t == nullptr) {
+            return;
+        }
+        const size_t m = t->mask;
+        Slot* s = t->slots.get();
+        size_t i = h & m;
+        while (s[i].e.load(std::memory_order_relaxed) != e) {
+            if (s[i].e.load(std::memory_order_relaxed) == nullptr) {
+                return;
+            }
+            i = (i + 1) & m;
+        }
+        // Pull later members of the cluster back so no probe crosses a hole.
+        for (size_t j = (i + 1) & m;; j = (j + 1) & m) {
+            E* ej = s[j].e.load(std::memory_order_relaxed);
+            if (ej == nullptr) {
+                break;
+            }
+            const uint64_t hj = s[j].hash.load(std::memory_order_relaxed);
+            const size_t home = hj & m;
+            // Movable unless its home lies cyclically in (i, j].
+            const bool inRange = i <= j ? (home > i && home <= j)
+                                        : (home > i || home <= j);
+            if (!inRange) {
+                s[i].hash.store(hj, std::memory_order_relaxed);
+                s[i].e.store(ej, std::memory_order_relaxed);
+                i = j;
+            }
+        }
+        s[i].e.store(nullptr, std::memory_order_relaxed);
+        count_--;
+    }
+
+    void prefetchSlot(uint64_t h) const {
+        if (const Table* t = t_.load(std::memory_order_acquire)) {
+            __builtin_prefetch(&t->slots[h & t->mask]);
+        }
+    }
+
+    // Prefetch the entry a matching slot near home points at. A stale
+    // pointer only wastes the prefetch.
+    void prefetchEntry(uint64_t h) const {
+        const Table* t = t_.load(std::memory_order_acquire);
+        if (t == nullptr) {
+            return;
+        }
+        for (size_t i = h & t->mask, n = 0; n < 4; i = (i + 1) & t->mask, n++) {
+            E* e = t->slots[i].e.load(std::memory_order_relaxed);
+            if (e == nullptr) {
+                return;
+            }
+            if (t->slots[i].hash.load(std::memory_order_relaxed) == h) {
+                __builtin_prefetch(e);
+                __builtin_prefetch(reinterpret_cast<const char*>(e) + 64);
+                return;
+            }
+        }
+    }
+
+    void clear() {
+        t_.store(nullptr, std::memory_order_relaxed);
+        count_ = 0;
+        tables_.clear();
+    }
+
+private:
+    struct Slot {
+        std::atomic<uint64_t> hash{0};
+        std::atomic<E*> e{nullptr};
+    };
+    struct Table {
+        size_t mask;
+        std::unique_ptr<Slot[]> slots;
+    };
+
+    static void place(Table& t, uint64_t h, E* e) {
+        size_t i = h & t.mask;
+        while (t.slots[i].e.load(std::memory_order_relaxed) != nullptr) {
+            i = (i + 1) & t.mask;
+        }
+        t.slots[i].hash.store(h, std::memory_order_relaxed);
+        t.slots[i].e.store(e, std::memory_order_relaxed);
+    }
+
+    Table* grow(Table* old) {
+        const size_t cap = old == nullptr ? 1024 : (old->mask + 1) * 2;
+        auto fresh = std::make_unique<Table>(
+                Table{cap - 1, std::make_unique<Slot[]>(cap)});
+        if (old != nullptr) {
+            for (size_t i = 0; i <= old->mask; i++) {
+                if (E* e = old->slots[i].e.load(std::memory_order_relaxed)) {
+                    place(*fresh,
+                          old->slots[i].hash.load(std::memory_order_relaxed),
+                          e);
+                }
+            }
+        }
+        Table* t = fresh.get();
+        tables_.push_back(std::move(fresh));
+        t_.store(t, std::memory_order_release);
+        return t;
+    }
+
+    std::atomic<Table*> t_{nullptr};
+    size_t count_{0};
+    std::vector<std::unique_ptr<Table>> tables_;
+};
+
 struct S3FifoCache::Shard {
     // Shared for Get/MarkPersisted (atomic field updates only), exclusive for
     // anything that touches the map or the lists.
     mutable folly::SharedMutex mu;
-    folly::F14FastMap<std::string_view, Entry*> map;
+    FlatIndex<Entry> index;
     Fifo small;
     Fifo main;
     // Ghost queue of key hashes evicted from small. Bounded to main's item
@@ -187,6 +335,10 @@ struct S3FifoCache::Shard {
 
     size_t bytes() const {
         return small.bytes + main.bytes;
+    }
+
+    Entry* find(uint64_t h, std::string_view mk) const {
+        return index.find(h, [&](const Entry* e) { return e->mapKey() == mk; });
     }
 
     void ghostAdd(uint64_t h) {
@@ -214,11 +366,14 @@ struct S3FifoCache::Shard {
             e->queue = kSmall;
             small.pushHead(e);
         }
-        map.emplace(e->mapKey(), e);
+        index.insert(h, e);
     }
 
     void free(Entry* e) {
-        map.erase(e->mapKey());
+        index.erase(hashKey(e->vbid,
+                            std::string_view(e->data() + sizeof(uint16_t),
+                                             e->keyLen)),
+                    e);
         if (e->pending.load(std::memory_order_relaxed) > 0) {
             pendingItems.fetch_sub(1, std::memory_order_relaxed);
         }
@@ -300,7 +455,7 @@ S3FifoCache::~S3FifoCache() {
                 Entry::destroy(e);
             }
         }
-        s.map.clear();
+        s.index.clear();
     }
 }
 
@@ -343,12 +498,11 @@ bool S3FifoCache::Get(uint16_t vbid,
     MapKeyBuf mk(vbid, key);
 
     std::shared_lock lock(s.mu);
-    auto it = s.map.find(mk.view);
-    if (it == s.map.end()) {
+    Entry* e = s.find(h, mk.view);
+    if (e == nullptr) {
         gReadStats[readStatSlot()].misses.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    Entry* e = it->second;
     // Racy increments are fine: losing one is a rounding error in the
     // policy, and it saves a locked RMW on every hit.
     uint8_t f = e->freq.load(std::memory_order_relaxed);
@@ -371,6 +525,18 @@ bool S3FifoCache::Get(uint16_t vbid,
     return true;
 }
 
+uint64_t S3FifoCache::PrefetchSlot(uint16_t vbid, std::string_view key) const {
+    const uint64_t h = hashKey(vbid, key);
+    auto& s = shardFor(h);
+    __builtin_prefetch(&s.mu);
+    s.index.prefetchSlot(h);
+    return h;
+}
+
+void S3FifoCache::PrefetchEntry(uint64_t token) const {
+    shardFor(token).index.prefetchEntry(token);
+}
+
 DocCache::GetResult S3FifoCache::GetCopy(uint16_t vbid,
                                          std::string_view key,
                                          CachedDoc* out,
@@ -382,12 +548,11 @@ DocCache::GetResult S3FifoCache::GetCopy(uint16_t vbid,
     MapKeyBuf mk(vbid, key);
 
     std::shared_lock lock(s.mu);
-    auto it = s.map.find(mk.view);
-    if (it == s.map.end()) {
+    Entry* e = s.find(h, mk.view);
+    if (e == nullptr) {
         gReadStats[readStatSlot()].misses.fetch_add(1, std::memory_order_relaxed);
         return GetResult::Miss;
     }
-    Entry* e = it->second;
     const uint8_t f = e->freq.load(std::memory_order_relaxed);
     if (f < kMaxFreq) {
         e->freq.store(f + 1, std::memory_order_relaxed);
@@ -426,14 +591,12 @@ void S3FifoCache::Put(uint16_t vbid,
 
     std::unique_lock lock(s.mu);
     uint32_t carry = 0;
-    auto it = s.map.find(e->mapKey());
-    if (it != s.map.end()) {
-        Entry* old = it->second;
+    if (Entry* old = s.find(h, e->mapKey())) {
         // Writes queued for the old version are still ahead of ours in the
         // writer queue; each will call MarkPersisted, so carry them over.
         carry = old->pending.load(std::memory_order_relaxed);
         s.unlink(old);
-        s.map.erase(it);
+        s.index.erase(h, old);
         Entry::destroy(old);
     }
     e->pending.store(carry + 1, std::memory_order_relaxed);
@@ -459,7 +622,7 @@ void S3FifoCache::PutIfAbsent(uint16_t vbid,
         // Cheap reject under the shared lock; the common case after a burst
         // of misses on the same key is that the first fill already landed.
         std::shared_lock lock(s.mu);
-        if (s.map.find(mk.view) != s.map.end()) {
+        if (s.find(h, mk.view) != nullptr) {
             gReadStats[readStatSlot()].fillsRejected.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -467,7 +630,7 @@ void S3FifoCache::PutIfAbsent(uint16_t vbid,
     Entry* e = Entry::create(
             vbid, key, value, seqno, flags, expiry, datatype, false);
     std::unique_lock lock(s.mu);
-    if (s.map.find(e->mapKey()) != s.map.end()) {
+    if (s.find(h, e->mapKey()) != nullptr) {
         gReadStats[readStatSlot()].fillsRejected.fetch_add(1, std::memory_order_relaxed);
         Entry::destroy(e);
         return;
@@ -486,11 +649,10 @@ void S3FifoCache::MarkPersisted(uint16_t vbid,
     bool overBudget = false;
     {
         std::shared_lock lock(s.mu);
-        auto it = s.map.find(mk.view);
-        if (it == s.map.end()) {
+        Entry* e = s.find(h, mk.view);
+        if (e == nullptr) {
             return; // replaced and freed already; nothing left to unpin
         }
-        Entry* e = it->second;
         if (seqno != 0) {
             e->seqno.store(seqno, std::memory_order_relaxed);
         }
@@ -512,11 +674,10 @@ void S3FifoCache::Erase(uint16_t vbid, std::string_view key) {
     auto& s = shardFor(h);
     MapKeyBuf mk(vbid, key);
     std::unique_lock lock(s.mu);
-    auto it = s.map.find(mk.view);
-    if (it == s.map.end()) {
+    Entry* e = s.find(h, mk.view);
+    if (e == nullptr) {
         return;
     }
-    Entry* e = it->second;
     s.unlink(e);
     s.free(e);
 }
