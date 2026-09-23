@@ -121,6 +121,12 @@ extern size_t gMaxReadBatch;
 // dispatch and worst times any one request was requeued past kMaxReadBatch.
 extern std::atomic<uint64_t> gMaxReadQueueAgeNs;
 extern std::atomic<uint32_t> gMaxReadRequeues;
+// Per-vbucket read load (gTraceLatency only), to find hot-vbucket skew:
+// cumulative gets served and executeRead rounds spent on that vbucket.
+// Exposed via /stats/kvstores as ReadsServed/ReadRounds.
+constexpr size_t kMaxVbidStats = 1024;
+extern std::atomic<uint64_t> gVbidServed[kMaxVbidStats];
+extern std::atomic<uint64_t> gVbidRounds[kMaxVbidStats];
 
 // Write coalescing. A vbucket whose last WriteDocs finished less than
 // gWriteCoalesceNs ago and has fewer than gMinWriteBatch items queued is

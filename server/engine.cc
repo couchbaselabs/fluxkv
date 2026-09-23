@@ -41,6 +41,8 @@ DocCache* gDocCache = nullptr;
 size_t gMaxReadBatch = 128;
 std::atomic<uint64_t> gMaxReadQueueAgeNs{0};
 std::atomic<uint32_t> gMaxReadRequeues{0};
+std::atomic<uint64_t> gVbidServed[kMaxVbidStats]{};
+std::atomic<uint64_t> gVbidRounds[kMaxVbidStats]{};
 size_t gMinWriteBatch = 64;
 BatchSort gBatchSort = BatchSort::Auto;
 bool gAsyncDurable = false;
@@ -1167,6 +1169,11 @@ size_t ReaderPool::executeRead(ReadTask& task) {
             }
             atomicBumpMax(gMaxReadRequeues, req->readRequeues);
         }
+        if (task.vbid < kMaxVbidStats) {
+            gVbidServed[task.vbid].fetch_add(batch.size(),
+                                             std::memory_order_relaxed);
+            gVbidRounds[task.vbid].fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     if (batch.size() == 1) {
@@ -1492,7 +1499,11 @@ std::string Bucket::GetKVStoreStatsJson() {
                        {"NReadBytesCompact", ks.NReadBytesCompact},
                        {"NTableFiles", ks.NTableFiles},
                        {"NTablesCreated", ks.NTablesCreated},
-                       {"NTablesDeleted", ks.NTablesDeleted}});
+                       {"NTablesDeleted", ks.NTablesDeleted},
+                       {"ReadsServed",
+                        gVbidServed[vbid].load(std::memory_order_relaxed)},
+                       {"ReadRounds",
+                        gVbidRounds[vbid].load(std::memory_order_relaxed)}});
     }
     return out.dump();
 }
