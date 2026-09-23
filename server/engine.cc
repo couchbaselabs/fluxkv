@@ -1209,10 +1209,23 @@ size_t ReaderPool::executeRead(ReadTask& task) {
         req->evb->runInEventBaseThread(
                 [conn, req]() { conn->sendGetResponse(req); });
     } else {
-        // Batch GetDocs
-        OperationsList<Magma::GetOperation> getOps;
+        // Batch GetDocs, deduped by key: under skew (zipf 0.99) the same
+        // hot key repeats heavily within one batch -- one GetOperation per
+        // distinct key, and its "followers" get a copy of the same result.
+        // Without this every repeat cost a full key-index lookup and a
+        // device read of the same data block (seqIndex data blocks are not
+        // cached by policy), which is what capped a hot vbucket's rate.
+        folly::F14FastMap<std::string_view, std::vector<Request*>> byKey;
+        byKey.reserve(batch.size());
         for (auto* req : batch) {
-            getOps.Add(Magma::GetOperation(req->key, req));
+            byKey[std::string_view(
+                          reinterpret_cast<const char*>(req->key.Data()),
+                          req->key.Len())]
+                    .push_back(req);
+        }
+        OperationsList<Magma::GetOperation> getOps;
+        for (auto& [key, reqs] : byKey) {
+            getOps.Add(Magma::GetOperation(reqs.front()->key, &reqs));
         }
         thread_local DispatchAccum accum;
         shard->GetMagma()->GetDocs(
@@ -1222,47 +1235,55 @@ size_t ReaderPool::executeRead(ReadTask& task) {
                    const Magma::GetOperation& op,
                    const Slice& meta,
                    const Slice& value) {
-                    auto* req = static_cast<Request*>(op.UserContext);
-                    req->resultStatus = s;
-                    if (s.IsOK() && !s.IsOkDocNotFound()) {
-                        auto dm = DocMeta::decode(meta);
-                        req->resultFlags = dm.flags;
-                        req->resultSeqno = dm.seqno;
-                        if (value.Len() > 0) {
-                            req->responseBuf.assign(
-                                    reinterpret_cast<const uint8_t*>(
-                                            value.Data()),
-                                    reinterpret_cast<const uint8_t*>(
-                                            value.Data()) +
-                                            value.Len());
-                        }
-                        req->resultDatatype = dm.datatype;
-                        fillCache(bucket_, task.vbid, req, dm, value);
-                        hotStatAdd(gDispStats.cmdGetResp);
-                    } else {
-                        // OkDocNotFound (legitimate miss) or other error.
-                        // Force resultStatus to a non-OK so sendGetResponse
-                        // builds an mcbp KeyNotFound error rather than a
-                        // success-with-empty-value (which silently lies to
-                        // callers and skews benchmarks).
-                        if (s.IsOkDocNotFound()) {
-                            req->resultStatus = Status(Status::Code::Internal,
-                                                       "key-not-found");
-                        }
-                        hotStatAdd(gDispStats.cmdGetRespMiss);
+                    auto* reqs =
+                            static_cast<std::vector<Request*>*>(op.UserContext);
+                    bool hit = s.IsOK() && !s.IsOkDocNotFound();
+                    DocMeta dm;
+                    if (hit) {
+                        dm = DocMeta::decode(meta);
                     }
-                    // Dispatch the response as soon as THIS op completes
-                    // instead of after the whole GetDocs batch returns.
-                    // With batch=N and coroutine fanout=IOQueueDepth, an op
-                    // finishing in the first IO wave otherwise waits
-                    // ~(N/IOQueueDepth) x NVMe-latency for the last wave —
-                    // pure intra-batch head-of-line blocking that dominates
-                    // p99/p999 under load. Lifetime: magma does not touch a
-                    // GetOperation (incl. its key Slice into req->dataBuf)
-                    // after its completion callback fires, so releasing the
-                    // request from the evb thread before GetDocs returns is
-                    // safe.
-                    accum.Add(req);
+                    for (auto* req : *reqs) {
+                        req->resultStatus = s;
+                        if (hit) {
+                            req->resultFlags = dm.flags;
+                            req->resultSeqno = dm.seqno;
+                            if (value.Len() > 0) {
+                                req->responseBuf.assign(
+                                        reinterpret_cast<const uint8_t*>(
+                                                value.Data()),
+                                        reinterpret_cast<const uint8_t*>(
+                                                value.Data()) +
+                                                value.Len());
+                            }
+                            req->resultDatatype = dm.datatype;
+                            fillCache(bucket_, task.vbid, req, dm, value);
+                            hotStatAdd(gDispStats.cmdGetResp);
+                        } else {
+                            // OkDocNotFound (legitimate miss) or other error.
+                            // Force resultStatus to a non-OK so sendGetResponse
+                            // builds an mcbp KeyNotFound error rather than a
+                            // success-with-empty-value (which silently lies to
+                            // callers and skews benchmarks).
+                            if (s.IsOkDocNotFound()) {
+                                req->resultStatus = Status(
+                                        Status::Code::Internal,
+                                        "key-not-found");
+                            }
+                            hotStatAdd(gDispStats.cmdGetRespMiss);
+                        }
+                        // Dispatch the response as soon as THIS op completes
+                        // instead of after the whole GetDocs batch returns.
+                        // With batch=N and coroutine fanout=IOQueueDepth, an
+                        // op finishing in the first IO wave otherwise waits
+                        // ~(N/IOQueueDepth) x NVMe-latency for the last wave
+                        // -- pure intra-batch head-of-line blocking that
+                        // dominates p99/p999 under load. Lifetime: magma
+                        // does not touch a GetOperation (incl. its key
+                        // Slice into req->dataBuf) after its completion
+                        // callback fires, so releasing the request from the
+                        // evb thread before GetDocs returns is safe.
+                        accum.Add(req);
+                    }
                 });
         accum.FlushAll();
     }
