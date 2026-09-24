@@ -108,6 +108,34 @@ double ThreadTuner::steadyLevel(size_t n) const {
     return w[w.size() / 2];
 }
 
+// Least-squares slope of the last n steady windows, as a fraction of their
+// mean per window. A write phase decays for minutes as compaction debt
+// builds; a trial measured after its reference would read that as a loss.
+double ThreadTuner::steadySlope(size_t n) const {
+    // Only windows since the last change: earlier ones belong to another
+    // configuration, and a kept gain would read as a rising trend.
+    n = std::min({n, steadyRecent_.size(), steadySinceChange_});
+    if (n < 4) {
+        return 0;
+    }
+    const size_t off = steadyRecent_.size() - n;
+    double sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (size_t i = 0; i < n; i++) {
+        const double x = static_cast<double>(i);
+        const double y = steadyRecent_[off + i];
+        sx += x;
+        sy += y;
+        sxx += x * x;
+        sxy += x * y;
+    }
+    const double den = n * sxx - sx * sx;
+    const double mean = sy / n;
+    if (den <= 0 || mean <= 0) {
+        return 0;
+    }
+    return (n * sxy - sx * sy) / den / mean;
+}
+
 double ThreadTuner::cv(const std::vector<double>& w) const {
     if (w.size() < 3) {
         return 0;
@@ -199,6 +227,7 @@ void ThreadTuner::decide(double tput) {
         }
         if (tput > 0) {
             steadyRecent_.push_back(tput);
+            steadySinceChange_++;
         }
         if (steadyRecent_.size() > kSteadyHistory) {
             steadyRecent_.erase(steadyRecent_.begin());
@@ -416,7 +445,10 @@ bool ThreadTuner::startTrial(PoolState& ps) {
         auto want = static_cast<size_t>(std::ceil(ps.noise / cfg_.minGain));
         ps.measure = std::min<size_t>(8, std::max(ps.measure, want));
     }
-    const double level = steadyLevel(std::max(ps.measure, kLevelWindows));
+    const size_t span = std::max(ps.measure, kLevelWindows);
+    const double level = steadyLevel(span);
+    ps.refSlope = steadySlope(std::max<size_t>(span, 2 * kLevelWindows));
+    ps.refSpan = span;
     // Both judge against the current level. A shrink used to have to hold
     // the best level ever seen, but a write phase starts high and decays as
     // compaction debt builds, so shrinks were reverted against a level the
@@ -453,7 +485,13 @@ void ThreadTuner::judge(PoolState& ps, double tput) {
     const size_t step = std::max<size_t>(1, pool->Step());
     const bool grew = ps.trial == Trial::Grow;
     const size_t delta = grew ? size - ps.sizeBefore : ps.sizeBefore - size;
-    const double ratio = ps.refTput > 0 ? tput / ps.refTput : 1.0;
+    // Compare against the reference carried along the load's own trend to
+    // the trial's median window, not against where the load used to be.
+    const double offset = ps.refSpan / 2.0 + ps.windowsSinceChange -
+                          ps.tputWindows.size() / 2.0;
+    const double drift = std::clamp(1.0 + ps.refSlope * offset, 0.8, 1.2);
+    const double expected = ps.refTput * drift;
+    const double ratio = expected > 0 ? tput / expected : 1.0;
     if (ps.tputWindows.size() >= 3) {
         measuredNoise_ = cv(ps.tputWindows);
     }
@@ -500,7 +538,7 @@ void ThreadTuner::judge(PoolState& ps, double tput) {
                  pool->Name(),
                  ps.lastAction,
                  keep ? "kept" : "reverted",
-                 ps.refTput,
+                 expected,
                  tput,
                  (ratio - 1.0) * 100.0,
                  tol * 100.0,
@@ -550,6 +588,7 @@ void ThreadTuner::judge(PoolState& ps, double tput) {
     }
     ps.trial = Trial::None;
     ps.windowsSinceChange = 0;
+    steadySinceChange_ = 0;
 }
 
 std::string ThreadTuner::ToJson() const {

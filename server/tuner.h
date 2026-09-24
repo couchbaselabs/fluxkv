@@ -219,6 +219,8 @@ private:
         Trial trial{Trial::None};
         size_t sizeBefore{0};
         double refTput{0};
+        double refSlope{0}; // steady trend at the trial's start, per window
+        size_t refSpan{0}; // windows behind refTput
         double busyBefore{0};
         // Observed over projected busy after kept shrinks. A shrink projects
         // busy * size / (size - n); pools whose work gets cheaper as it
@@ -248,6 +250,7 @@ private:
     void decide(double tput);
     void closeWindow(PoolState& ps, double tput, bool steady);
     bool hasMomentum(const PoolState& ps) const;
+    double steadySlope(size_t n) const;
     bool startTrial(PoolState& ps);
     void judge(PoolState& ps, double tput);
     size_t roundToStep(size_t n, size_t step) const;
@@ -289,6 +292,7 @@ private:
     size_t stepLow_{0};
     double measuredNoise_{-1};
     static constexpr size_t kSteadyHistory = 16;
+    size_t steadySinceChange_{0}; // steady windows since the last verdict
     static constexpr size_t kLevelWindows = 4;
 };
 
