@@ -218,6 +218,11 @@ private:
         size_t sizeBefore{0};
         double refTput{0};
         double busyBefore{0};
+        // Observed over projected busy after kept shrinks. A shrink projects
+        // busy * size / (size - n); pools whose work gets cheaper as it
+        // concentrates (writers batch more docs per wake) come in under that,
+        // and the guard learns to allow the steps it would otherwise refuse.
+        double shrinkScale{1.0};
         size_t measure{0};
         double noise{0}; // steadyNoise() when the trial started
         // Per-window throughput during a trial. The verdict takes the

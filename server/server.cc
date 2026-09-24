@@ -254,6 +254,11 @@ void Server::IOPool::Reap() {
                 ++it;
                 continue;
             }
+            if (iot->holds.load(std::memory_order_relaxed) > 0) {
+                iot->emptyTicks = 0; // replies still owed on this loop
+                ++it;
+                continue;
+            }
             if (++iot->emptyTicks < 2) {
                 ++it;
                 continue;

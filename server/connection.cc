@@ -1026,7 +1026,7 @@ void Connection::handleSet(McbpHeader& hdr,
         // tuner retires a loop once its connections have migrated off.
         req->ioOwner = owner_;
         if (owner_) {
-            owner_->Reserve();
+            owner_->Hold();
         }
         if (gTraceLatency) {
             req->tArrive = steadyNowNs();
@@ -1116,7 +1116,7 @@ void Connection::handleDelete(McbpHeader& hdr,
         // tuner retires a loop once its connections have migrated off.
         req->ioOwner = owner_;
         if (owner_) {
-            owner_->Reserve();
+            owner_->Hold();
         }
         if (gTraceLatency) {
             req->tArrive = steadyNowNs();
@@ -1271,7 +1271,7 @@ void Connection::sendWriteResponse(Request* req) {
     }
     releaseRequest(req);
     if (iot) {
-        iot->Unreserve();
+        iot->Release();
     }
     if (outstandingRequests_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         onDrained();

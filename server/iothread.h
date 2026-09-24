@@ -60,6 +60,17 @@ struct IOThread {
     void Unreserve() {
         pending.fetch_sub(1, std::memory_order_relaxed);
     }
+    // Durable writes waiting on this loop for their reply. They keep it
+    // from being reaped, but are not connections: counting them as
+    // reservations kept the pool from ever looking settled under durable
+    // load and stopped retiring loops from being re-planned.
+    std::atomic<int> holds{0};
+    void Hold() {
+        holds.fetch_add(1, std::memory_order_relaxed);
+    }
+    void Release() {
+        holds.fetch_sub(1, std::memory_order_relaxed);
+    }
 
     void Start() {
         auto* e = evb.get();

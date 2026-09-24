@@ -306,13 +306,16 @@ bool ThreadTuner::startTrial(PoolState& ps) {
 
     // A quarter of the pool, halved after each failure, never below a step.
     size_t n = std::max(step, roundToStep(size / 4, step));
-    // While a pegged pool keeps every step it is given, escalate: reaching
-    // the working size from a small start otherwise costs a trial per
-    // quarter, and each trial pays settle plus measure windows. Capped at
-    // doubling, and dir.cap below still bounds a retry after a revert.
-    if (wantGrow && dir.keptStreak >= cfg_.rampAfterKept &&
-        busy >= cfg_.rampBusy) {
-        const size_t mult = dir.keptStreak >= cfg_.rampAfterKept + 1 ? 4 : 2;
+    // While a pool keeps every step it is given, escalate: reaching the
+    // working size otherwise costs a trial per quarter, and each trial pays
+    // settle plus measure windows. A grow escalates only while pegged; a
+    // shrink while its kept steps hold throughput. dir.cap below still bounds
+    // a retry after a revert.
+    if (dir.keptStreak >= cfg_.rampAfterKept &&
+        (!wantGrow || busy >= cfg_.rampBusy)) {
+        // A shrink stops at half the pool per step.
+        const size_t mult =
+                wantGrow && dir.keptStreak >= cfg_.rampAfterKept + 1 ? 4 : 2;
         n = std::max(n, roundToStep(size / 4 * mult, step));
     }
     if (dir.cap > 0) {
@@ -323,12 +326,16 @@ bool ThreadTuner::startTrial(PoolState& ps) {
     } else {
         n = std::min(n, size - ps.bounds.min);
         // Do not shrink into the range that would just ask to grow again,
-        // unless growing has already been shown not to help.
+        // unless growing has already been shown not to help. The projection
+        // is scaled by what earlier shrinks of this pool actually did: taken
+        // as constant work it held 96 durable writers, batching 4 docs a
+        // wake, for 15 minutes.
         if (ps.grow.backoff == 0) {
-            while (n > step && busy * size / (size - n) >= cfg_.highBusy) {
+            const double b = busy * ps.shrinkScale;
+            while (n > step && b * size / (size - n) >= cfg_.highBusy) {
                 n -= step;
             }
-            if (busy * size / (size - n) >= cfg_.highBusy) {
+            if (b * size / (size - n) >= cfg_.highBusy) {
                 return false;
             }
         }
@@ -433,6 +440,13 @@ void ThreadTuner::judge(PoolState& ps, double tput) {
     ps.lastAction += keep ? " kept" : " reverted";
 
     Direction& dir = grew ? ps.grow : ps.shrink;
+    if (keep && !grew && ps.busyBefore >= cfg_.idleBusy && size > 0) {
+        const double projected = ps.busyBefore * ps.sizeBefore / size;
+        if (projected > 0) {
+            const double seen = std::clamp(ps.last.busyMean / projected, 0.1, 1.0);
+            ps.shrinkScale = 0.5 * ps.shrinkScale + 0.5 * seen;
+        }
+    }
     if (keep) {
         dir.cap = 0;
         dir.nextBackoff = 0;

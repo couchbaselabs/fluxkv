@@ -340,7 +340,7 @@ struct alignas(64) Request {
     // For routing response back to connection
     Connection* conn{nullptr};
     folly::EventBase* evb{nullptr};
-    // Durable mode only: the IO thread evb belongs to, reserved while this
+    // Durable mode only: the IO thread evb belongs to, held while this
     // request is parked waiting for durability. Without the reservation the
     // tuner can retire that loop once its connections have migrated away
     // and destroy the EventBase this request still points at.

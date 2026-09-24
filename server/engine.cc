@@ -575,9 +575,9 @@ void Shard::durableLoop() {
             }
         }
 
-        // Each parked request holds a reservation on the loop it will be
+        // Each parked request holds the loop it will be
         // answered on, so the loop cannot be retired underneath us. The
-        // reservation is dropped on that loop, after the response.
+        // hold is dropped on that loop, after the response.
         // Post in slices: answering tens of thousands of requests in one
         // callback keeps that loop from reading its sockets for the whole
         // run of them.
