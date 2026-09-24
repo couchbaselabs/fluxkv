@@ -214,6 +214,29 @@ void ThreadTuner::decide(double tput) {
             ps.windowsSinceChange < cfg_.maxSettleWindows) {
             return;
         }
+        if (tput <= 0) {
+            // No load, so nothing to judge a change against (the gap between
+            // a load and the next phase read as a -100% verdict and cost a
+            // backoff). Measure again once load returns; undo the change,
+            // with no backoff, if it does not.
+            ps.tputWindows.clear();
+            ps.settledWindows = 0;
+            if (ps.windowsSinceChange > cfg_.maxSettleWindows) {
+                const size_t size = ps.pool->Size();
+                if (ps.trial == Trial::Grow) {
+                    ps.pool->Shrink(size - ps.sizeBefore);
+                } else {
+                    ps.pool->Grow(ps.sizeBefore - size);
+                }
+                spdlog::info("tuner: {} {} abandoned (no load)",
+                             ps.pool->Name(),
+                             ps.lastAction);
+                ps.lastAction += " abandoned";
+                ps.trial = Trial::None;
+                ps.windowsSinceChange = 0;
+            }
+            return;
+        }
         if (++ps.settledWindows > cfg_.settleWindows) {
             ps.tputWindows.push_back(tput);
             if (ps.tputWindows.size() >= ps.measure) {
