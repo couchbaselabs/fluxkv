@@ -75,6 +75,9 @@ struct Options {
     size_t startkey = 0;
     // Spread consecutive key indices across the key order (see scrambleIndex).
     bool scramble = false;
+    // SET picks keys uniformly at random (sustained overwrite) instead of the
+    // one-pass stride.
+    bool random = false;
     // Zipf skew for key selection. 0 = uniform. Higher values concentrate
     // more of the load on fewer keys.
     double zipf = 0.0;
@@ -665,7 +668,7 @@ void runConnectionWindow(const Options& opts,
     size_t have = 0;
     // As in runConnection: a SET without -zipf is a one-pass stride, so an
     // insert-only run never rewrites a key. TmpFail'd keys are not resent.
-    const bool strideLoad = doSet && !gZipfOn;
+    const bool strideLoad = doSet && !gZipfOn && !opts.random;
     size_t setCursor = threadIndex;
 
     while (!stop.load(std::memory_order_relaxed)) {
@@ -782,7 +785,7 @@ void runConnection(const Options& opts,
     // Choosing keys at random instead leaves part of the keyspace unwritten,
     // and the misses that follow are cheap - which inflates the read rate.
     size_t setCursor = threadIndex;
-    const bool strideLoad = doSet && !gZipfOn;
+    const bool strideLoad = doSet && !gZipfOn && !opts.random;
     // A TmpFail'd SET left its key unwritten; resend it before moving on, or
     // the read pass misses those keys.
     std::vector<size_t> keyOfSlot(opts.pipeline);
@@ -929,6 +932,7 @@ void usage(const char* prog) {
                "one-pass stride load to sustained random writes\n"
             << "  -startkey N       add N to every key index, e.g. to insert past a preloaded set (default 0)\n"
             << "  -scramble         spread key indices across the key order (bijective), so a stride load or insert is uniform over the keyspace\n"
+            << "  -random           with -mode set: uniform random keys (sustained overwrite) instead of the one-pass stride\n"
             << "  -seed N           RNG seed (default 1)\n"
             << "  -rate N           paced load, total ops/s across connections "
                "(default 0: closed loop); use with a small -pipeline for "
@@ -995,6 +999,8 @@ int main(int argc, char** argv) {
             opts.startkey = std::stoull(next());
         } else if (arg == "-scramble") {
             opts.scramble = true;
+        } else if (arg == "-random") {
+            opts.random = true;
         } else if (arg == "-seed") {
             opts.seed = std::stoull(next());
         } else if (arg == "-runtime") {
