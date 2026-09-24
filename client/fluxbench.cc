@@ -71,6 +71,10 @@ struct Options {
     // link saturates: at 8-byte values the request IS mostly key and header.
     // 0 keeps the original variable-length keys.
     size_t keylen = 0;
+    // Added to every key index, so a run can write keys past a preloaded set.
+    size_t startkey = 0;
+    // Spread consecutive key indices across the key order (see scrambleIndex).
+    bool scramble = false;
     // Zipf skew for key selection. 0 = uniform. Higher values concentrate
     // more of the load on fewer keys.
     double zipf = 0.0;
@@ -114,6 +118,20 @@ uint16_t vbucketFor(const std::string& key, uint16_t vbuckets) {
 }
 
 size_t gKeyLen = 0;
+size_t gStartKey = 0;
+bool gScramble = false;
+
+// Bijection on [0, 2^39): 2^39 < 10^12, so a 12-digit key still holds every
+// value. Without it a stride load writes keys in sorted order, which makes an
+// insert-only run an append at the end of the key range.
+uint64_t scrambleIndex(uint64_t x) {
+    constexpr uint64_t kMask = (uint64_t(1) << 39) - 1;
+    x = (x * 0x9E3779B97F4A7C15ULL) & kMask;
+    x ^= x >> 19;
+    x = (x * 0xBF58476D1CE4E5B9ULL) & kMask;
+    x ^= x >> 17;
+    return x;
+}
 
 // Zipf-distributed key selection over [0, n).
 //
@@ -179,6 +197,10 @@ inline size_t pickKey(const Options& opts, std::mt19937_64& rng) {
 }
 
 std::string keyFor(size_t index) {
+    index += gStartKey;
+    if (gScramble) {
+        index = scrambleIndex(index);
+    }
     if (gKeyLen == 0) {
         return "key_" + std::to_string(index);
     }
@@ -641,13 +663,27 @@ void runConnectionWindow(const Options& opts,
     std::vector<uint8_t> sendBuf;
     std::vector<uint8_t> rx(1 << 20);
     size_t have = 0;
+    // As in runConnection: a SET without -zipf is a one-pass stride, so an
+    // insert-only run never rewrites a key. TmpFail'd keys are not resent.
+    const bool strideLoad = doSet && !gZipfOn;
+    size_t setCursor = threadIndex;
 
     while (!stop.load(std::memory_order_relaxed)) {
         if (!freed.empty()) {
             sendBuf.clear();
             const auto now = std::chrono::steady_clock::now();
             for (uint32_t slot : freed) {
-                const std::string key = keyFor(pickKey(opts, rng));
+                size_t keyIndex;
+                if (strideLoad) {
+                    if (setCursor >= opts.keys) {
+                        break;
+                    }
+                    keyIndex = setCursor;
+                    setCursor += opts.conns;
+                } else {
+                    keyIndex = pickKey(opts, rng);
+                }
+                const std::string key = keyFor(keyIndex);
                 appendRequest(sendBuf,
                               doSet ? kOpSet : kOpGet,
                               key,
@@ -891,6 +927,8 @@ void usage(const char* prog) {
             << "  -zipf THETA       Zipf key selection (e.g. 0.99); default "
                "uniform. With -mode set this also switches SET from the "
                "one-pass stride load to sustained random writes\n"
+            << "  -startkey N       add N to every key index, e.g. to insert past a preloaded set (default 0)\n"
+            << "  -scramble         spread key indices across the key order (bijective), so a stride load or insert is uniform over the keyspace\n"
             << "  -seed N           RNG seed (default 1)\n"
             << "  -rate N           paced load, total ops/s across connections "
                "(default 0: closed loop); use with a small -pipeline for "
@@ -953,6 +991,10 @@ int main(int argc, char** argv) {
             opts.randvals = true;
         } else if (arg == "-rate") {
             opts.rate = std::stod(next());
+        } else if (arg == "-startkey") {
+            opts.startkey = std::stoull(next());
+        } else if (arg == "-scramble") {
+            opts.scramble = true;
         } else if (arg == "-seed") {
             opts.seed = std::stoull(next());
         } else if (arg == "-runtime") {
@@ -989,6 +1031,12 @@ int main(int argc, char** argv) {
     std::vector<Result> results(opts.conns);
     std::vector<std::thread> threads;
     gKeyLen = opts.keylen;
+    gStartKey = opts.startkey;
+    gScramble = opts.scramble;
+    if (gScramble && gKeyLen != 0 && gKeyLen < 12) {
+        std::cerr << "-scramble needs -keylen 0 or >= 12\n";
+        return 2;
+    }
     if (opts.zipf > 0.0) {
         // Summing the series over the whole key space takes a few seconds at
         // 100M+ keys, so do it once here rather than per connection.
