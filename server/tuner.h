@@ -247,6 +247,7 @@ private:
     void sample(double wallSec);
     void decide(double tput);
     void closeWindow(PoolState& ps, double tput, bool steady);
+    bool hasMomentum(const PoolState& ps) const;
     bool startTrial(PoolState& ps);
     void judge(PoolState& ps, double tput);
     size_t roundToStep(size_t n, size_t step) const;

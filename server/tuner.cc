@@ -157,8 +157,25 @@ bool ThreadTuner::rampingUp() const {
             ps.pool->Size() < ps.bounds.max) {
             return true;
         }
+        if (hasMomentum(ps)) {
+            return true;
+        }
     }
     return false;
+}
+
+// The pool's last trial raised throughput and it can keep going the same
+// way: its next step is the likeliest gain on offer.
+bool ThreadTuner::hasMomentum(const PoolState& ps) const {
+    if (ps.trial != Trial::None) {
+        return false;
+    }
+    const size_t size = ps.pool->Size();
+    return ps.lastTrialGrew
+                   ? ps.grow.lastGained && ps.grow.backoff == 0 &&
+                             size < ps.bounds.max
+                   : ps.shrink.lastGained && ps.shrink.backoff == 0 &&
+                             size > ps.bounds.min;
 }
 
 void ThreadTuner::decide(double tput) {
@@ -267,8 +284,17 @@ void ThreadTuner::decide(double tput) {
         }
     }
 
-    // One change per window, pools taken in turn. A pool rests one window
-    // after a kept change before moving again.
+    // A pool whose last step gained goes next, without the rest window:
+    // taking turns with pools that had nothing to gain held 96 writers
+    // 7-9 minutes short of their working size, the tuner's whole gap to the
+    // best fixed count.
+    for (auto& ps : pools_) {
+        if (hasMomentum(ps) && ps.windowsSinceChange >= 1 && startTrial(ps)) {
+            return;
+        }
+    }
+    // Otherwise one change per window, pools taken in turn. A pool rests one
+    // window after a kept change before moving again.
     for (size_t i = 0; i < pools_.size(); i++) {
         auto& ps = pools_[(nextPool_ + i) % pools_.size()];
         if (ps.windowsSinceChange >= 2 && startTrial(ps)) {
