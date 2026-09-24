@@ -225,6 +225,8 @@ private:
         // concentrates (writers batch more docs per wake) come in under that,
         // and the guard learns to allow the steps it would otherwise refuse.
         double shrinkScale{1.0};
+        // Direction of the last judged trial.
+        bool lastTrialGrew{false};
         size_t measure{0};
         double noise{0}; // steadyNoise() when the trial started
         // Per-window throughput during a trial. The verdict takes the

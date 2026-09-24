@@ -317,11 +317,18 @@ bool ThreadTuner::startTrial(PoolState& ps) {
     // Direction: busy threads ask for more; otherwise probe fewer. The probe
     // also runs on a busy pool once growing it has failed - the limit is
     // elsewhere, so the threads may not all be needed however busy they look.
-    const bool wantGrow = busy > cfg_.highBusy && ps.grow.backoff == 0 &&
-                          size < ps.bounds.max;
-    const bool wantShrink = !wantGrow && ps.shrink.backoff == 0 &&
-                            size > ps.bounds.min &&
-                            (busy <= cfg_.highBusy || ps.grow.backoff > 0);
+    // A pool pegged by a queue that never drains looks busy at any size, so
+    // busy cannot say whether more threads help. Once a grow of it has been
+    // reverted, probe fewer instead: 96 non-durable writers only ever grew,
+    // to 120-160, while 32 were 10-13% faster.
+    const bool probeShrink = busy > cfg_.highBusy && ps.lastTrialGrew &&
+                             !ps.grow.lastGained && ps.shrink.backoff == 0 &&
+                             size > ps.bounds.min;
+    const bool wantGrow = !probeShrink && busy > cfg_.highBusy &&
+                          ps.grow.backoff == 0 && size < ps.bounds.max;
+    const bool wantShrink =
+            !wantGrow && ps.shrink.backoff == 0 && size > ps.bounds.min &&
+            (busy <= cfg_.highBusy || ps.grow.backoff > 0 || probeShrink);
     if (!wantGrow && !wantShrink) {
         return false;
     }
@@ -355,7 +362,7 @@ bool ThreadTuner::startTrial(PoolState& ps) {
         // (durable writers got busier with every step from 96 and faster
         // too). The projection is scaled by what earlier shrinks of this
         // pool actually did.
-        if (ps.grow.backoff == 0 && !dir.lastGained) {
+        if (ps.grow.backoff == 0 && !dir.lastGained && !probeShrink) {
             const double b = busy * ps.shrinkScale;
             while (n > step && b * size / (size - n) >= cfg_.highBusy) {
                 n -= step;
@@ -451,7 +458,12 @@ void ThreadTuner::judge(PoolState& ps, double tput) {
         // shrink "kept" on a 124% gain in a write-only load.
         keep = true;
     } else if (grew) {
-        keep = ratio >= 1.0 + tol;
+        // The verdict compares two medians, each with its own error: a gain
+        // counts at about two standard errors of their difference. At one,
+        // noisy non-durable loads kept grows on noise (+5-11% under 6-18%).
+        const double margin =
+                std::max(cfg_.minGain, 2.0 * std::sqrt(2.0) * tol);
+        keep = ratio >= 1.0 + margin;
     } else {
         const double allow = std::max(cfg_.maxLoss, std::min(tol, 0.02));
         keep = ratio >= 1.0 - allow && streakRatio >= 1.0 - allow;
@@ -478,6 +490,7 @@ void ThreadTuner::judge(PoolState& ps, double tput) {
         }
     }
     dir.lastGained = keep && ratio >= 1.0 + tol;
+    ps.lastTrialGrew = grew;
     if (keep) {
         dir.cap = 0;
         dir.nextBackoff = 0;
