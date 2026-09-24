@@ -19,11 +19,19 @@ namespace kvserver {
 extern std::atomic<int64_t> gMailDepth;
 
 class Connection;
+struct Request;
+// Defined in engine.cc: drops a loop from the durable notifier's wake list.
+void UnregisterDurableLoop(struct IOThread* t);
 
 // One event loop and the connections pinned to it. The connection list is
 // owned by the loop thread; other threads read only the atomic count and
 // post work to the EventBase.
 struct IOThread {
+    ~IOThread() {
+        if (durableRegistered.load(std::memory_order_acquire)) {
+            UnregisterDurableLoop(this);
+        }
+    }
     std::unique_ptr<folly::EventBase> evb;
     std::thread thread;
     clockid_t cpuClock{};
@@ -125,6 +133,15 @@ struct IOThread {
     std::mutex mailMu;
     std::vector<std::function<void()>> mail;
     std::atomic<bool> hasMail{false};
+
+    // Async-durable writes answered on this loop once the shared log covers
+    // their Request::durableLsn. Writers push chains through Request::hook;
+    // the loop moves them to parkedLocal and answers the covered ones.
+    std::atomic<Request*> parkedHead{nullptr};
+    std::atomic<int64_t> parkedCount{0};
+    std::atomic<bool> durableWakeQueued{false};
+    std::atomic<bool> durableRegistered{false};
+    std::vector<Request*> parkedLocal; // loop thread only
 
     // CPU time consumed by the loop thread so far. The loop blocks in
     // epoll_wait when idle, so this is exactly its busy time.

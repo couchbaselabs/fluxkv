@@ -370,6 +370,8 @@ struct alignas(64) Request {
     // Result filled by engine thread
     Status resultStatus;
     uint64_t resultSeqno{0};
+    // Async-durable: log position that must be durable before the reply.
+    uint64_t durableLsn{0};
     uint32_t resultFlags{0};
     uint8_t resultDatatype{0}; // stored datatype (GET)
     // GET result value copied from FetchBuffer. std::vector with capacity
@@ -400,6 +402,7 @@ struct alignas(64) Request {
         readRequeues = 0;
         resultStatus = Status();
         resultSeqno = 0;
+        durableLsn = 0;
         resultFlags = 0;
         responseBuf.clear(); // preserve capacity for reuse
     }
@@ -863,6 +866,7 @@ private:
     std::string echoGetValue_;
     std::unique_ptr<DocCache> cache_;
     std::vector<std::unique_ptr<Shard>> shards_;
+    std::unique_ptr<class DurableNotifier> durableNotifier_;
     // Per-shard pools live inside each Shard now (sharded). Bucket holds
     // no global pools — EnqueueRead/StageWrite route to the shard's own.
 };

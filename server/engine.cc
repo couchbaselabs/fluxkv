@@ -298,6 +298,189 @@ Shard::~Shard() {
     }
 }
 
+// Async-durable completion. A writer stamps each request with the log
+// position its batch ended at and parks it on the IO loop that answers it;
+// the batch's queue bytes go into a ledger. One thread waits on the shared
+// log's durable watermark and, each time it moves, releases the ledger up to
+// it and wakes only the loops holding parked requests. This replaces a
+// completion thread per shard that regrouped every batch by loop and posted
+// a closure per slice, which cost the IO threads twice their non-durable CPU
+// per write and added ~2 ms before the response.
+class DurableNotifier {
+public:
+    DurableNotifier(std::vector<Magma*> magmas, Bucket* bucket)
+        : magmas_(std::move(magmas)), bucket_(bucket) {
+    }
+    ~DurableNotifier() {
+        Stop();
+    }
+    void Start() {
+        thread_ = std::thread([this]() { run(); });
+    }
+    void Stop() {
+        if (thread_.joinable()) {
+            stop_.store(true, std::memory_order_release);
+            thread_.join();
+        }
+    }
+    uint64_t Durable() const {
+        return magmas_[0]->GetWALDurableLSN();
+    }
+    // Writer: hand one loop its share of a batch, linked first..last.
+    void Park(IOThread* t, Request* first, Request* last, int64_t n) {
+        Request* head = t->parkedHead.load(std::memory_order_relaxed);
+        do {
+            last->hook.next = head;
+        } while (!t->parkedHead.compare_exchange_weak(
+                head, first, std::memory_order_release,
+                std::memory_order_relaxed));
+        t->parkedCount.fetch_add(n, std::memory_order_release);
+        if (!t->durableRegistered.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> g(loopsMu_);
+            if (!t->durableRegistered.load(std::memory_order_relaxed)) {
+                loops_.push_back(t);
+                t->durableRegistered.store(true, std::memory_order_release);
+            }
+        }
+    }
+    // Writer: the batch's queue budget, released once `lsn` is durable.
+    void AddBytes(uint64_t lsn, size_t bytes) {
+        {
+            std::lock_guard<std::mutex> g(ledgerMu_);
+            ledger_.push_back({lsn, bytes});
+        }
+        parkGen_.fetch_add(1, std::memory_order_release);
+    }
+    void Unregister(IOThread* t) {
+        std::lock_guard<std::mutex> g(loopsMu_);
+        loops_.erase(std::remove(loops_.begin(), loops_.end(), t),
+                     loops_.end());
+    }
+
+private:
+    uint64_t maxTail() const {
+        uint64_t m = 0;
+        for (auto* mg : magmas_) {
+            m = std::max(m, mg->GetWALTailLSN());
+        }
+        return m;
+    }
+    void release(uint64_t durable) {
+        size_t bytes = 0;
+        {
+            std::lock_guard<std::mutex> g(ledgerMu_);
+            size_t kept = 0;
+            for (auto& e : ledger_) {
+                if (e.lsn <= durable) {
+                    bytes += e.bytes;
+                } else {
+                    ledger_[kept++] = e;
+                }
+            }
+            ledger_.resize(kept);
+        }
+        if (bytes) {
+            bucket_->queuedBytes_.fetch_sub(bytes, std::memory_order_relaxed);
+        }
+    }
+    void wake() {
+        std::lock_guard<std::mutex> g(loopsMu_);
+        for (auto* t : loops_) {
+            if (t->parkedCount.load(std::memory_order_acquire) > 0 &&
+                !t->durableWakeQueued.exchange(true,
+                                               std::memory_order_acq_rel)) {
+                t->Post([t]() { DrainDurable(t); });
+            }
+        }
+    }
+    void run() {
+        pthread_setname_np(pthread_self(), "fx:durwake");
+        uint64_t lastD = 0, lastG = 0;
+        for (;;) {
+            const bool stopping = stop_.load(std::memory_order_acquire);
+            const uint64_t g = parkGen_.load(std::memory_order_acquire);
+            const uint64_t d = Durable();
+            if (d != lastD || g != lastG) {
+                release(d);
+                wake();
+                lastD = d;
+                lastG = g;
+            }
+            if (stopping) {
+                return;
+            }
+            if (maxTail() > d) {
+                // Something committed is not durable yet: the log's
+                // flushers will publish it, and this returns when they do.
+                magmas_[0]->AwaitWALDurable(d + 1);
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+        }
+    }
+
+    struct Entry {
+        uint64_t lsn;
+        size_t bytes;
+    };
+    std::vector<Magma*> magmas_;
+    Bucket* bucket_;
+    std::thread thread_;
+    std::atomic<bool> stop_{false};
+    std::atomic<uint64_t> parkGen_{0};
+    std::mutex ledgerMu_;
+    std::vector<Entry> ledger_;
+    std::mutex loopsMu_;
+    std::vector<IOThread*> loops_;
+
+public:
+    // Loop thread: answer every parked request the log now covers.
+    static void DrainDurable(IOThread* t);
+};
+
+namespace {
+// Set in Bucket::Open, cleared in Bucket::Close; writers and loops read it.
+std::atomic<DurableNotifier*> gDurableNotifier{nullptr};
+} // namespace
+
+void UnregisterDurableLoop(IOThread* t) {
+    if (auto* n = gDurableNotifier.load(std::memory_order_acquire)) {
+        n->Unregister(t);
+    }
+}
+
+void DurableNotifier::DrainDurable(IOThread* t) {
+    t->durableWakeQueued.store(false, std::memory_order_release);
+    for (Request* r = t->parkedHead.exchange(nullptr, std::memory_order_acquire);
+         r;) {
+        Request* next = r->hook.next;
+        t->parkedLocal.push_back(r);
+        r = next;
+    }
+    auto* n = gDurableNotifier.load(std::memory_order_acquire);
+    if (!n || t->parkedLocal.empty()) {
+        return;
+    }
+    const uint64_t durable = n->Durable();
+    const uint64_t now = gTraceLatency ? steadyNowNs() : 0;
+    size_t kept = 0, done = 0;
+    for (auto* r : t->parkedLocal) {
+        if (r->durableLsn <= durable) {
+            r->tDurable = now;
+            r->conn->sendWriteResponse(r);
+            done++;
+        } else {
+            t->parkedLocal[kept++] = r;
+        }
+    }
+    t->parkedLocal.resize(kept);
+    if (done) {
+        hotStatAdd(gDispStats.cmdSetResp, done);
+        t->parkedCount.fetch_sub(static_cast<int64_t>(done),
+                                 std::memory_order_acq_rel);
+    }
+}
+
 void Shard::durableLoop() {
     pthread_setname_np(pthread_self(), "fx:durable");
     for (;;) {
@@ -969,13 +1152,51 @@ size_t WriterPool::executePersist(PersistTask& task) {
         // is left is the log reaching disk, and one thread can wait for
         // that on behalf of every writer. queuedBytes_ is released there,
         // so the write-queue limit bounds acknowledged-pending bytes.
-        Shard::PendingDurable p;
-        p.lsn = shard->GetMagma()->GetWALTailLSN();
-        p.status = status;
-        p.bytes = batchBytes;
-        p.reqs = std::move(batch);
-        const size_t written = p.reqs.size();
-        shard->AwaitDurable(std::move(p));
+        const uint64_t lsn = shard->GetMagma()->GetWALTailLSN();
+        const size_t written = batch.size();
+        if (auto* dn = gDurableNotifier.load(std::memory_order_acquire)) {
+            // Group by answering loop so each loop gets one CAS per batch.
+            std::vector<Request*> orphans;
+            for (auto* req : batch) {
+                req->durableLsn = lsn;
+            }
+            std::sort(batch.begin(), batch.end(), [](Request* a, Request* b) {
+                return a->ioOwner < b->ioOwner;
+            });
+            for (size_t i = 0; i < batch.size();) {
+                IOThread* t = batch[i]->ioOwner;
+                size_t j = i;
+                while (j + 1 < batch.size() && batch[j + 1]->ioOwner == t) {
+                    batch[j]->hook.next = batch[j + 1];
+                    j++;
+                }
+                if (t) {
+                    dn->Park(
+                            t, batch[i], batch[j], static_cast<int64_t>(j - i + 1));
+                } else {
+                    orphans.insert(orphans.end(), batch.begin() + i,
+                                   batch.begin() + j + 1);
+                }
+                i = j + 1;
+            }
+            if (!orphans.empty()) {
+                // No IO loop to park on: the shard's completion thread answers.
+                Shard::PendingDurable p;
+                p.lsn = lsn;
+                p.status = status;
+                p.bytes = 0;
+                p.reqs = std::move(orphans);
+                shard->AwaitDurable(std::move(p));
+            }
+            dn->AddBytes(lsn, batchBytes);
+        } else {
+            Shard::PendingDurable p;
+            p.lsn = lsn;
+            p.status = status;
+            p.bytes = batchBytes;
+            p.reqs = std::move(batch);
+            shard->AwaitDurable(std::move(p));
+        }
         batch.clear();
         releaseVBQueueAfterWrite(vbq, shard, task.vbid, *this);
         return written;
@@ -1512,6 +1733,16 @@ Status Bucket::Open() {
     spdlog::info("Pre-created {} kvstores across {} shards",
                  numVBuckets_,
                  numShards_);
+    if (gAsyncDurable && durable_ && !durableNotifier_) {
+        std::vector<Magma*> magmas;
+        for (auto& shard : shards_) {
+            magmas.push_back(shard->GetMagma());
+        }
+        durableNotifier_ = std::make_unique<DurableNotifier>(magmas, this);
+        gDurableNotifier.store(durableNotifier_.get(),
+                               std::memory_order_release);
+        durableNotifier_->Start();
+    }
     return Status::OK();
 }
 
@@ -1560,6 +1791,12 @@ void Bucket::Close() {
         if (auto* r = shard->GetReaderPool()) {
             r->Shutdown();
         }
+    }
+    // After the writers have drained (the ledger is released by now) and
+    // before magma closes under it.
+    if (durableNotifier_) {
+        gDurableNotifier.store(nullptr, std::memory_order_release);
+        durableNotifier_->Stop();
     }
     // Shards are independent magma instances; closing them one after
     // another took over a second each and left the process alive 10 s past
