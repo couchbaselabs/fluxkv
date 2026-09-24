@@ -327,11 +327,12 @@ bool ThreadTuner::startTrial(PoolState& ps) {
     } else {
         n = std::min(n, size - ps.bounds.min);
         // Do not shrink into the range that would just ask to grow again,
-        // unless growing has already been shown not to help. The projection
-        // is scaled by what earlier shrinks of this pool actually did: taken
-        // as constant work it held 96 durable writers, batching 4 docs a
-        // wake, for 15 minutes.
-        if (ps.grow.backoff == 0) {
+        // unless growing has already been shown not to help, or the last
+        // shrink raised throughput: then busy is not what limits this pool
+        // (durable writers got busier with every step from 96 and faster
+        // too). The projection is scaled by what earlier shrinks of this
+        // pool actually did.
+        if (ps.grow.backoff == 0 && !dir.lastGained) {
             const double b = busy * ps.shrinkScale;
             while (n > step && b * size / (size - n) >= cfg_.highBusy) {
                 n -= step;
