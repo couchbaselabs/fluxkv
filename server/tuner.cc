@@ -309,10 +309,11 @@ bool ThreadTuner::startTrial(PoolState& ps) {
     // While a pool keeps every step it is given, escalate: reaching the
     // working size otherwise costs a trial per quarter, and each trial pays
     // settle plus measure windows. A grow escalates only while pegged; a
-    // shrink while its kept steps hold throughput. dir.cap below still bounds
-    // a retry after a revert.
+    // shrink only while its last kept step raised throughput, i.e. the pool
+    // is past its working size, not merely able to lose a thread. dir.cap
+    // below still bounds a retry after a revert.
     if (dir.keptStreak >= cfg_.rampAfterKept &&
-        (!wantGrow || busy >= cfg_.rampBusy)) {
+        (wantGrow ? busy >= cfg_.rampBusy : dir.lastGained)) {
         // A shrink stops at half the pool per step.
         const size_t mult =
                 wantGrow && dir.keptStreak >= cfg_.rampAfterKept + 1 ? 4 : 2;
@@ -359,7 +360,12 @@ bool ThreadTuner::startTrial(PoolState& ps) {
         ps.measure = std::min<size_t>(8, std::max(ps.measure, want));
     }
     const double level = steadyLevel(std::max(ps.measure, kLevelWindows));
-    ps.refTput = wantGrow ? level : std::max(steadyBest_, level);
+    // Both judge against the current level. A shrink used to have to hold
+    // the best level ever seen, but a write phase starts high and decays as
+    // compaction debt builds, so shrinks were reverted against a level the
+    // load no longer offered; the streak reference still stops a run of
+    // small losses from adding up.
+    ps.refTput = level;
     ps.busyBefore = busy;
     ps.tputWindows.clear();
     ps.windowsSinceChange = 0;
@@ -447,6 +453,7 @@ void ThreadTuner::judge(PoolState& ps, double tput) {
             ps.shrinkScale = 0.5 * ps.shrinkScale + 0.5 * seen;
         }
     }
+    dir.lastGained = keep && ratio >= 1.0 + tol;
     if (keep) {
         dir.cap = 0;
         dir.nextBackoff = 0;

@@ -198,6 +198,8 @@ private:
         // ramping, not searching, so the step escalates; any revert
         // resets it and the halving search takes over.
         size_t keptStreak{0};
+        // The last kept move raised throughput beyond the noise.
+        bool lastGained{false};
         // Throughput before the first move of the current streak. Each move
         // is judged against it as well as against the last level, so a run
         // of moves that each lose a little cannot add up to a large loss:
