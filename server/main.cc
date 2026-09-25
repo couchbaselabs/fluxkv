@@ -171,6 +171,7 @@ struct Config {
     int lsdLevels = 0;
     bool lsdTieredL0 = false;
     double memLwmRatio = 0;
+    double writeCacheRatio = 0; // 0 keeps magma's default
     bool tuneWritersOnly = false;
     std::string tunePools; // empty = all
     std::string blockCachePolicy;
@@ -293,6 +294,9 @@ static void printUsage(const char* prog) {
                  "direct IO the reads bypass the page cache (magma default 0: "
                  "buffered fd, kernel readahead)\n"
               << "  --no-index-compression  override --index-compression-lz4\n"
+              << "  --write-cache-ratio R  share of the block+write cache budget given "
+                 "to the write cache (magma default 0.2); the block cache gets the "
+                 "rest, so with --write-cache fixed this shrinks only the block cache\n"
               << "  --mem-lwm-ratio R    share of --mem-quota for the block cache "
                  "and write cache; the rest is the bloom filter quota (magma "
                  "default 0.2)\n"
@@ -400,6 +404,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"read-ahead", required_argument, nullptr, 1081},
             {"tune-pools", required_argument, nullptr, 1083},
             {"block-cache-policy", required_argument, nullptr, 1084},
+            {"write-cache-ratio", required_argument, nullptr, 1099},
             {"no-index-compression", no_argument, nullptr, 1082},
             {"lsm-level0-tables", required_argument, nullptr, 1055},
             {"lsm-min-compact-size", required_argument, nullptr, 1056},
@@ -611,6 +616,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1078:
             cfg.lsdTieredL0 = true;
+            break;
+        case 1099:
+            cfg.writeCacheRatio = std::stod(optarg);
             break;
         case 1079:
             cfg.memLwmRatio = std::stod(optarg);
@@ -858,6 +866,9 @@ int main(int argc, char* argv[]) {
     }
     if (cfg.readAhead > 0) {
         magmaCfg.ReadAheadSize = cfg.readAhead;
+    }
+    if (cfg.writeCacheRatio > 0) {
+        magmaCfg.WriteCacheRatio = cfg.writeCacheRatio;
     }
     if (cfg.memLwmRatio > 0) {
         magmaCfg.MemoryQuotaLowWaterMarkRatio = cfg.memLwmRatio;
