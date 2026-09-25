@@ -18,6 +18,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -670,12 +671,32 @@ void runConnectionWindow(const Options& opts,
     // insert-only run never rewrites a key. TmpFail'd keys are not resent.
     const bool strideLoad = doSet && !gZipfOn && !opts.random;
     size_t setCursor = threadIndex;
+    // Open loop (-rate with -window): requests go out on a fixed schedule and
+    // latency counts from the scheduled time, so one slow response neither
+    // holds back later sends (batch mode's ceiling is conns * pipeline / tail)
+    // nor hides the queueing behind it.
+    const bool paced = opts.rate > 0;
+    const auto interval =
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(
+                            static_cast<double>(opts.conns) / opts.rate));
+    auto nextSend = std::chrono::steady_clock::now();
 
     while (!stop.load(std::memory_order_relaxed)) {
-        if (!freed.empty()) {
+        const auto tick = std::chrono::steady_clock::now();
+        size_t due = freed.size();
+        if (paced) {
+            due = 0;
+            for (auto t = nextSend; due < freed.size() && t <= tick;
+                 t += interval) {
+                due++;
+            }
+        }
+        if (due > 0) {
             sendBuf.clear();
-            const auto now = std::chrono::steady_clock::now();
-            for (uint32_t slot : freed) {
+            size_t sent = 0;
+            for (; sent < due; sent++) {
+                const uint32_t slot = freed[freed.size() - 1 - sent];
                 size_t keyIndex;
                 if (strideLoad) {
                     if (setCursor >= opts.keys) {
@@ -693,12 +714,38 @@ void runConnectionWindow(const Options& opts,
                               vbucketFor(key, opts.vbuckets),
                               slot,
                               doSet ? &value : nullptr);
-                sentAt[slot] = now;
+                if (paced) {
+                    sentAt[slot] = nextSend;
+                    nextSend += interval;
+                } else {
+                    sentAt[slot] = tick;
+                }
             }
-            freed.clear();
-            if (!writeFully(fd, sendBuf.data(), sendBuf.size())) {
+            freed.resize(freed.size() - sent);
+            if (strideLoad && setCursor >= opts.keys) {
+                freed.clear();
+            }
+            if (!sendBuf.empty() &&
+                !writeFully(fd, sendBuf.data(), sendBuf.size())) {
                 result.errors++;
                 break;
+            }
+        }
+        if (paced && !freed.empty()) {
+            // Sleep until the next send is due unless a response lands first.
+            // Never fall into a blocking recv here: nothing may be in flight.
+            const auto wait = nextSend - std::chrono::steady_clock::now();
+            if (wait.count() <= 0) {
+                continue;
+            }
+            const auto ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(wait)
+                            .count();
+            timespec ts{static_cast<time_t>(ns / 1000000000),
+                        static_cast<long>(ns % 1000000000)};
+            pollfd pfd{fd, POLLIN, 0};
+            if (::ppoll(&pfd, 1, &ts, nullptr) <= 0) {
+                continue;
             }
         }
         if (have == rx.size()) {
@@ -934,7 +981,7 @@ void usage(const char* prog) {
             << "  -scramble         spread key indices across the key order (bijective), so a stride load or insert is uniform over the keyspace\n"
             << "  -random           with -mode set: uniform random keys (sustained overwrite) instead of the one-pass stride\n"
             << "  -seed N           RNG seed (default 1)\n"
-            << "  -rate N           paced load, total ops/s across connections "
+            << "  -rate N           paced load, total ops/s across connections (with -window: open loop, latency from the scheduled send time) "
                "(default 0: closed loop); use with a small -pipeline for "
                "latency at a fixed rate\n"
             << "  -runtime Ns       run duration in seconds (default 30s)\n";
@@ -1022,10 +1069,6 @@ int main(int argc, char** argv) {
     if (opts.mode != "get" && opts.mode != "set") {
         std::cerr << "-mode must be get or set\n";
         return 2;
-    }
-    if (opts.window && opts.rate > 0) {
-        std::cerr << "-window is closed loop; it does not combine with -rate\n";
-        return 1;
     }
     if (opts.conns == 0 || opts.pipeline == 0 || opts.keys == 0) {
         std::cerr << "-conns, -pipeline and -keys must be non-zero\n";
