@@ -8,6 +8,7 @@
 #include "include/libmagma/operations.h"
 
 #include <folly/container/F14Map.h>
+#include <jemalloc/jemalloc.h>
 #include <folly/container/F14Set.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -219,6 +220,20 @@ std::string DispatcherStats::toJson() const {
     j["paused_conns"] = gPausedConns.load(std::memory_order_relaxed);
     j["resp_pending_bytes"] = gRespPendingBytes.load(std::memory_order_relaxed);
     j["mail_depth"] = gMailDepth.load(std::memory_order_relaxed);
+    // Every allocation goes through jemalloc (alloc.cc), so these account for
+    // the whole heap: resident minus allocated is what it holds unpurged.
+    {
+        uint64_t epoch = 1;
+        size_t len = sizeof(epoch);
+        je_mallctl("epoch", &epoch, &len, &epoch, len);
+        for (const char* k : {"allocated", "active", "resident", "retained", "mapped"}) {
+            size_t v = 0;
+            len = sizeof(v);
+            if (je_mallctl((std::string("stats.") + k).c_str(), &v, &len, nullptr, 0) == 0) {
+                j[std::string("jemalloc_") + k] = v;
+            }
+        }
+    }
     if (gExtraStatsJson) {
         std::string extra;
         gExtraStatsJson(extra);
