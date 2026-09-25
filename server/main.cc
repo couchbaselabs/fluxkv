@@ -95,6 +95,7 @@ struct Config {
     bool noCompression = false; // SSTables write & read uncompressed
     bool indexCompressionLZ4 = false; // keep LZ4 on index blocks only
     bool noValuePtrRead = false; // disable magma's value-pointer fast path
+    bool learnedSeqLocator = false; // seqIndex blocks located by a learned model
     // Sets SeqTreeBlockSize ONLY -- the data blocks holding document values.
     // KeyTreeBlockSize stays at magma's 4096 default: shrinking it too adds
     // key-index reads (IO/GET 1.13 -> 1.35) and cost 7-11% throughput.
@@ -230,6 +231,8 @@ static void printUsage(const char* prog) {
                  "(data/compacted follow --no-compression)\n"
               << "  --no-value-ptr-read   disable magma's value-pointer "
                  "fast path (forces a full seqIndex lookup per GET)\n"
+              << "  --learned-seq-locator locate seqIndex data blocks with a "
+                 "learned model instead of the index blocks\n"
               << "  --cache-size N        document cache budget in bytes "
                  "(default 0 = off); write-through, read-fill\n"
               << "  --cache-shards N      lock shards in the cache (default "
@@ -363,6 +366,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"no-compression", no_argument, nullptr, 1007},
             {"index-compression-lz4", no_argument, nullptr, 1012},
             {"no-value-ptr-read", no_argument, nullptr, 1013},
+            {"learned-seq-locator", no_argument, nullptr, 1100},
             {"data-block-size", required_argument, nullptr, 1008},
             {"dispatch-batch", required_argument, nullptr, 1018},
             {"cache-size", required_argument, nullptr, 1020},
@@ -508,6 +512,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1013:
             cfg.noValuePtrRead = true;
+            break;
+        case 1100:
+            cfg.learnedSeqLocator = true;
             break;
         case 1008:
             cfg.dataBlockSize = strtoull(optarg, nullptr, 10);
@@ -784,6 +791,12 @@ int main(int argc, char* argv[]) {
     // isolates how much of the read path it actually saves.
     if (cfg.noValuePtrRead) {
         magmaCfg.EnableValuePtrRead = false;
+    }
+    // Point lookups that miss the value pointer reach a seqIndex data block
+    // through the model rather than its index blocks, which then need no
+    // cache space for gets.
+    if (cfg.learnedSeqLocator) {
+        magmaCfg.EnableLearnedSeqIndexLocator = true;
     }
     if (cfg.dataBlockSize > 0) {
         magmaCfg.SeqTreeBlockSize = cfg.dataBlockSize;
