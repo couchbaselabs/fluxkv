@@ -80,6 +80,13 @@ if(FLUXKV_BUILD_SERVER)
                           -Wl,--end-group)
     set_target_properties(cache_test PROPERTIES
                           BUILD_RPATH "${CBMAGMA_RPATH}")
+
+    # DocMeta's on-disk forms; header-only, so it needs only the includes.
+    add_executable(metadata_test tests/metadata_test.cc)
+    target_include_directories(metadata_test PRIVATE
+                               "${CMAKE_CURRENT_SOURCE_DIR}/server"
+                               ${CBMAGMA_INCLUDE_DIRS})
+    target_compile_definitions(metadata_test PRIVATE ${CBMAGMA_DEFINITIONS})
 endif()
 
 add_executable(fluxbench client/fluxbench.cc)
