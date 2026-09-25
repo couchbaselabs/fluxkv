@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 #include <map>
 #include <random>
 #include <string>
@@ -52,6 +53,12 @@ struct Options {
     size_t keys = 1000000;
     uint16_t vbuckets = 256;
     size_t valsize = 1024;
+    // Per-key value sizes, "uniform:MIN:MAX" or "bimodal:SMALL:LARGE:FRAC";
+    // empty keeps every value at valsize. A key keeps its size across
+    // overwrites, so the stored data set does not drift.
+    std::string valdist;
+    size_t valMin = 0, valMax = 0;
+    double valLargeFrac = 0;
     std::string mode = "get";
     bool randvals = false;
     uint64_t seed = 1;
@@ -240,16 +247,35 @@ uint32_t getU32(const uint8_t* p) {
     return ntohl(v);
 }
 
+// Size of key `keyIndex`'s value under -valdist; valsize without it.
+size_t valueLenFor(const Options& opts, size_t keyIndex) {
+    if (opts.valdist.empty()) {
+        return opts.valsize;
+    }
+    uint64_t x = keyIndex + 0x9E3779B97F4A7C15ull; // splitmix64
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    x ^= x >> 31;
+    if (opts.valdist[0] == 'u') {
+        return opts.valMin + x % (opts.valMax - opts.valMin + 1);
+    }
+    return double(x >> 11) / double(1ull << 53) < opts.valLargeFrac
+                   ? opts.valMax
+                   : opts.valMin;
+}
+
 // Appends one mcbp request. GET carries just the key; SET carries 8 bytes of
-// extras (flags, expiry) followed by key and value.
+// extras (flags, expiry) followed by key and the first `valueLen` bytes of
+// `value`.
 void appendRequest(std::vector<uint8_t>& out,
                    uint8_t opcode,
                    const std::string& key,
                    uint16_t vbucket,
                    uint32_t opaque,
-                   const std::string* value) {
+                   const std::string* value,
+                   size_t valueLen = 0) {
     const size_t extrasLen = (opcode == kOpSet) ? 8 : 0;
-    const size_t valueLen = value ? value->size() : 0;
+    valueLen = value ? (valueLen ? valueLen : value->size()) : 0;
     const size_t bodyLen = extrasLen + key.size() + valueLen;
 
     uint8_t h[kHeaderSize] = {};
@@ -270,7 +296,7 @@ void appendRequest(std::vector<uint8_t>& out,
     }
     out.insert(out.end(), key.begin(), key.end());
     if (value) {
-        out.insert(out.end(), value->begin(), value->end());
+        out.insert(out.end(), value->begin(), value->begin() + valueLen);
     }
 }
 
@@ -548,13 +574,15 @@ std::vector<uint8_t> buildBuffer(const Options& opts,
     std::vector<uint8_t> buf;
     buf.reserve(batch * (kHeaderSize + 24 + (doSet ? opts.valsize : 0)));
     for (size_t i = 0; i < batch; i++) {
-        const std::string key = keyFor(pickKey(opts, rng));
+        const size_t keyIndex = pickKey(opts, rng);
+        const std::string key = keyFor(keyIndex);
         appendRequest(buf,
                       doSet ? kOpSet : kOpGet,
                       key,
                       vbucketFor(key, opts.vbuckets),
                       static_cast<uint32_t>(i),
-                      value);
+                      value,
+                      valueLenFor(opts, keyIndex));
     }
     return buf;
 }
@@ -580,7 +608,7 @@ void runConnectionPregen(const Options& opts,
     const size_t batch = opts.batch ? opts.batch : opts.pipeline;
     std::string value;
     if (opts.mode == "set") {
-        value.resize(opts.valsize);
+        value.resize(std::max(opts.valsize, opts.valMax));
         if (opts.randvals) {
             for (auto& c : value) {
                 c = static_cast<char>(rng() & 0xFF);
@@ -647,7 +675,7 @@ void runConnectionWindow(const Options& opts,
     const bool doSet = (opts.mode == "set");
     std::string value;
     if (doSet) {
-        value.resize(opts.valsize);
+        value.resize(std::max(opts.valsize, opts.valMax));
         if (opts.randvals) {
             for (auto& c : value) {
                 c = static_cast<char>(rng() & 0xFF);
@@ -713,7 +741,8 @@ void runConnectionWindow(const Options& opts,
                               key,
                               vbucketFor(key, opts.vbuckets),
                               slot,
-                              doSet ? &value : nullptr);
+                              doSet ? &value : nullptr,
+                              valueLenFor(opts, keyIndex));
                 if (paced) {
                     sentAt[slot] = nextSend;
                     nextSend += interval;
@@ -812,7 +841,7 @@ void runConnection(const Options& opts,
     // incompressible, which matters when comparing compression settings.
     std::string value;
     if (doSet) {
-        value.resize(opts.valsize);
+        value.resize(std::max(opts.valsize, opts.valMax));
         if (opts.randvals) {
             for (auto& c : value) {
                 c = static_cast<char>(rng() & 0xFF);
@@ -888,7 +917,8 @@ void runConnection(const Options& opts,
                           key,
                           vbucketFor(key, opts.vbuckets),
                           static_cast<uint32_t>(i),
-                          doSet ? &value : nullptr);
+                          doSet ? &value : nullptr,
+                          valueLenFor(opts, keyIndex));
             sentAt[i] = std::chrono::steady_clock::now();
             keyOfSlot[i] = keyIndex;
         }
@@ -968,6 +998,9 @@ void usage(const char* prog) {
             << "  -vbuckets N       vbucket count, must match the server "
                "(default 256)\n"
             << "  -valsize N        value size in bytes for set (default 1024)\n"
+            << "  -valdist D        per-key value sizes: uniform:MIN:MAX or "
+               "bimodal:SMALL:LARGE:FRAC (FRAC of keys LARGE); a key keeps its "
+               "size across overwrites\n"
             << "  -mode get|set     operation (default get)\n"
             << "  -user U           SASL PLAIN user; unset skips the "
                "handshake entirely (default: unset)\n"
@@ -1034,6 +1067,26 @@ int main(int argc, char** argv) {
             opts.vbuckets = static_cast<uint16_t>(std::stoi(next()));
         } else if (arg == "-valsize") {
             opts.valsize = std::stoul(next());
+        } else if (arg == "-valdist") {
+            opts.valdist = next();
+            std::vector<std::string> f;
+            std::stringstream ss(opts.valdist);
+            for (std::string t; std::getline(ss, t, ':');) {
+                f.push_back(t);
+            }
+            const bool uni = f.size() == 3 && f[0] == "uniform";
+            const bool bi = f.size() == 4 && f[0] == "bimodal";
+            if (!uni && !bi) {
+                std::cerr << "-valdist: uniform:MIN:MAX or bimodal:SMALL:LARGE:FRAC\n";
+                return 1;
+            }
+            opts.valMin = std::stoul(f[1]);
+            opts.valMax = std::stoul(f[2]);
+            opts.valLargeFrac = bi ? std::stod(f[3]) : 0;
+            if (opts.valMin > opts.valMax) {
+                std::cerr << "-valdist: MIN above MAX\n";
+                return 1;
+            }
         } else if (arg == "-mode") {
             opts.mode = next();
         } else if (arg == "-zipf") {
