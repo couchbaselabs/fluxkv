@@ -978,10 +978,14 @@ size_t WriterPool::executePersist(PersistTask& task) {
     auto* shard = task.shard;
     auto& vbq = shard->GetVBWriteQueue(task.vbid);
 
-    // Sweep all pending items for this vb
+    // One chain only: sweep() can append a later chain, and the single
+    // reverse below would then put its writes ahead of older ones, so the
+    // dedupe kept an older write over a newer one to the same key (a lost
+    // delete or update). What arrives meanwhile stays queued and re-arms
+    // the vbucket in releaseVBQueueAfterWrite.
     std::vector<Request*> batch;
     batch.reserve(256);
-    vbq.list.sweep([&](Request* req) { batch.push_back(req); });
+    vbq.list.sweepOnce([&](Request* req) { batch.push_back(req); });
     vbq.pending.fetch_sub(static_cast<uint32_t>(batch.size()),
                           std::memory_order_relaxed);
 
