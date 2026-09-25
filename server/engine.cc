@@ -8,13 +8,18 @@
 #include "include/libmagma/operations.h"
 
 #include <folly/container/F14Map.h>
-#include <jemalloc/jemalloc.h>
 #include <folly/container/F14Set.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+
+// Not <jemalloc/jemalloc.h>: its malloc/free/mallocx macros would make folly's
+// inline allocator helpers in this file disagree with every other file's
+// (sized frees against the wrong size class), which corrupts the heap.
+extern "C" int je_mallctl(const char* name, void* oldp, size_t* oldlenp,
+                          void* newp, size_t newlen);
 
 namespace magma {
 namespace kvserver {
