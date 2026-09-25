@@ -49,6 +49,7 @@ ReadStageTimers gReadStages;
 size_t gMinWriteBatch = 64;
 BatchSort gBatchSort = BatchSort::Auto;
 bool gAsyncDurable = false;
+bool gCompactMeta = false;
 bool gTraceLatency = false;
 StageTimers gStages;
 int gDurableSpinIters = 4000;
@@ -1079,9 +1080,12 @@ size_t WriterPool::executePersist(PersistTask& task) {
     std::vector<Magma::WriteOperation> ops;
     ops.reserve(batch.size());
     size_t batchBytes = 0;
-    // DocMeta is packed and written to disk as-is, so the vector's storage
-    // is the encoded form: one allocation per batch, not a string per op.
+    // A legacy DocMeta is written as-is, so the vector's storage is the
+    // encoded form; the compact form gets one buffer per batch. Either way
+    // one allocation per batch, not a string per op, alive until WriteDocs.
     std::vector<DocMeta> metas(batch.size());
+    std::vector<char> compactMetas(
+            gCompactMeta ? batch.size() * DocMeta::kMaxCompactSize : 0);
     const uint64_t cas =
             std::chrono::system_clock::now().time_since_epoch().count();
 
@@ -1102,6 +1106,10 @@ size_t WriterPool::executePersist(PersistTask& task) {
 
         batchBytes += req->key.Len() + req->value.Len() + sizeof(Request);
         Slice meta(reinterpret_cast<const char*>(&dm), sizeof(DocMeta));
+        if (gCompactMeta) {
+            char* slot = compactMetas.data() + i * DocMeta::kMaxCompactSize;
+            meta = Slice(slot, dm.encodeCompact(slot));
+        }
 
         if (req->opcode == static_cast<uint8_t>(Opcode::Delete)) {
             ops.push_back(Magma::WriteOperation::NewDocDelete(req->key, meta));

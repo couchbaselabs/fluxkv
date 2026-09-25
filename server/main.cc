@@ -1,5 +1,6 @@
 #include "engine.h"
 #include "include/libmagma/magma.h"
+#include "include/libmagma/storage_format_version.h"
 #include "metadata.h"
 #include "server.h"
 
@@ -96,6 +97,7 @@ struct Config {
     bool indexCompressionLZ4 = false; // keep LZ4 on index blocks only
     bool noValuePtrRead = false; // disable magma's value-pointer fast path
     bool learnedSeqLocator = false; // seqIndex blocks located by a learned model
+    bool compactMeta = false; // write DocMeta in its compact form
     // Sets SeqTreeBlockSize ONLY -- the data blocks holding document values.
     // KeyTreeBlockSize stays at magma's 4096 default: shrinking it too adds
     // key-index reads (IO/GET 1.13 -> 1.35) and cost 7-11% throughput.
@@ -233,6 +235,8 @@ static void printUsage(const char* prog) {
                  "fast path (forces a full seqIndex lookup per GET)\n"
               << "  --learned-seq-locator locate seqIndex data blocks with a "
                  "learned model instead of the index blocks\n"
+              << "  --compact-meta        write document metadata in the "
+                 "compact form (needs magma storage format 2)\n"
               << "  --cache-size N        document cache budget in bytes "
                  "(default 0 = off); write-through, read-fill\n"
               << "  --cache-shards N      lock shards in the cache (default "
@@ -367,6 +371,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"index-compression-lz4", no_argument, nullptr, 1012},
             {"no-value-ptr-read", no_argument, nullptr, 1013},
             {"learned-seq-locator", no_argument, nullptr, 1100},
+            {"compact-meta", no_argument, nullptr, 1101},
             {"data-block-size", required_argument, nullptr, 1008},
             {"dispatch-batch", required_argument, nullptr, 1018},
             {"cache-size", required_argument, nullptr, 1020},
@@ -515,6 +520,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1100:
             cfg.learnedSeqLocator = true;
+            break;
+        case 1101:
+            cfg.compactMeta = true;
             break;
         case 1008:
             cfg.dataBlockSize = strtoull(optarg, nullptr, 10);
@@ -797,6 +805,19 @@ int main(int argc, char* argv[]) {
     // cache space for gets.
     if (cfg.learnedSeqLocator) {
         magmaCfg.EnableLearnedSeqIndexLocator = true;
+    }
+    // Magma stamps each tree with its storage format and refuses newer ones,
+    // so tying compact metas to format 2 keeps binaries that cannot read them
+    // from opening the data at all.
+    if (cfg.compactMeta) {
+        if (magma::GetStorageFormatVersion() < 2) {
+            spdlog::error("--compact-meta needs magma storage format 2, this "
+                          "build has {}",
+                          magma::GetStorageFormatVersion());
+            return 1;
+        }
+        kvserver::gCompactMeta = true;
+        spdlog::info("  compact-meta: writing compact document metadata");
     }
     if (cfg.dataBlockSize > 0) {
         magmaCfg.SeqTreeBlockSize = cfg.dataBlockSize;

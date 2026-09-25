@@ -169,6 +169,9 @@ inline uint64_t steadyNowNs() {
 }
 
 extern bool gAsyncDurable;
+// Write metas in DocMeta's compact form. Old binaries cannot read it, so main
+// only sets this when magma's storage format keeps them off the data.
+extern bool gCompactMeta;
 // Per-stage timing of the durable write path, off by default: it costs four
 // clock reads per request. Sums and counts only - the shape of the mean is
 // enough to say which hop to remove.
