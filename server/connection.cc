@@ -25,6 +25,18 @@ size_t flushBytes() {
     }();
     return v;
 }
+
+// A queued write's body is a slice of the connection's 64 KB read buffer, and
+// holding it pins the whole buffer until the write is persisted: 1 KB SETs
+// spread over many vbucket batches kept 8 GB of read buffers alive under
+// load. A body that shares or oversizes its buffer is copied out instead.
+std::unique_ptr<folly::IOBuf> ownBody(std::unique_ptr<folly::IOBuf> body) {
+    body->coalesce();
+    if (body->isShared() || body->capacity() > 2 * body->length()) {
+        return folly::IOBuf::copyBuffer(body->data(), body->length());
+    }
+    return body;
+}
 } // namespace
 
 
@@ -987,7 +999,7 @@ void Connection::handleSet(McbpHeader& hdr,
             memcpy(req->inlineData, body->data(), body->length());
             p = req->inlineData;
         } else {
-            req->dataBuf = std::move(body);
+            req->dataBuf = ownBody(std::move(body));
             p = reinterpret_cast<const char*>(req->dataBuf->data());
         }
 
@@ -1088,8 +1100,7 @@ void Connection::handleDelete(McbpHeader& hdr,
     req->cas = hdr.cas;
 
     if (body) {
-        body->coalesce();
-        req->dataBuf = std::move(body);
+        req->dataBuf = ownBody(std::move(body));
         const char* p = reinterpret_cast<const char*>(req->dataBuf->data());
         req->key = Slice(p + hdr.extrasLen, hdr.keyLen);
     }
