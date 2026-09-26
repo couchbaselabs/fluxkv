@@ -1225,8 +1225,16 @@ void Connection::handleGet(McbpHeader& hdr,
 
     if (body) {
         body->coalesce();
-        req->dataBuf = std::move(body);
-        const char* p = reinterpret_cast<const char*>(req->dataBuf->data());
+        const char* p;
+        // A split that drains the read queue takes its whole 64 KB buffer, so
+        // holding the body pinned one buffer per in-flight GET (2.4 GB at T2).
+        if (body->length() <= Request::kInlineData) {
+            memcpy(req->inlineData, body->data(), body->length());
+            p = req->inlineData;
+        } else {
+            req->dataBuf = ownBody(std::move(body));
+            p = reinterpret_cast<const char*>(req->dataBuf->data());
+        }
         // GET has no extras, body is just key
         req->key = Slice(p + hdr.extrasLen, hdr.keyLen);
     }
