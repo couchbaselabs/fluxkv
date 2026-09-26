@@ -96,6 +96,7 @@ struct Config {
     bool noCompression = false; // SSTables write & read uncompressed
     bool indexCompressionLZ4 = false; // keep LZ4 on index blocks only
     bool noValuePtrRead = false; // disable magma's value-pointer fast path
+    bool noValuePtrWrite = false; // store no value pointers in the key index
     bool learnedSeqLocator = false; // seqIndex blocks located by a learned model
     bool compactMeta = false; // write DocMeta in its compact form
     // Sets SeqTreeBlockSize ONLY -- the data blocks holding document values.
@@ -233,6 +234,8 @@ static void printUsage(const char* prog) {
                  "(data/compacted follow --no-compression)\n"
               << "  --no-value-ptr-read   disable magma's value-pointer "
                  "fast path (forces a full seqIndex lookup per GET)\n"
+              << "  --no-value-ptr-write  store no value pointers in the key "
+                 "index (smaller leaves; pair with --learned-seq-locator)\n"
               << "  --learned-seq-locator locate seqIndex data blocks with a "
                  "learned model instead of the index blocks\n"
               << "  --compact-meta        write document metadata in the "
@@ -372,6 +375,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"no-value-ptr-read", no_argument, nullptr, 1013},
             {"learned-seq-locator", no_argument, nullptr, 1100},
             {"compact-meta", no_argument, nullptr, 1101},
+            {"no-value-ptr-write", no_argument, nullptr, 1102},
             {"data-block-size", required_argument, nullptr, 1008},
             {"dispatch-batch", required_argument, nullptr, 1018},
             {"cache-size", required_argument, nullptr, 1020},
@@ -523,6 +527,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1101:
             cfg.compactMeta = true;
+            break;
+        case 1102:
+            cfg.noValuePtrWrite = true;
             break;
         case 1008:
             cfg.dataBlockSize = strtoull(optarg, nullptr, 10);
@@ -799,6 +806,9 @@ int main(int argc, char* argv[]) {
     // isolates how much of the read path it actually saves.
     if (cfg.noValuePtrRead) {
         magmaCfg.EnableValuePtrRead = false;
+    }
+    if (cfg.noValuePtrWrite) {
+        magmaCfg.EnableValuePtrWrite = false;
     }
     // Point lookups that miss the value pointer reach a seqIndex data block
     // through the model rather than its index blocks, which then need no
