@@ -447,7 +447,11 @@ void Server::Start() {
                 } else if (strstr(buf, "/compact")) {
                     auto t0 = std::chrono::steady_clock::now();
                     try {
-                        bucket_->CompactAll();
+                        // /compact/key: key index only, which keeps value
+                        // pointers (a seqIndex rewrite invalidates them).
+                        bucket_->CompactAll(strstr(buf, "/compact/key")
+                                                    ? Magma::StoreType::Key
+                                                    : Magma::StoreType::All);
                         auto sec = std::chrono::duration<double>(
                                            std::chrono::steady_clock::now() - t0)
                                            .count();

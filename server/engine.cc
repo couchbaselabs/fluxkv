@@ -1843,7 +1843,7 @@ void Bucket::Close() {
     }
 }
 
-void Bucket::CompactAll() {
+void Bucket::CompactAll(Magma::StoreType type) {
     // Walk every kvstore (one per vbucket) on every shard and trigger a
     // full compaction. The Magma::CompactKVStore API blocks until the
     // compaction finishes, so we run them in parallel across shards
@@ -1851,13 +1851,13 @@ void Bucket::CompactAll() {
     std::vector<std::thread> workers;
     workers.reserve(numShards_);
     for (uint16_t s = 0; s < numShards_; s++) {
-        workers.emplace_back([this, s]() {
+        workers.emplace_back([this, s, type]() {
             for (uint16_t vb = s; vb < numVBuckets_; vb += numShards_) {
                 auto& shard = *shards_[s];
                 if (!shard.IsKVStoreCreated(vb)) {
                     continue;
                 }
-                shard.GetMagma()->CompactKVStore(vb, Magma::StoreType::All);
+                shard.GetMagma()->CompactKVStore(vb, type);
             }
         });
     }

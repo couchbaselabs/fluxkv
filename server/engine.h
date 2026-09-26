@@ -835,7 +835,7 @@ public:
 
     // Trigger full compaction of every kvstore (all shards × all vbuckets).
     // Synchronous — returns when every compaction finishes.
-    void CompactAll();
+    void CompactAll(Magma::StoreType type = Magma::StoreType::All);
 
     size_t NumShards() const {
         return numShards_;
