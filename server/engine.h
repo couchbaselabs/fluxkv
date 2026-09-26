@@ -381,6 +381,8 @@ struct alignas(64) Request {
     // preserved across reset() — the Connection-local Request pool reuses
     // this buffer, so steady-state value-size workloads incur zero allocs.
     std::vector<uint8_t> responseBuf;
+    // Set on the head of a chain handed to Shard::RecycleRequests.
+    uint32_t chainLen{0};
 
     // Reset to default state for pool reuse. Cheap — no heap frees beyond
     // releasing dataBuf/responseBuf, which usually came from coalesce/move.
@@ -603,18 +605,34 @@ public:
     // requests. Only called when gAsyncDurable.
     void AwaitDurable(PendingDurable&& p);
 
+    // Capped by the Requests held, not by chains: the pool only bridges
+    // recycle and reuse, and chains left over when a write phase ended kept
+    // 2.1 GB pooled for good. chain->chainLen is the chain's length.
+    static constexpr int64_t kMaxFreeRequests = 1 << 14;
     bool RecycleRequests(Request* chain) {
-        return freeRequests_.write(chain);
+        const int64_t n = chain->chainLen;
+        if (freeRequestCount_.fetch_add(n, std::memory_order_relaxed) + n >
+                    kMaxFreeRequests ||
+            !freeRequests_.write(chain)) {
+            freeRequestCount_.fetch_sub(n, std::memory_order_relaxed);
+            return false;
+        }
+        return true;
     }
     Request* TakeRequests() {
         Request* r{nullptr};
-        return freeRequests_.read(r) ? r : nullptr;
+        if (!freeRequests_.read(r)) {
+            return nullptr;
+        }
+        freeRequestCount_.fetch_sub(r->chainLen, std::memory_order_relaxed);
+        return r;
     }
 
 private:
     uint16_t shardId_;
     std::unique_ptr<Magma> magma_;
     folly::MPMCQueue<Request*> freeRequests_;
+    std::atomic<int64_t> freeRequestCount_{0};
     // Batches acknowledged when the shared log reaches their LSN.
     std::mutex durableMu_;
     std::condition_variable durableCv_;

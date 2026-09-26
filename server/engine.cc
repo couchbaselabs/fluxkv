@@ -61,9 +61,9 @@ StageTimers gStages;
 int gDurableSpinIters = 4000;
 size_t gCompletionSlice = 512;
 double gSortDupThreshold = 0.05;
-// Per-shard cap on recycled Requests; beyond it writers delete. Sized to
-// cover the write queue at a few hundred bytes per Request.
-static constexpr size_t kFreeRequestCap = 1 << 18;
+// Slots in each shard's queue of recycled chains; a chain holds at least one
+// Request, so this never binds before Shard::kMaxFreeRequests.
+static constexpr size_t kFreeRequestCap = Shard::kMaxFreeRequests;
 uint64_t gWriteCoalesceNs = 0;
 
 namespace {
@@ -315,7 +315,11 @@ Shard::~Shard() {
     Close();
     Request* r{nullptr};
     while (freeRequests_.read(r)) {
-        delete r;
+        while (r) {
+            Request* next = r->hook.next;
+            delete r;
+            r = next;
+        }
     }
 }
 
@@ -1262,6 +1266,7 @@ size_t WriterPool::executePersist(PersistTask& task) {
             batch[i]->reset();
             batch[i]->hook.next = i + 1 < batch.size() ? batch[i + 1] : nullptr;
         }
+        batch[0]->chainLen = static_cast<uint32_t>(batch.size());
         if (!shard->RecycleRequests(batch[0])) {
             for (auto* req : batch) {
                 delete req;
