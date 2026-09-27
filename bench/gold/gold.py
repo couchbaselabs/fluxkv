@@ -177,7 +177,10 @@ def run(a):
     print("%s  all rows finished; failed: %s" % (now(), ", ".join(sorted(dead & names(groups))) or "none"))
     if a.out:
         collect(a)
-        report(argparse.Namespace(dir=a.out, o=os.path.join(a.out, "report.html"), run=None))
+        if set(groups) == set(suite.GROUPS) and not a.smoke:
+            report(argparse.Namespace(dir=a.out, o=os.path.join(a.out, "report.html"), run=None))
+        else:
+            print("partial or smoke run: no report (it needs all %d rows)" % len(names(suite.GROUPS)))
 
 
 def names(groups):

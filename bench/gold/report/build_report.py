@@ -75,7 +75,11 @@ def pairs_caveat(host_of):
     return "Cross-box pairs", "Some durable and non-durable pairs ran on different boxes: %s. Same-box durability ratios come from the S rows." % where
 
 
-def build(g, run):
+def lat_s(u):
+    return "%d&nbsp;µs" % u if u < 1000 else "%.1f&nbsp;ms" % (u / 1e3) if u < 1e6 else "%.1f&nbsp;s" % (u / 1e6)
+
+
+def build(g, run, template="template.html"):
     lat = {k: lrow(g[k]) for k in g if re.fullmatch(r"L\d+", k)}
     # The averaging window ends at 7140 s; the last two 60 s windows are cut short by the run stopping.
     sus = {k: {"ops": g[k]["ops_series_60s"][:-2], "du": g[k]["du_series_GB"][1:-2]} for k in g if re.fullmatch(r"S\d", k)}
@@ -144,6 +148,12 @@ def build(g, run):
          "spin": "%d" % (int(spin) + 1), "insKeys": "%.1f–%.1f" % (min(insk) / 1e9, max(insk) / 1e9), "insTB": "%.1f" % (sum(insdu) / 4 / 1000),
          "pairHead": ph, "pairText": pt, "L1base": "%.1f" % (g["L1"]["rate_base"] / 1e6), "L11base": "%.1f" % (g["L11"]["rate_base"] / 1e6),
          "footer": run.get("footer") or "Results: " + run["results_path"]}
+    # Worst 8 B insert tail at 75% load, and what the smallest cache leaves of each overwrite type.
+    t8 = max(("L%d" % n for n in (13, 14, 15, 16)), key=lambda r: us(g[r]["r75"]["p99"]))
+    H.update({"nBoxes": "%d" % len(set(run["host_of"].values())) if run["host_of"] else "?",
+              "saRun": "%.2f–%.2f" % (min(S[k]["run"] for k in S), max(S[k]["run"] for k in S)),
+              "tail8": "up to %s (%s)" % (lat_s(us(g[t8]["r75"]["p99"])), t8),
+              "e7": "%d%%" % round(ops("T7_m5") / ops("T7") * 100), "e8": "%d%%" % round(ops("T8_m5") / ops("T8") * 100)})
     srows = [[k, dd, lk, ops(k), "±%.1f%%" % S[k]["sd"], "~%.2f" % S[k]["run"], "%.2f" % S[k]["sa"], S[k]["wa"], S[k]["rss"]]
              for k, dd, lk in (("S1", "nd", "on"), ("S2", "du", "on"), ("S3", "nd", "off"), ("S4", "du", "off"))]
     # Residency rows: label, on disk, memory / on disk (bar at the range's midpoint, %), index blocks
@@ -158,7 +168,7 @@ def build(g, run):
              ["T3–T6 insert, run average", rng(avgdu, "%d") + " GB", *share(avgdu)[:1], avgres[0], avgres[1], share(avgdu)[1]],
              ["L3–L6 insert, 75% step", rng([x / 1000 for x in l75du], "%.2f") + " TB", *share(l75du)[:1], "~" + rng(l75i, "%d") + "%", "~%d%%" % round(sum(l75l) / 4), share(l75du)[1]]]
 
-    tpl = open(os.path.join(HERE, "template.html")).read()
+    tpl = open(template if os.path.isabs(template) or os.path.exists(template) else os.path.join(HERE, template)).read()
     for k, v in (("/*__DATA__*/", "const DATA = %s;" % json.dumps(data, separators=(",", ":"))),
                  ("/*__W__*/", json.dumps(W, ensure_ascii=False)), ("/*__R__*/", json.dumps(R, ensure_ascii=False)),
                  ("/*__SROWS__*/", json.dumps(srows)), ("/*__RROWS__*/", json.dumps(rrows, ensure_ascii=False))):
@@ -172,9 +182,10 @@ def main():
     ap.add_argument("results")
     ap.add_argument("-o", "--out", default="gold-report.html")
     ap.add_argument("--run", help="run metadata JSON (default RESULTS/run.json)")
+    ap.add_argument("--template", default="template.html", help="template.html (classic) or template_v3.html")
     a = ap.parse_args()
     g, run = load(a.results, a.run or os.path.join(a.results, "run.json"))
-    html = build(g, run)
+    html = build(g, run, a.template)
     open(a.out, "w").write(html)
     print("%s: %d bytes" % (a.out, len(html)))
 

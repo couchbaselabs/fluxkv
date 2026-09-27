@@ -74,6 +74,8 @@ collected, but the report needs all 64 rows.
 `report/build_report.py RESULTS_DIR` reads one `<row>.json` per row plus `run.json`, which
 `collect` writes: run dates, build ids, hardware, server config and the box each row ran on.
 Every figure in the report comes from these files; edit `run.json` to correct a label.
+`--template template_v3.html` builds the redesigned layout: summary and risks first, a key to
+row names and terms, and findings linked to their evidence.
 
 `report/test_report.sh RESULTS_DIR EXPECTED.html` rebuilds a saved report and checks that the
 output is byte-identical, which guards the template against unintended changes.
