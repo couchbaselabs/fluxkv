@@ -102,6 +102,7 @@ struct Config {
     bool noValuePtrWrite = true; // store no value pointers in the key index
     bool learnedSeqLocator = true; // seqIndex blocks located by a learned model
     bool compactMeta = false; // write DocMeta in its compact form
+    double bottomBloomAccuracy = -1; // < 0: magma default
     // Sets SeqTreeBlockSize ONLY -- the data blocks holding document values.
     // KeyTreeBlockSize stays at magma's 4096 default: shrinking it too adds
     // key-index reads (IO/GET 1.13 -> 1.35) and cost 7-11% throughput.
@@ -241,6 +242,8 @@ static void printUsage(const char* prog) {
                  "index (default off; --no-value-ptr-write is the default)\n"
               << "  --no-learned-seq-locator  locate seqIndex data blocks "
                  "through their index blocks (default: learned model)\n"
+              << "  --bottom-bloom-accuracy F  bloom filter accuracy of the "
+                 "key index's bottom level, 0 for none (magma default 0.95)\n"
               << "  --compact-meta        write document metadata in the "
                  "compact form (needs magma storage format 2)\n"
               << "  --cache-size N        document cache budget in bytes "
@@ -381,6 +384,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"no-value-ptr-write", no_argument, nullptr, 1102},
             {"value-ptr-write", no_argument, nullptr, 1103},
             {"no-learned-seq-locator", no_argument, nullptr, 1104},
+            {"bottom-bloom-accuracy", required_argument, nullptr, 1105},
             {"data-block-size", required_argument, nullptr, 1008},
             {"dispatch-batch", required_argument, nullptr, 1018},
             {"cache-size", required_argument, nullptr, 1020},
@@ -541,6 +545,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1104:
             cfg.learnedSeqLocator = false;
+            break;
+        case 1105:
+            cfg.bottomBloomAccuracy = std::stod(optarg);
             break;
         case 1008:
             cfg.dataBlockSize = strtoull(optarg, nullptr, 10);
@@ -820,6 +827,12 @@ int main(int argc, char* argv[]) {
     }
     if (cfg.noValuePtrWrite) {
         magmaCfg.EnableValuePtrWrite = false;
+    }
+    // Every stored key reaches the bottom level, so for existing keys its
+    // filter always answers "maybe"; it only saves a leaf search for absent
+    // ones (non-blind inserts of new keys).
+    if (cfg.bottomBloomAccuracy >= 0) {
+        magmaCfg.BloomFilterAccuracyForBottomLevel = cfg.bottomBloomAccuracy;
     }
     // Point lookups that miss the value pointer reach a seqIndex data block
     // through the model rather than its index blocks, which then need no
