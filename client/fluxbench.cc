@@ -44,6 +44,7 @@ constexpr uint8_t kOpGet = 0x00;
 constexpr uint8_t kOpSet = 0x01;
 constexpr uint8_t kOpSaslAuth = 0x21;
 constexpr uint8_t kOpSelectBucket = 0x89;
+constexpr uint8_t kOpHello = 0x1f;
 
 struct Options {
     std::string host = "127.0.0.1";
@@ -94,6 +95,9 @@ struct Options {
     std::string user;
     std::string pass;
     std::string bucket;
+    // Leave UnorderedExecution unnegotiated, so a kv_engine-compatible
+    // server keeps each connection's responses in request order.
+    bool ordered = false;
 };
 
 Options gOpts;
@@ -354,8 +358,13 @@ bool simpleCmd(int fd,
     return (static_cast<uint16_t>(rh[6] << 8 | rh[7])) == 0;
 }
 
-// SASL PLAIN then SELECT_BUCKET. Servers that take neither leave -user unset.
+// HELLO asking for UnorderedExecution, as SDKs do (unless -ordered), then
+// SASL PLAIN and SELECT_BUCKET for servers that want them (-user).
 bool handshake(int fd) {
+    if (!gOpts.ordered &&
+        !simpleCmd(fd, kOpHello, "fluxbench", std::string("\x00\x0e", 2))) {
+        return false;
+    }
     if (gOpts.user.empty()) {
         return true;
     }
@@ -1005,6 +1014,7 @@ void usage(const char* prog) {
             << "  -user U           SASL PLAIN user; unset skips the "
                "handshake entirely (default: unset)\n"
             << "  -pass P           SASL PLAIN password\n"
+            << "  -ordered          do not negotiate UnorderedExecution in HELLO\n"
             << "  -bucket B         bucket to select after authenticating\n"
             << "  -randvals         random, incompressible values\n"
             << "  -zipf THETA       Zipf key selection (e.g. 0.99); default "
@@ -1091,6 +1101,8 @@ int main(int argc, char** argv) {
             opts.mode = next();
         } else if (arg == "-zipf") {
             opts.zipf = std::stod(next());
+        } else if (arg == "-ordered") {
+            opts.ordered = true;
         } else if (arg == "-randvals") {
             opts.randvals = true;
         } else if (arg == "-rate") {
