@@ -153,7 +153,9 @@ def build(g, run, template="template.html"):
     H.update({"nBoxes": "%d" % len(set(run["host_of"].values())) if run["host_of"] else "?",
               "saRun": "%.2f–%.2f" % (min(S[k]["run"] for k in S), max(S[k]["run"] for k in S)),
               "tail8": "up to %s (%s)" % (lat_s(us(g[t8]["r75"]["p99"])), t8),
-              "e7": "%d%%" % round(ops("T7_m5") / ops("T7") * 100), "e8": "%d%%" % round(ops("T8_m5") / ops("T8") * 100)})
+              "e7": "%d%%" % round(ops("T7_m5") / ops("T7") * 100), "e8": "%d%%" % round(ops("T8_m5") / ops("T8") * 100),
+              # Best 1 KB insert and update rows, whatever their durability or lookup.
+              "ins1k": f3(max(ops(i) for i in ("T3", "T4", "T5", "T6"))), "upd1k": f3(max(ops(i) for i in ("T7", "T8", "T9", "T10")))})
     srows = [[k, dd, lk, ops(k), "±%.1f%%" % S[k]["sd"], "~%.2f" % S[k]["run"], "%.2f" % S[k]["sa"], S[k]["wa"], S[k]["rss"]]
              for k, dd, lk in (("S1", "nd", "on"), ("S2", "du", "on"), ("S3", "nd", "off"), ("S4", "du", "off"))]
     # Residency rows: label, on disk, memory / on disk (bar at the range's midpoint, %), index blocks

@@ -63,8 +63,12 @@ nav.top a i.bad{background:var(--bad)} nav.top a i.warn{background:var(--warn)}
 
 /* header */
 header.hero{display:grid;gap:20px;padding-top:40px}
-.thesis{font-size:clamp(17px,1.9vw,20px);line-height:1.5;color:var(--ink2);max-width:66ch}
+.thesis{font-size:clamp(17px,1.9vw,20px);line-height:1.5;color:var(--ink2);max-width:92ch}
 .thesis em{font-style:normal;font-weight:600;color:var(--ink)}
+.thesis{display:grid;gap:6px}
+.thesis > span{display:block}
+.thesis .n{font:700 1.2em/1 var(--display);color:var(--ink);white-space:nowrap}
+.thesis .n.nd{color:var(--nd)} .thesis .n.rd{color:var(--rd)}
 .meta{display:flex;flex-wrap:wrap;gap:6px 8px}
 .meta span{font:12px/1.4 var(--mono);color:var(--muted);background:var(--panel);border:1px solid var(--line);border-radius:3px;padding:3px 8px}
 .meta b{color:var(--ink);font-weight:500}
@@ -210,7 +214,7 @@ footer{font:12px/1.7 var(--mono);color:var(--muted);border-top:1px solid var(--l
 <header class="hero" id="glance">
   <span class="eyebrow">Golden benchmark · fluxkv on magma · run {{dates}} · {{nBoxes}} boxes</span>
   <h1>fluxkv Golden Benchmark</h1>
-  <p class="thesis">1&nbsp;KB overwrites hold <em>{{S1ops}} set/s for two hours</em> when each SET first reads the key, and <em>{{S3ops}}</em> when it does not. Disk reads run at <em>{{T2ops}} get/s at one IO per GET</em> in {{T2rss}}&nbsp;GB of server memory, and in-memory 8&nbsp;B reads reach <em>{{T11ops}} get/s</em>.</p>
+  <p class="thesis"><span>In memory, fluxkv serves <b class="n rd">{{T11ops}}/sec</b> reads for 8&nbsp;B values and <b class="n rd">{{T1ops}}/sec</b> for 1&nbsp;KB.</span><span>From disk, 1&nbsp;KB reads run at <b class="n rd">{{T2ops}}/sec</b> at one IO per GET.</span><span>1&nbsp;KB inserts run at <b class="n nd">{{ins1k}}/sec</b> and updates at <b class="n nd">{{upd1k}}/sec</b>.</span></p>
   <div class="figs">
     <div class="fig nd"><span class="k">1 KB overwrite · 2 h<br>non-blind, non-durable</span><span class="v">{{S1ops}}<small>set/s</small></span><svg class="spark" id="spk1" aria-hidden="true"></svg><span class="c">±{{S1sd}}% after 10 min · durable {{S2ops}}</span></div>
     <div class="fig nd"><span class="k">1 KB overwrite · 2 h<br>blind, non-durable</span><span class="v">{{S3ops}}<small>set/s</small></span><svg class="spark" id="spk3" aria-hidden="true"></svg><span class="c">durable {{S4ops}}</span></div>
@@ -368,15 +372,6 @@ footer{font:12px/1.7 var(--mono);color:var(--muted);border-top:1px solid var(--l
       <dt>Network</dt><dd>none, loopback</dd>
     </dl></div>
   </div>
-  <ul class="cav">
-    <li><b>Kernel lock contention</b>The kernel spin-lock share of CPU stayed under {{spin}}% on every row.</li>
-    <li><b>Response-coalescing timer</b><code>MAGMA_FLUSH_DELAY_US=100</code> rounds up to a ~1&nbsp;ms epoll tick on a quiet loop, so it is off for every row except the saturated in-memory reads.</li>
-    <li><b>Insert rows grow the store</b>A 900&nbsp;s 1&nbsp;KB insert adds {{insKeys}}B keys and ends near {{insTB}}&nbsp;TB on disk. Throughput is the average over that growth.</li>
-    <li><b>{{pairHead}}</b>{{pairText}}</li>
-    <li><b>In-memory latency rows</b>L1 and L11 are paced from {{L1base}}M and {{L11base}}M get/s. L11 at 50% and 75% is limited by the latency client itself.</li>
-    <li><b>Memory</b>RSS is the server's resident set averaged over the measured window, with jemalloc untuned.</li>
-    <li><b>Box hygiene</b><code>fstrim</code> before every load; performance governor and aio limits set on every box.</li>
-  </ul>
 </section>
 
 <footer>{{footer}}</footer>
