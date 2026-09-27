@@ -9,6 +9,7 @@ Scripts for running storage-engine experiments against fluxkv.
 | `io_matrix.sh` | Sweep {libaio, io_uring} x {DirectIO, buffered} |
 | `cgroup_run.sh` | Start the server under a systemd memory cap |
 | `cgroup_stats.sh` | Show the memory breakdown of a capped server during a run |
+| `gold/` | The golden benchmark suite across N machines, and its HTML report ([README](gold/README.md)) |
 
 All scripts take configuration from environment variables and have defaults
 that match the read benchmarks.

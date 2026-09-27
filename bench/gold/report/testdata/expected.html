@@ -1,0 +1,661 @@
+<title>fluxkv Golden Benchmark</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=Public+Sans:ital,wght@0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#EDEFF1; --panel:#FFFFFF; --sunk:#F5F6F8; --ink:#10151B; --ink2:#2F3945; --muted:#5C6774; --line:#D5DAE0; --grid:#E6E9ED;
+  --nd:#2F5BD3; --nd2:#A9BBEE; --du:#C27F14; --du2:#EDCF97; --rd:#13806B; --rd2:#A6D9CC;
+  --good:#23804F; --warn:#B8690F; --bad:#BE3A28;
+  --h0:#E3F1E9; --h1:#F2F0D6; --h2:#F6DBB0; --h3:#F1BBA3; --h4:#E08E84;
+  --sel:#10151B;
+  --display:"Archivo","Arial Narrow",system-ui,sans-serif;
+  --body:"Public Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,"SFMono-Regular",Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --bg:#0D1116; --panel:#151A21; --sunk:#11161C; --ink:#E7EBF0; --ink2:#C3CBD4; --muted:#909CAA; --line:#27303A; --grid:#1D242C;
+    --nd:#7D9CF2; --nd2:#34477F; --du:#EAAA48; --du2:#5F4520; --rd:#4CC2A7; --rd2:#1C4A40;
+    --good:#5CC48B; --warn:#E9A04F; --bad:#EE7B69;
+    --h0:#15302A; --h1:#2D301E; --h2:#48361A; --h3:#56291F; --h4:#742A24;
+    --sel:#E7EBF0;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#0D1116; --panel:#151A21; --sunk:#11161C; --ink:#E7EBF0; --ink2:#C3CBD4; --muted:#909CAA; --line:#27303A; --grid:#1D242C;
+  --nd:#7D9CF2; --nd2:#34477F; --du:#EAAA48; --du2:#5F4520; --rd:#4CC2A7; --rd2:#1C4A40;
+  --good:#5CC48B; --warn:#E9A04F; --bad:#EE7B69;
+  --h0:#15302A; --h1:#2D301E; --h2:#48361A; --h3:#56291F; --h4:#742A24;
+  --sel:#E7EBF0;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:64px}
+@media (prefers-reduced-motion: reduce){html{scroll-behavior:auto}}
+body{background:var(--bg);color:var(--ink);font:15px/1.6 var(--body);padding-inline:20px;padding-block:0 72px}
+.wrap{max-width:1140px;margin:0 auto;display:flex;flex-direction:column;gap:72px}
+h1,h2,h3{font-family:var(--display);text-wrap:balance;margin:0;line-height:1.08}
+h1{font-size:clamp(40px,7vw,78px);font-weight:800;font-stretch:72%;letter-spacing:-.015em}
+h2{font-size:clamp(28px,3.6vw,38px);font-weight:700;font-stretch:78%;letter-spacing:-.005em}
+h3{font-size:18px;font-weight:650;font-stretch:88%}
+p{margin:0;max-width:70ch}
+b{font-weight:600}
+.num{font-variant-numeric:tabular-nums}
+.eyebrow{font:500 11.5px/1.3 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
+.note{font-size:14px;color:var(--muted);max-width:76ch}
+.note b{color:var(--ink2)}
+code{font:12.5px var(--mono);background:var(--grid);padding:1px 5px;border-radius:3px}
+
+/* nav */
+nav.top{position:sticky;top:env(safe-area-inset-top,0px);z-index:5;margin-inline:-20px;padding-inline:20px;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+nav.top .in{max-width:1140px;margin:0 auto;display:flex;align-items:center;gap:22px;height:48px;overflow-x:auto;scrollbar-width:none}
+nav.top .in::-webkit-scrollbar{display:none}
+nav.top .brand{font:700 15px var(--display);font-stretch:75%;letter-spacing:.01em;white-space:nowrap;color:var(--ink)}
+nav.top a{font:500 12px var(--mono);letter-spacing:.04em;color:var(--muted);text-decoration:none;white-space:nowrap;padding-block:4px;border-bottom:2px solid transparent}
+nav.top a:hover{color:var(--ink)}
+nav.top a.on{color:var(--ink);border-bottom-color:var(--nd)}
+a:focus-visible,button:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--nd);outline-offset:2px;border-radius:2px}
+
+/* hero */
+header.hero{display:grid;gap:28px;padding-top:44px}
+.hero .meta{display:flex;flex-wrap:wrap;gap:6px 22px;font:12px/1.5 var(--mono);color:var(--muted)}
+.hero .meta b{color:var(--ink);font-weight:500}
+.thesis{font:500 clamp(19px,2.3vw,24px)/1.4 var(--body);max-width:52ch;color:var(--ink2);text-wrap:pretty}
+.thesis em{font-style:normal;color:var(--ink);font-weight:600}
+.figs{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,170px),1fr));border-top:2px solid var(--ink);border-bottom:1px solid var(--line)}
+.fig{padding:16px 16px 16px 0;display:flex;flex-direction:column;gap:6px;border-right:1px solid var(--line);padding-left:16px}
+.fig:first-child{padding-left:0}
+.fig:last-child{border-right:none}
+.fig .k{font:500 11px/1.35 var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);min-height:2.7em}
+.fig .v{font:800 44px/0.95 var(--display);font-stretch:68%;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+.fig .v small{font:600 15px var(--display);font-stretch:85%;color:var(--muted);margin-left:4px;letter-spacing:0}
+.fig .c{font-size:12.5px;color:var(--muted);line-height:1.4}
+.fig.nd .v{color:var(--nd)} .fig.du .v{color:var(--du)} .fig.rd .v{color:var(--rd)}
+
+.spark{display:block;width:100%;height:26px;margin-block:2px}
+.strip{margin:0;display:grid;gap:10px}
+.strip figcaption{display:flex;gap:6px 16px;align-items:baseline;flex-wrap:wrap}
+.strip figcaption .note{font-size:12.5px}
+.strip-grid{display:grid;grid-template-columns:40px repeat(20,minmax(0,1fr));gap:3px;align-items:center}
+.strip-grid .ld{font:10.5px var(--mono);color:var(--muted);text-align:right;padding-right:6px}
+.strip-grid a{display:block;height:22px;border-radius:2px;text-decoration:none;outline-offset:1px;transition:transform .12s}
+.strip-grid a:hover{transform:scaleY(1.25)}
+.strip-grid .cl{font:10px var(--mono);color:var(--muted);text-align:center}
+.strip-grid .vs{grid-column:span 10;font:600 11px var(--mono);color:var(--ink2);border-top:1.5px solid var(--ink2);padding-top:4px}
+@media (prefers-reduced-motion: reduce){.strip-grid a{transition:none}}
+/* findings */
+.finds{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:0;border-top:1px solid var(--line)}
+.find{padding:18px 20px 18px 0;border-bottom:1px solid var(--line);display:grid;grid-template-columns:auto 1fr;gap:4px 14px;align-content:start}
+.find .tag{grid-row:span 2;font:700 13px/1 var(--mono);width:34px;height:22px;display:grid;place-items:center;border-radius:3px;color:var(--panel);margin-top:2px}
+.find .tag.g{background:var(--good)} .find .tag.w{background:var(--warn)} .find .tag.n{background:var(--nd)}
+.find h3{font-size:17px}
+.find p{font-size:14px;color:var(--muted)}
+
+section{display:flex;flex-direction:column;gap:22px}
+.sechead{display:grid;gap:10px}
+.sechead .row{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+.sechead .ids{font:600 12px var(--mono);color:var(--muted);letter-spacing:.04em}
+.rule{height:2px;background:var(--ink);width:100%}
+
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:4px}
+.chart{padding:18px 18px 12px;display:flex;flex-direction:column;gap:10px;min-width:0}
+.chart .ct{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
+.chart .ct h3{font-size:16px}
+.chart .ct span{font:11px var(--mono);color:var(--muted)}
+.scroll{overflow-x:auto}
+.chart svg{display:block;width:100%;height:auto}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,470px),1fr));gap:20px}
+.three{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:20px}
+.legend{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:12.5px;color:var(--muted);align-items:center}
+.sw{display:inline-block;width:12px;height:12px;vertical-align:-1px;margin-right:6px;border-radius:2px}
+.ln{display:inline-block;width:20px;height:0;border-top:2.5px solid;vertical-align:3px;margin-right:6px}
+.ln.d{border-top-style:dashed}
+
+svg text{font-family:var(--mono);font-size:11px;fill:var(--muted)}
+svg .lbl{font-family:var(--body);font-size:12.5px;fill:var(--ink)}
+svg .grp{font-family:var(--display);font-size:13.5px;font-weight:650;fill:var(--ink)}
+svg .val{fill:var(--ink);font-weight:500}
+svg .dim{fill:var(--muted)}
+svg .gl{stroke:var(--grid);stroke-width:1}
+svg .ax{stroke:var(--line);stroke-width:1}
+
+/* tables */
+.tbl{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--grid);white-space:nowrap;vertical-align:middle}
+thead th{font:500 10.5px/1.3 var(--mono);letter-spacing:.07em;text-transform:uppercase;color:var(--muted);background:var(--sunk);border-bottom:1px solid var(--line);position:sticky;top:0}
+th.r,td.r{text-align:right;font-variant-numeric:tabular-nums}
+td.id{font:600 12.5px var(--mono)}
+tbody tr:last-child td{border-bottom:none}
+tr.gh td{background:var(--sunk);font:650 13px var(--display);font-stretch:85%;letter-spacing:.02em;color:var(--ink);padding-block:7px}
+.pill{display:inline-flex;align-items:center;gap:5px;font:500 11px var(--mono)}
+.pill::before{content:"";width:8px;height:8px;border-radius:50%;background:currentColor}
+.pill.nd{color:var(--nd)} .pill.du{color:var(--du)} .pill.rd{color:var(--rd)}
+.off{color:var(--muted)}
+.bar{display:flex;align-items:center;gap:8px;justify-content:flex-end}
+.bar i{display:block;height:7px;border-radius:1px;flex:none}
+.hc{font-variant-numeric:tabular-nums;border-radius:2px}
+.h0{background:var(--h0)} .h1{background:var(--h1)} .h2{background:var(--h2)} .h3{background:var(--h3)} .h4{background:var(--h4)}
+.heatkey{display:flex;flex-wrap:wrap;gap:0;font:11px var(--mono);color:var(--ink2);border:1px solid var(--line);border-radius:3px;overflow:hidden;width:max-content;max-width:100%}
+.heatkey span{padding:4px 10px}
+
+/* scorecard */
+table.score td.op{min-width:190px}
+table.score td.hc{text-align:right;padding-inline:10px}
+
+/* reads */
+.reads{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,245px),1fr));gap:20px}
+.rcard{padding:18px;display:flex;flex-direction:column;gap:10px}
+.rcard .top{display:flex;justify-content:space-between;align-items:baseline}
+.rcard .v{font:800 40px/1 var(--display);font-stretch:68%;font-variant-numeric:tabular-nums}
+.rcard .v small{font:600 14px var(--display);color:var(--muted);margin-left:4px}
+.rcard dl{margin:0;display:grid;grid-template-columns:1fr auto;gap:3px 12px;font-size:13px}
+.rcard dt{color:var(--muted)} .rcard dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
+.ios{display:flex;gap:4px;align-items:center;height:22px}
+.ios i{display:block;width:22px;height:22px;border:1.5px solid var(--rd);border-radius:3px;position:relative;overflow:hidden}
+.ios i b{position:absolute;inset:0 auto 0 0;background:var(--rd)}
+.ios span{font:600 12px var(--mono);margin-left:6px}
+.ios.zero i{border-color:var(--line)}
+
+/* latency */
+.latwrap{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(0,1fr);gap:20px;align-items:start}
+@media (max-width:900px){.latwrap{grid-template-columns:minmax(0,1fr)}.latside{order:-1;position:static!important}}
+.latside{position:sticky;top:64px}
+.hm{min-width:640px;display:grid;grid-template-columns:minmax(170px,1.2fr) repeat(4,minmax(96px,1fr));font-variant-numeric:tabular-nums}
+.hm .hd{font:500 10.5px var(--mono);letter-spacing:.07em;text-transform:uppercase;color:var(--muted);padding:8px 8px;background:var(--sunk);border-bottom:1px solid var(--line);text-align:right}
+.hm .hd:first-child{text-align:left}
+.hm .g{grid-column:1/-1;font:650 13px var(--display);font-stretch:85%;padding:8px 10px;background:var(--sunk);border-bottom:1px solid var(--grid)}
+.hm .rw{display:contents;cursor:pointer}
+.hm .rw > div{border-bottom:1px solid var(--panel);padding:7px 8px;min-height:54px}
+.hm .nm{display:flex;flex-direction:column;justify-content:center;gap:1px;border-left:3px solid transparent;padding-left:10px!important;background:var(--panel)}
+.hm .nm .i{font:600 12px var(--mono)}
+.hm .nm .d{font-size:12.5px;color:var(--muted);line-height:1.3}
+.hm .rw:hover .nm,.hm .rw:focus-visible .nm{background:var(--sunk)}
+.hm .rw.sel .nm{border-left-color:var(--sel);background:var(--sunk)}
+.hm .rw:focus-visible{outline:none}
+.hm .c{display:flex;flex-direction:column;align-items:flex-end;justify-content:center;gap:0;text-align:right}
+.hm .c .p{font:600 14px/1.2 var(--mono);color:var(--ink)}
+.hm .c .s{font:10.5px/1.3 var(--mono);color:var(--ink2);opacity:.85}
+.hm .c .f{font:600 9.5px/1.3 var(--mono);letter-spacing:.05em;text-transform:uppercase;color:var(--bad)}
+.detail{padding:18px;display:flex;flex-direction:column;gap:12px}
+.detail .id{font:600 12px var(--mono);color:var(--muted)}
+.detail h3{font-size:20px}
+.detail .tbl{overflow-x:auto} .detail svg{max-width:100%;height:auto}
+.detail .tbl table{font-size:12.5px}
+.detail .tbl td,.detail .tbl th{padding:6px 8px}
+
+.tag2{font:600 10px var(--mono);letter-spacing:.06em;text-transform:uppercase;padding:2px 6px;border-radius:2px}
+.tag2.ok{color:var(--good);border:1px solid currentColor}
+.tag2.no{color:var(--bad);border:1px solid currentColor}
+
+.status{display:flex;gap:12px;align-items:flex-start;padding:14px 16px;border:1px dashed var(--line);border-radius:4px;background:var(--sunk)}
+.status .dot{width:9px;height:9px;border-radius:50%;background:var(--warn);margin-top:7px;flex:none;box-shadow:0 0 0 4px color-mix(in srgb,var(--warn) 20%,transparent)}
+.status p{font-size:14px;color:var(--ink2)}
+
+.specs{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr));gap:20px}
+.spec{padding:16px 18px;display:flex;flex-direction:column;gap:10px}
+.spec dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:5px 16px;font-size:13.5px}
+.spec dt{color:var(--muted)} .spec dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
+.wl dl{grid-template-columns:minmax(120px,auto) 1fr;gap:8px 20px;font-size:14px}
+.wl dt{font-weight:600;color:var(--ink)} .wl dd{text-align:left;color:var(--muted);max-width:80ch}
+@media (max-width:560px){.wl dl{grid-template-columns:1fr;gap:2px}.wl dd{margin-bottom:8px}}
+ul.cav{margin:0;padding:0;list-style:none;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:0 28px}
+ul.cav li{padding:12px 0;border-bottom:1px solid var(--line);font-size:14px;color:var(--muted)}
+ul.cav li b{color:var(--ink);display:block;font-family:var(--display);font-size:15.5px;font-stretch:88%;margin-bottom:2px}
+footer{font:12px/1.7 var(--mono);color:var(--muted);border-top:1px solid var(--line);padding-top:16px}
+</style>
+
+<nav class="top" aria-label="Sections"><div class="in">
+  <span class="brand">fluxkv · gold</span>
+  <a href="#matrix">Matrix</a><a href="#writes">Writes</a><a href="#reads">Reads</a><a href="#latency">Latency</a><a href="#sustain">Two hours</a><a href="#residency">Residency</a><a href="#method">Method</a>
+</div></nav>
+
+<div class="wrap">
+<header class="hero">
+  <span class="eyebrow">Golden benchmark · fluxkv on magma · run 26–27 Sep 2026 · 4 boxes</span>
+  <h1>fluxkv Golden Benchmark</h1>
+  <p class="thesis">1&nbsp;KB overwrites hold <em>1.01M set/s for two hours</em> as non-blind writes and <em>1.18M</em> as blind writes. Disk reads run at <em>1.43M get/s at one IO per GET</em> in 7.2&nbsp;GB of server memory, and in-memory 8&nbsp;B reads reach <em>91.6M get/s</em>.</p>
+  <div class="figs">
+    <div class="fig nd"><span class="k">1 KB non-blind<br>2 h, non-durable</span><span class="v">1.01M<small>set/s</small></span><svg class="spark" id="spk1" aria-hidden="true"></svg><span class="c">±0.9% for 2 h · durable 968K</span></div>
+    <div class="fig nd"><span class="k">1 KB blind<br>2 h, non-durable</span><span class="v">1.18M<small>set/s</small></span><svg class="spark" id="spk3" aria-hidden="true"></svg><span class="c">durable 1.17M</span></div>
+    <div class="fig rd"><span class="k">1 KB reads<br>from disk</span><span class="v">1.43M<small>get/s</small></span><span class="c">1.008 IOs per GET · 100M keys · RSS 7.2 GB</span></div>
+    <div class="fig rd"><span class="k">1 KB reads<br>in memory</span><span class="v">22.0M<small>get/s</small></span><span class="c">80 IO threads · 96 × 128 pipeline · CPU 98%</span></div>
+    <div class="fig rd"><span class="k">8 B reads<br>in memory</span><span class="v">91.6M<small>get/s</small></span><span class="c">80 IO threads · 80 × 2048 pipeline · CPU 99%</span></div>
+    <div class="fig"><span class="k">1 KB, every row<br>at 5% load</span><span class="v">89–244<small>µs p50</small></span><span class="c">p99 under 0.5 ms, durable included</span></div>
+  </div>
+  <div class="meta"><span>magma <b>a2978ace</b></span><span>fluxkv server <b>5c926f8</b></span><span>client <b>1827184 / a481c34</b></span><span>Xeon Gold 6230 · 125 GB · 3× P4610 NVMe RAID0 · loopback</span><span>16 GiB quota · direct IO</span><span>all workloads <b>uniform random</b></span><span>learned seq locator · no value pointers · compact metadata</span></div>
+</header>
+
+<section aria-label="Findings">
+  <div class="finds">
+    <div class="find"><span class="tag g">S</span><h3>No drift over two hours</h3><p>All four sustainability runs stay flat from minute 10 to minute 120. Compaction keeps pace and space settles at 1.70–1.98×.</p></div>
+    <div class="find"><span class="tag n">T</span><h3>Non-blind writes cost 15–17%</h3><p>S1 vs S3 and S2 vs S4, same box and data. Durability costs another 1–4%.</p></div>
+    <div class="find"><span class="tag g">T</span><h3>One IO per GET while the index fits</h3><p>1&nbsp;KB disk reads take 1.008 IOs. 8&nbsp;B at 1B keys takes 1.71, because its 41&nbsp;GB key tree cannot stay cached.</p></div>
+    <div class="find"><span class="tag w">L</span><h3>Durable tails show at 25% load</h3><p>Durable rows reach 4–141&nbsp;ms p99.9 from 25% load.</p></div>
+    <div class="find"><span class="tag w">L</span><h3>Inserts stall near capacity</h3><p>At 75% load 1&nbsp;KB inserts hold their rate but p99 reaches 0.6–3.2&nbsp;s. Non-durable overwrites at 75% stay under 8&nbsp;ms.</p></div>
+  </div>
+</section>
+
+<section id="matrix">
+  <div class="sechead">
+    <div class="row"><span class="eyebrow">Whole matrix at a glance</span><span class="ids">T1–T20 · L1–L20</span></div>
+    <div class="rule"></div>
+    <h2>Every workload on one page</h2>
+    <p class="note">Maximum throughput from the T row. Space and write amplification come from the same run. p99 comes from the matching L row paced at 25% and 50% of that maximum. Bars share one scale within each value size.</p>
+  </div>
+  <div class="panel spec wl">
+    <h3>The workloads</h3>
+    <p class="note"><b>Every workload is uniform random:</b> each operation picks its key uniformly at random, with no hot set. Inserts draw new keys in a scrambled order, so they also land uniformly across the key space.</p>
+    <dl>
+      <dt>Read</dt><dd>GET of a uniformly random existing key. <b>In memory</b> rows serve every GET from the Document Cache; <b>on disk</b> rows turn it off, so each GET goes through the index to the data on disk.</dd>
+      <dt>Insert</dt><dd>SET of a new key, added on top of the preloaded data, so the store grows during the run.</dd>
+      <dt>Overwrite</dt><dd>SET of a uniformly random existing key, replacing its value. The store stays the same size and compaction reclaims the old versions.</dd>
+      <dt>Non-blind write</dt><dd>The SET first looks up the existing key, which costs an index read.</dd>
+      <dt>Blind write</dt><dd>The SET is written without looking up the old value.</dd>
+      <dt>Durable</dt><dd>A SET is acknowledged once the shared write-ahead log reports it persisted. Non-durable SETs are acknowledged before that.</dd>
+      <dt>Document Cache</dt><dd>The fluxkv server's in-memory cache of whole documents (key and value), in front of magma and its block cache.</dd>
+    </dl>
+  </div>
+  <div class="heatkey" id="heatkey1"></div>
+  <div class="panel tbl"><table class="score" id="score"></table></div>
+</section>
+
+<section id="writes">
+  <div class="sechead">
+    <div class="row"><span class="eyebrow">Write throughput</span><span class="ids">T3–T10 · T13–T20</span></div>
+    <div class="rule"></div>
+    <h2>Writes: durable and non-durable, blind and non-blind</h2>
+    <p class="note">Average of the 60&nbsp;s windows from 180 to 840&nbsp;s of a 900&nbsp;s phase. Inserts add fresh keys on top of the preloaded set. Overwrites pick keys uniformly at random. The percentage beside each durable bar is its cost against non-durable.</p>
+  </div>
+  <div class="legend"><span><i class="sw" style="background:var(--nd)"></i>non-durable</span><span><i class="sw" style="background:var(--du)"></i>durable (async-durable, shared WAL)</span></div>
+  <div class="two">
+    <div class="panel chart"><div class="ct"><h3>1 KB values</h3><span>100M keys preloaded · ~175 GB</span></div><div class="scroll"><svg id="w1k" role="img" aria-label="1 KB write throughput"></svg></div></div>
+    <div class="panel chart"><div class="ct"><h3>8 B values</h3><span>1B keys preloaded · ~130 GB</span></div><div class="scroll"><svg id="w8b" role="img" aria-label="8 B write throughput"></svg></div></div>
+  </div>
+  <div class="panel chart">
+    <div class="ct"><h3>Space against write amplification</h3><span>space amp = du ÷ keys × (12 B + value) · write amp = device bytes ÷ bytes ingested · color = durability · filled = non-blind · ring = blind</span></div>
+    <div class="scroll"><svg id="ampsc" role="img" aria-label="Space amplification against write amplification for every write row"></svg></div>
+  </div>
+  <p class="note">At 8&nbsp;B the per-key overhead (seq record, key index entry, metadata) is several times the 20&nbsp;B payload, so both figures grow. Blind 8&nbsp;B overwrites reach 16× space because their garbage is only found by compaction.</p>
+</section>
+
+<section id="reads">
+  <div class="sechead">
+    <div class="row"><span class="eyebrow">Read throughput</span><span class="ids">T1 · T2 · T11 · T12</span></div>
+    <div class="rule"></div>
+    <h2>Reads: from memory and from disk</h2>
+    <p class="note">Squares show read IOs per GET, from device read counts divided by GETs served. One full square means every GET costs exactly one IO.</p>
+  </div>
+  <div class="reads" id="readcards"></div>
+  <p class="note">In-memory rows run 80 IO threads with the client shape that peaks each: 1&nbsp;KB reads are CPU-bound and peak at a shallow pipeline, 8&nbsp;B reads need ~164K requests in flight. Both keep the 100&nbsp;µs response-coalescing timer.</p>
+</section>
+
+<section id="latency">
+  <div class="sechead">
+    <div class="row"><span class="eyebrow">Latency under paced load</span><span class="ids">L1–L20 · 5 / 25 / 50 / 75%</span></div>
+    <div class="rule"></div>
+    <h2>Latency at 5%, 25%, 50% and 75% load</h2>
+    <p class="note">The client sends on a fixed schedule and times each request from its scheduled send, so queueing and stalls count. Each cell shows p99 in large type, with the achieved rate and p50 · p99.9 below it. Load is a fraction of the matching T row's maximum. Select a row to plot it.</p>
+  </div>
+  <div class="heatkey" id="heatkey2"></div>
+  <div class="latwrap">
+    <div class="panel scroll"><div class="hm" id="hm" role="listbox" aria-label="Latency rows"></div></div>
+    <aside class="panel latside detail" id="detail" aria-live="polite"></aside>
+  </div>
+</section>
+
+<section id="sustain">
+  <div class="sechead">
+    <div class="row"><span class="eyebrow">Sustainability</span><span class="ids">S1–S4 · 7,200 s each</span></div>
+    <div class="rule"></div>
+    <h2>Two hours of 1 KB overwrites</h2>
+    <p class="note">100M keys (103.6&nbsp;GB live), saturated for two hours, one point per 60&nbsp;s window. The first two minutes of warm-up are left off the charts. Color is durability. Solid lines are non-blind writes, dashed lines blind writes.</p>
+  </div>
+  <div class="legend"><span><i class="ln" style="border-color:var(--nd)"></i>S1 non-durable · non-blind</span><span><i class="ln" style="border-color:var(--du)"></i>S2 durable · non-blind</span><span><i class="ln d" style="border-color:var(--nd)"></i>S3 non-durable · blind</span><span><i class="ln d" style="border-color:var(--du)"></i>S4 durable · blind</span></div>
+  <div class="two">
+    <div class="panel chart"><div class="ct"><h3>Throughput</h3><span>set/s per 60 s window</span></div><div class="scroll"><svg id="sops" role="img" aria-label="Sustained throughput over two hours"></svg></div></div>
+    <div class="panel chart"><div class="ct"><h3>Space amplification</h3><span>du ÷ 103.6 GB live</span></div><div class="scroll"><svg id="samp" role="img" aria-label="Space amplification over two hours"></svg></div></div>
+  </div>
+  <div class="panel tbl"><table id="stbl"></table></div>
+</section>
+
+<section id="residency">
+  <div class="sechead">
+    <div class="row"><span class="eyebrow">Memory against data</span><span class="ids">E rows</span></div>
+    <div class="rule"></div>
+    <h2>Residency: how much of the data fits in memory</h2>
+    <p class="note">Memory is the 16&nbsp;GiB quota (direct IO), 10.9&nbsp;GB of it block cache; in-memory rows add a 32&nbsp;GiB Document Cache. The index is 6.7&nbsp;GB at 100M keys.</p>
+  </div>
+  <div class="panel tbl"><table id="rtbl"></table></div>
+  <div class="sechead" style="margin-top:12px">
+    <h3 style="font-size:22px">Index residency: one dataset, less memory</h3>
+    <p class="note">100M keys × 1&nbsp;KB, the same data in every row; only the block cache shrinks (<code>--write-cache-ratio</code>). <b>Memory per key</b> is block cache ÷ 100M keys.<sup>*</sup></p>
+  </div>
+  <div class="two">
+    <div class="panel chart"><div class="ct"><h3>Read IOs per GET</h3><span>against block cache per key (log scale)</span></div><div class="scroll" id="eiosbox"><svg id="eios" role="img" aria-label="Read IOs per GET against index residency"></svg></div></div>
+    <div class="panel chart"><div class="ct"><h3>Read throughput</h3><span>get/s against block cache per key</span></div><div class="scroll"><svg id="eops" role="img" aria-label="Read throughput against index residency"></svg></div></div>
+  </div>
+  <div class="panel chart">
+    <div class="ct"><h3>Reads: 100% down to 3 IOs per GET</h3><span>T2 / L2 · p99 at 5 / 25 / 50 / 75% of each row's own maximum</span></div>
+    <div class="tbl"><table id="ertbl"></table></div>
+  </div>
+  <p class="note"><sup>*</sup> <b>Data resident</b> is memory given (the 16&nbsp;GiB quota at 100%; block cache plus the 324&nbsp;MB pinned memtables below that) ÷ the data directory's size on disk. Index resident divides the cache by uncompressed key-tree leaves (44&nbsp;B per key) plus index blocks, so it understates residency: leaves are LZ4-compressed in the cache, and at full residency the working set is about 33&nbsp;B per key.</p>
+  <div class="panel chart">
+    <div class="ct"><h3>Overwrites at 10% and 5% index residency</h3><span>T7 / L7 non-blind · T8 / L8 blind</span></div>
+    <div class="tbl"><table id="ewtbl"></table></div>
+  </div>
+
+</section>
+
+<section id="method">
+  <div class="sechead">
+    <div class="row"><span class="eyebrow">Method</span><span class="ids">44 tests · T / L / S</span></div>
+    <div class="rule"></div>
+    <h2>What was run, and how</h2>
+    <p class="note">Two value sizes, each with two read rows and eight write rows (insert or overwrite × durable or not × blind or non-blind). Each throughput row T has a latency row L paced from its result, plus four two-hour S rows. All keys are 12&nbsp;B, uniform, in scrambled order, with a 1&nbsp;KB seqIndex block.</p>
+  </div>
+  <div class="specs">
+    <div class="panel spec"><h3>Datasets</h3><dl>
+      <dt>1 KB, Document Cache off</dt><dd>100M keys · ~175 GB</dd>
+      <dt>8 B, Document Cache off</dt><dd>1B keys · ~130 GB</dd>
+      <dt>1 KB, in memory</dt><dd>20M keys · 32 GiB Document Cache</dd>
+      <dt>8 B, in memory</dt><dd>200M keys · 32 GiB Document Cache</dd>
+    </dl></div>
+    <div class="panel spec"><h3>Server</h3><dl>
+      <dt>Shards / vbuckets</dt><dd>8 / 128</dd>
+      <dt>Memory quota</dt><dd>16 GiB, direct IO</dd>
+      <dt>Writers / IO / readers</dt><dd>32 / 24 / 128</dd>
+      <dt>Seq / key block</dt><dd>1 KB / 4 KB</dd>
+      <dt>Durable</dt><dd>async-durable, shared WAL</dd>
+      <dt>Compression</dt><dd>off (index LZ4)</dd>
+      <dt>Seq lookup</dt><dd>learned locator</dd>
+      <dt>Value pointers</dt><dd>off</dd>
+      <dt>Metadata</dt><dd>compact</dd>
+    </dl></div>
+    <div class="panel spec"><h3>Client and timing</h3><dl>
+      <dt>Throughput</dt><dd>112 × 128 window · 900 s</dd>
+      <dt>Averaged over</dt><dd>windows 180–840 s</dd>
+      <dt>In-memory reads</dt><dd>96 × 128 / 80 × 2048 · 300 s</dd>
+      <dt>Latency</dt><dd>open loop · 4 × 300 s steps</dd>
+      <dt>Every run</dt><dd>fresh load · fstrim first</dd>
+      <dt>Network</dt><dd>none, loopback</dd>
+    </dl></div>
+  </div>
+  <ul class="cav">
+    <li><b>Kernel lock contention</b>The kernel spin-lock share of CPU stayed under 2% on every row.</li>
+    <li><b>Response-coalescing timer</b><code>MAGMA_FLUSH_DELAY_US=100</code> rounds up to a ~1&nbsp;ms epoll tick on a quiet loop, so it is off for every row except the saturated in-memory reads.</li>
+    <li><b>Insert rows grow the store</b>A 900&nbsp;s 1&nbsp;KB insert adds 1.2–1.2B keys and ends near 1.6&nbsp;TB on disk. Throughput is the average over that growth.</li>
+    <li><b>Same-box pairs</b>Each durable and non-durable pair ran on one box: T3–T6 on .51, T7–T10 on .52, S1–S4 on .53.</li>
+    <li><b>In-memory latency rows</b>L1 and L11 are paced from 16.6M and 62.0M get/s. L11 at 50% and 75% is limited by the latency client itself.</li>
+    <li><b>Memory</b>RSS is the server's resident set at the end of each run, with jemalloc untuned.</li>
+    <li><b>Box hygiene</b><code>fstrim /data</code> before every load; performance governor and aio limits persisted on all four boxes.</li>
+  </ul>
+</section>
+
+<footer>Results: /root/gold/res/*_g3.json on .51–.54</footer>
+</div>
+
+<script>
+const DATA = {"lat":{"L1":[[824784,830416,97,146,192],[4096100,4152083,103,280,576],[8192604,8304166,184,488,776],[12288258,12456249,712,3680,1294336]],"L2":[[71404,71641,244,400,500],[355684,358206,568,1200,1568],[711432,716413,1120,3744,5696],[1067230,1074620,8064,38400,59392]],"L3":[[63057,63479,90,109,124],[315190,317399,104,396,1424],[630470,634799,156,3008,5120],[941167,952199,42496,1474560,2392064]],"L4":[[65564,65788,89,106,122],[326669,328943,105,376,1568],[653250,657887,180,3680,8704],[976107,986831,73728,3244032,5177344]],"L5":[[62940,63363,172,436,3232],[314603,316816,332,1760,25600],[629392,633633,2336,13568,81920],[940766,950450,23552,622592,819200]],"L6":[[66922,67145,160,344,2560],[333400,335725,300,1520,6336],[666763,671450,2912,16128,24576],[996725,1007175,24064,761856,1146880]],"L7":[[50618,50783,90,109,126],[252253,253919,103,228,1328],[504406,507838,127,3104,5056],[756614,761757,186,5440,19200]],"L8":[[59221,59416,89,107,127],[295047,297081,103,276,1568],[590131,594163,146,3136,5184],[885190,891244,230,7360,22528]],"L9":[[47756,47913,188,316,1120],[237927,239568,242,2144,51712],[475984,479137,776,11008,155648],[713950,718705,5760,190464,589824]],"L10":[[58968,59162,162,324,1968],[293810,295810,240,1984,76800],[587690,591620,1312,9600,33280],[881419,887430,6912,227328,663552]],"L11":[[3077905,3099105,86,232,352],[15343511,15495526,164,444,584],[30789784,30991052,528,3276800,18612224],[44197956,46486578,1081344,36700160,53477376]],"L12":[[42831,42971,308,568,816],[214156,214859,396,912,2032],[426866,429718,768,1744,3424],[640116,644577,1248,3456,5248]],"L13":[[107579,108349,91,944,3040],[537941,541747,123,1712,3552],[1072524,1083494,284,4224,7552],[1491843,1625241,704512,27787264,41418752]],"L14":[[180924,182189,99,2496,4928],[904817,910947,230,4288,7104],[1808471,1821894,332,5824,10112],[2705399,2732841,452,7232,12160]],"L15":[[69944,70185,170,424,2400],[348572,350929,324,2848,9984],[697075,701858,1808,15744,206848],[1045424,1052787,5760,24576,40448]],"L16":[[83043,83345,154,2176,9472],[413884,416726,392,6976,23552],[827894,833452,2464,17408,27136],[1241947,1250178,9728,37376,59392]],"L17":[[29191,23245,90,114,162],[115846,116228,91,117,188],[230927,232457,99,180,496],[346354,348686,103,672,2752]],"L18":[[150823,151828,148,3264,5952],[754104,759143,160,3264,5504],[1508007,1518287,304,5696,9728],[2254410,2277431,408,7104,11648]],"L19":[[34498,34611,304,592,3360],[171915,173056,344,1600,4224],[343824,346113,784,10240,58880],[515749,519170,1712,88064,262144]],"L20":[[77642,77917,154,6208,20480],[387040,389587,312,7744,141312],[774007,779174,1840,23552,192512],[1138506,1168761,16000,13369344,14548992]]},"sus":{"S1":{"ops":[1196725,957931,1022069,1010832,1009240,1014769,1011774,1006715,1009247,1012759,1008743,1021480,1009530,1009092,1004622,1018614,1009471,1015698,1018196,1019078,1015038,1017145,1010272,1017897,1013350,1005640,1012839,1006766,1018413,1013046,1008190,1016267,1012557,1012700,1009612,1010584,1008458,1012953,1006874,1009906,1001590,1015829,1009885,1012974,1014212,1011429,1018169,1010212,1005722,1013224,1015127,1009514,1013235,1011914,1010507,1015410,1011061,1008788,1013758,1022176,1013483,1017020,1017793,1015072,1017109,1018526,1021080,1015675,1014526,1022624,1007546,1021480,1017102,1012004,1021433,1009582,1009120,1012354,1010611,1016028,1013211,1006472,1017521,1008620,1015458,1016393,1013737,1018994,1018038,1013152,1010978,1009563,1011174,1013867,1018664,1007799,1004241,1008539,1012183,1016774,1009447,1019322,1013877,1015939,1014764,1010986,1017710,1017219,1008348,1002861,1012982,1011727,1008946,1013289,1009723,1012808,1010328,1017702],"du":[221.5,203.1,207.6,208.6,207.6,205.6,206.4,205.5,207.6,208.1,207.1,207.5,205.1,206.4,208.6,206.4,207.0,206.8,207.3,207.8,207.8,207.0,208.4,206.4,205.2,207.4,206.7,207.5,207.4,206.7,203.8,206.9,207.6,207.3,204.7,207.5,206.7,206.4,206.3,205.7,208.3,205.6,205.6,205.4,206.5,207.6,206.1,207.8,207.5,208.9,206.5,209.1,206.7,208.3,207.2,205.4,207.5,207.7,205.3,206.4,206.7,207.5,207.5,208.5,208.6,206.3,206.0,207.1,207.7,207.4,208.2,206.1,204.5,207.3,209.3,205.9,206.9,206.4,207.6,206.9,207.6,206.5,207.4,207.6,208.5,206.9,205.1,207.7,207.9,204.3,207.6,206.4,207.1,205.6,207.7,206.7,206.5,205.4,207.3,207.0,207.0,205.7,205.4,206.6,208.2,207.9,207.7,206.4,206.9,207.3,208.1,206.9,207.3,206.4,205.9,207.7,207.4,206.8]},"S2":{"ops":[1102288,889202,984766,959104,955434,964860,968398,967702,961982,969583,962196,974202,962484,967897,968401,960559,964503,968780,962425,960893,972630,967457,978372,969024,972690,961307,966147,969748,969635,979553,965792,963940,969930,968483,969690,970219,958982,969210,960504,963552,972492,966542,967388,961814,972582,969075,967320,962464,963229,965077,966358,970462,967137,969358,963732,972040,968889,968049,974341,971535,970392,964647,968730,969503,969989,965531,969361,978643,965237,972487,973647,967094,966573,973572,971486,970225,971928,968638,971078,965964,974656,961910,977502,969223,968938,961736,967598,968016,979859,964132,973348,972302,965161,965666,973378,975858,969752,969172,975214,970581,965118,980645,963119,977690,962356,964692,966965,967196,959253,973501,968834,957437,962203,965200,973219,970105,971588,961441],"du":[216.1,204.4,200.2,204.4,203.5,202.8,201.7,202.0,202.1,201.2,202.4,202.3,201.1,203.6,198.8,203.0,202.5,202.3,203.3,201.4,201.3,201.2,199.9,201.5,202.7,202.0,203.7,201.9,202.2,202.3,202.0,201.7,200.5,203.0,205.4,203.3,202.8,200.5,204.2,203.8,201.1,203.4,203.3,199.9,200.9,203.5,201.2,202.1,202.6,202.5,201.3,203.2,200.5,200.5,204.6,203.2,201.5,203.0,201.4,203.3,202.4,202.4,202.0,199.9,202.3,202.8,202.7,201.6,201.6,202.0,202.3,201.0,201.3,202.6,202.0,200.0,202.0,202.7,204.4,201.5,200.7,203.2,203.1,199.1,202.3,202.9,203.4,201.3,202.8,203.5,201.7,202.1,202.6,202.5,202.3,201.0,199.4,202.9,202.5,202.6,202.3,201.3,203.2,202.0,201.8,203.5,202.6,201.6,201.4,203.0,200.4,202.4,199.0,202.0,201.9,201.5,200.0,203.0]},"S3":{"ops":[1511381,1131174,1179004,1187654,1188622,1182676,1185805,1181015,1177536,1190636,1179910,1180846,1181641,1187519,1174701,1194858,1185596,1180263,1165219,1195719,1178545,1186003,1189568,1175539,1182710,1184432,1201099,1190971,1191931,1197665,1192061,1200577,1183229,1176295,1200139,1192127,1186047,1187984,1188795,1178676,1190056,1198368,1201603,1182909,1184463,1176775,1196202,1177352,1171319,1166192,1178810,1184159,1165650,1183610,1181721,1192558,1186099,1182055,1186580,1165895,1176997,1162806,1183593,1176705,1187511,1169785,1197694,1182740,1169910,1191358,1178798,1177746,1190537,1192451,1185450,1183240,1176600,1186769,1203830,1167293,1185882,1186398,1183945,1190203,1187570,1182182,1185120,1185382,1175288,1182573,1180786,1206951,1177757,1190336,1178942,1194394,1188040,1185168,1188445,1195339,1170289,1206487,1185745,1180898,1185584,1192143,1191540,1184809,1194977,1187567,1188516,1202046,1198213,1190275,1189894,1195217,1196288,1198497],"du":[237.5,240.0,241.8,241.0,239.7,241.7,239.8,237.8,236.9,238.8,236.2,241.6,237.1,237.0,237.4,238.9,241.3,238.1,239.7,239.7,240.3,236.1,238.5,237.8,236.7,239.3,237.7,237.9,238.8,235.9,238.0,238.6,238.2,237.4,240.2,239.0,238.6,238.4,239.8,238.2,239.7,238.7,238.6,242.4,236.5,241.4,239.2,239.6,238.9,240.1,238.6,236.7,237.1,239.7,237.4,240.6,240.0,239.6,238.5,239.5,240.3,238.0,238.9,235.7,236.9,237.4,240.4,238.3,241.3,238.4,238.5,239.6,238.7,235.7,239.1,238.6,237.8,239.7,239.5,238.9,242.3,237.0,242.5,241.9,240.8,241.1,238.1,238.3,242.2,237.6,241.3,238.4,238.7,240.0,235.0,239.0,242.0,240.0,240.7,240.1,241.3,242.7,238.2,240.8,238.2,236.0,237.9,238.3,239.8,239.7,240.7,239.7,242.7,239.9,241.0,239.3,238.8,240.7]},"S4":{"ops":[1545850,1114864,1172540,1170861,1173396,1165517,1175188,1177002,1168850,1172198,1165505,1183201,1176153,1165030,1174644,1171230,1168080,1182986,1163595,1165323,1180060,1177124,1184559,1178272,1170276,1180611,1173109,1171600,1170454,1175743,1175950,1173914,1179200,1164068,1177972,1171666,1170972,1161364,1168713,1169665,1163709,1161062,1179654,1165329,1166630,1178280,1181225,1175269,1178725,1175036,1174745,1165383,1174038,1178242,1180469,1170388,1158062,1173235,1168148,1162043,1169123,1164010,1167249,1173051,1182191,1168402,1185702,1170294,1166911,1181173,1166921,1169207,1175151,1166426,1168359,1170573,1171655,1178870,1164293,1174288,1168455,1172288,1170658,1180202,1169050,1174595,1176097,1161758,1179357,1181063,1168333,1177328,1166247,1172867,1168083,1170846,1172164,1168204,1176551,1171923,1181805,1172678,1180723,1156853,1170601,1168849,1184396,1198226,1184564,1178828,1176614,1183242,1177249,1178779,1181866,1179416,1173205,1193882],"du":[240.6,243.1,236.1,235.6,235.2,237.4,234.4,233.7,238.6,234.6,238.2,234.0,236.5,233.1,234.3,235.3,234.2,232.2,233.5,236.1,234.4,234.2,235.5,233.2,236.7,237.6,233.6,236.5,236.6,234.3,235.4,235.9,237.0,236.5,236.3,234.4,234.4,236.3,235.9,236.6,235.9,235.3,234.1,237.8,234.7,234.6,235.5,234.6,234.0,235.4,234.2,236.9,237.7,235.7,232.8,231.9,236.0,234.6,233.9,237.4,235.3,234.7,237.5,235.0,236.4,232.1,236.0,235.5,234.3,236.3,237.2,237.7,235.0,234.4,234.4,236.3,233.2,235.0,236.1,233.7,235.6,236.7,235.8,235.9,234.8,235.0,232.6,236.2,235.2,234.0,234.2,235.0,236.0,234.5,234.0,234.0,235.4,239.3,235.9,234.1,236.7,233.3,234.4,237.1,235.1,234.4,233.7,234.8,236.2,236.5,233.2,236.2,236.3,238.0,234.0,234.4,236.5,237.1]}},"E":{"T2":{"ops":1432827,"ios":1.008,"res":1.0,"hit":0.9999,"sa":null,"wa":null,"bc":10.86,"keys":100000000,"leaf":4.42,"idx":2.25,"mbs":2301,"kbpg":1.57,"du":172.8,"rss":7.16},"T7":{"ops":1015677,"ios":null,"res":1.0,"hit":0.9541,"sa":1.86,"wa":3.51,"bc":10.79,"keys":100000000,"leaf":4.49,"idx":3.17,"mbs":2573,"kbpg":null,"du":192.9,"rss":11.74},"T8":{"ops":1188326,"ios":null,"res":1.0,"hit":0.4607,"sa":2.19,"wa":3.41,"bc":10.75,"keys":100000000,"leaf":4.51,"idx":3.57,"mbs":2924,"kbpg":null,"du":226.9,"rss":11.72},"L2":{"r5":[71404,71641,244,400,500],"r25":[355684,358206,568,1200,1568],"r50":[711432,716413,1120,3744,5696],"r75":[1067230,1074620,8064,38400,59392]},"L7":{"r5":[50618,50783,90,109,126],"r25":[252253,253919,103,228,1328],"r50":[504406,507838,127,3104,5056],"r75":[756614,761757,186,5440,19200]},"L8":{"r5":[59221,59416,89,107,127],"r25":[295047,297081,103,276,1568],"r50":[590131,594163,146,3136,5184],"r75":[885190,891244,230,7360,22528]},"T2_m50":{"ops":1411572,"ios":1.008,"res":0.742,"hit":0.9999,"sa":null,"wa":null,"bc":4.94,"keys":100000000,"leaf":4.4,"idx":2.26,"mbs":2267,"kbpg":1.57,"du":173.2,"rss":7.04},"L2_m50":{"r5":[70341,70578,242,404,528],"r25":[350492,352893,552,1168,1504],"r50":[700891,705786,1072,3392,5184],"r75":[1051539,1058679,9216,44544,68608]},"T2_m10":{"ops":788361,"ios":1.731,"res":0.15,"hit":0.6486,"sa":null,"wa":null,"bc":0.99,"keys":100000000,"leaf":4.37,"idx":2.24,"mbs":3043,"kbpg":3.77,"du":172.5,"rss":3.06},"L2_m10":{"r5":[39290,39418,336,600,792],"r25":[196439,197090,460,992,1632],"r50":[391566,394180,976,1984,3520],"r75":[587291,591270,1808,4160,6400]},"T2_m3":{"ops":692544,"ios":1.917,"res":0.063,"hit":0.556,"sa":null,"wa":null,"bc":0.41,"keys":100000000,"leaf":4.26,"idx":2.23,"mbs":3078,"kbpg":4.34,"du":171.3,"rss":2.26},"L2_m3":{"r5":[34514,34627,352,624,824],"r25":[172569,173136,464,984,1488],"r50":[343950,346272,944,1904,3360],"r75":[515841,519408,1696,3744,5760]},"T2_m1":{"ops":659961,"ios":2.043,"res":0.021,"hit":0.4935,"sa":null,"wa":null,"bc":0.14,"keys":100000000,"leaf":4.29,"idx":2.27,"mbs":3206,"kbpg":4.74,"du":173.9,"rss":1.94},"L2_m1":{"r5":[32891,32998,364,648,832],"r25":[164447,164990,472,1024,1616],"r50":[327746,329980,960,1888,3424],"r75":[491693,494970,1744,3776,5568]},"T2_m05":{"ops":561863,"ios":2.269,"res":0.01,"hit":0.382,"sa":null,"wa":null,"bc":0.07,"keys":100000000,"leaf":4.23,"idx":2.25,"mbs":3163,"kbpg":5.5,"du":173.4,"rss":1.93},"L2_m05":{"r5":[28001,28093,388,728,1008],"r25":[140005,140465,504,1168,2336],"r50":[279005,280931,960,2080,3776],"r75":[418557,421397,1776,4416,6592]},"T2_m01":{"ops":412471,"ios":2.829,"res":0.002,"hit":0.1079,"sa":null,"wa":null,"bc":0.01,"keys":100000000,"leaf":4.24,"idx":2.25,"mbs":3133,"kbpg":7.42,"du":172.5,"rss":1.85},"L2_m01":{"r5":[20556,20623,460,840,1200],"r25":[102780,103117,584,1280,2976],"r50":[205556,206235,976,2400,4416],"r75":[307223,309353,1712,4544,6784]},"T7_m10":{"ops":320248,"ios":null,"res":0.131,"hit":0.557,"sa":1.83,"wa":3.66,"bc":0.99,"keys":100000000,"leaf":4.56,"idx":3.01,"mbs":1708,"kbpg":null,"du":189.4,"rss":6.35},"L7_m10":{"r5":[17512,16012,89,136,180],"r25":[79800,80062,88,108,126],"r50":[159599,160124,95,126,224],"r75":[239392,240186,94,136,260]},"T7_m5":{"ops":305627,"ios":null,"res":0.065,"hit":0.4433,"sa":1.83,"wa":3.67,"bc":0.49,"keys":100000000,"leaf":4.47,"idx":3.03,"mbs":1868,"kbpg":null,"du":189.2,"rss":5.7},"L7_m5":{"r5":[16601,15281,93,142,194],"r25":[76155,76406,92,114,140],"r50":[152313,152813,99,136,222],"r75":[227706,229220,98,146,268]},"T8_m10":{"ops":1179498,"ios":null,"res":0.12,"hit":0.0691,"sa":2.2,"wa":3.44,"bc":0.98,"keys":100000000,"leaf":4.51,"idx":3.65,"mbs":2914,"kbpg":null,"du":227.5,"rss":7.4},"L8_m10":{"r5":[58776,58974,88,109,125],"r25":[292901,294874,103,236,736],"r50":[585717,589749,140,2944,4864],"r75":[878412,884623,232,6720,22784]},"T8_m5":{"ops":1177950,"ios":null,"res":0.06,"hit":0.0471,"sa":2.19,"wa":3.44,"bc":0.48,"keys":100000000,"leaf":4.54,"idx":3.6,"mbs":2910,"kbpg":null,"du":226.5,"rss":6.74},"L8_m5":{"r5":[58699,58897,89,109,124],"r25":[292519,294487,104,254,880],"r50":[584859,588975,140,2880,4672],"r75":[877343,883462,232,7232,23808]}},"EPLAN":{"reads":[{"tag":"","target":"100%","cache":"10.9 GB","st":"done"},{"tag":"_m50","target":"50%","cache":"5.0 GB","st":"done"},{"tag":"_m10","target":"10%","cache":"1.0 GB","st":"done"},{"tag":"_m3","target":"~4%","cache":"0.41 GB","st":"done"},{"tag":"_m1","target":"~1.4%","cache":"0.14 GB","st":"done"},{"tag":"_m05","target":"~0.7%","cache":"0.07 GB","st":"done"},{"tag":"_m01","target":"~0.1%","cache":"0.014 GB","st":"done"}],"writes":[{"tag":"","target":"100%","cache":"10.9 GB","st":{"T7":"done","T8":"done"}},{"tag":"_m10","target":"10%","cache":"1.0 GB","st":{"T7":"done","T8":"done"}},{"tag":"_m5","target":"5%","cache":"0.50 GB","st":{"T7":"done","T8":"done"}}]}};
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, parent, text){ const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; if (parent) parent.appendChild(e); return e; }
+function h(html){ const t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstChild; }
+function fmt(v){ if (v >= 1e7) return (v/1e6).toFixed(1) + "M"; if (v >= 1e6) return (v/1e6).toFixed(2) + "M"; if (v >= 1e3) return Math.round(v/1e3) + "K"; return String(Math.round(v)); }
+function lat(u){ if (u < 1000) return u + " µs"; if (u < 1e4) return (u/1e3).toFixed(2) + " ms"; if (u < 1e5) return (u/1e3).toFixed(1) + " ms"; if (u < 1e6) return Math.round(u/1e3) + " ms"; return (u/1e6).toFixed(1) + " s"; }
+function heat(u){ return u < 1e3 ? "h0" : u < 1e4 ? "h1" : u < 1e5 ? "h2" : u < 1e6 ? "h3" : "h4"; }
+const comma = v => v.toLocaleString("en-US");
+const wt = l => l === "on" ? "non-blind" : "blind";
+
+// id, value, kind, durability, lookup, spaceAmp, WA vs ingest, WA vs user, ops, cpu, disk, rss
+const W = [["T3", "1 KB", "insert", "nd", "on", 1.18, 2.71, 2.74, 1269599, 93.5, 91.9, 18.21], ["T4", "1 KB", "insert", "nd", "off", 1.17, 2.71, 2.75, 1315775, 92.9, 75.4, 18.24], ["T5", "1 KB", "insert", "du", "on", 1.18, 2.72, 2.76, 1267267, 95.8, 94.9, 15.27], ["T6", "1 KB", "insert", "du", "off", 1.17, 2.73, 2.77, 1342901, 95.6, 75.8, 15.22], ["T7", "1 KB", "overwrite", "nd", "on", 1.86, 3.51, 3.54, 1015677, 92.8, 88.3, 11.74], ["T8", "1 KB", "overwrite", "nd", "off", 2.19, 3.41, 3.45, 1188326, 91.7, 92.0, 11.72], ["T9", "1 KB", "overwrite", "du", "on", 1.8, 3.53, 3.58, 958274, 91.7, 87.1, 8.46], ["T10", "1 KB", "overwrite", "du", "off", 2.16, 3.45, 3.5, 1183241, 91.9, 91.9, 8.69], ["T13", "8 B", "insert", "nd", "on", 5.0, 16.57, 28.17, 2166989, 97.8, 99.1, 18.47], ["T14", "8 B", "insert", "nd", "off", 5.33, 11.74, 19.96, 3643788, 97.8, 63.7, 18.8], ["T15", "8 B", "insert", "du", "on", 4.86, 26.11, 44.39, 1403716, 97.6, 95.3, 15.49], ["T16", "8 B", "insert", "du", "off", 4.92, 23.95, 40.72, 1666905, 97.8, 58.6, 15.42], ["T17", "8 B", "overwrite", "nd", "on", 7.51, 22.86, 38.8, 464915, 27.9, 94.9, 17.42], ["T18", "8 B", "overwrite", "nd", "off", 15.58, 13.15, 22.31, 3036575, 98.3, 59.3, 19.28], ["T19", "8 B", "overwrite", "du", "on", 7.93, 25.46, 43.29, 692227, 79.6, 99.9, 15.1], ["T20", "8 B", "overwrite", "du", "off", 9.36, 24.32, 41.34, 1558349, 97.9, 57.7, 15.55]];
+const R = [{"id": "T1", "vs": "1 KB", "ds": "20M keys in memory", "ops": 22035077, "cpu": 98, "disk": 0, "rss": 31.57, "ios": 0, "shape": "80 IO threads · 96 × 128"}, {"id": "T11", "vs": "8 B", "ds": "200M keys in memory", "ops": 91614012, "cpu": 99, "disk": 0, "rss": 43.33, "ios": 0, "shape": "80 IO threads · 80 × 2048"}, {"id": "T2", "vs": "1 KB", "ds": "100M keys on disk", "ops": 1432827, "cpu": 99, "disk": 100, "rss": 7.16, "ios": 1.008, "kb": 1.57}, {"id": "T12", "vs": "8 B", "ds": "1B keys on disk", "ops": 859437, "cpu": 93, "disk": 100, "rss": 16.87, "ios": 1.711, "kb": 3.72}];
+const KIND = ["read · in memory","read · disk","insert","insert","insert","insert","overwrite","overwrite","overwrite","overwrite"];
+const DUR = [null,null,"nd","nd","du","du","nd","nd","du","du"];
+const LK = [null,null,"on","off","on","off","on","off","on","off"];
+function meta(n){ const m = (n - 1) % 10; return {vs: n <= 10 ? "1 KB" : "8 B", kind: KIND[m], dur: DUR[m], lk: LK[m]}; }
+const durPill = d => d === "nd" ? '<span class="pill nd">non-durable</span>' : d === "du" ? '<span class="pill du">durable</span>' : '<span class="off">–</span>';
+const LOADS = ["5%","25%","50%","75%"];
+function flag(id, i){ const r = DATA.lat[id][i]; if (id === "L11" && i >= 2) return "client-bound"; return r[0] / r[1] < 0.95 ? "overloaded" : ""; }
+
+// heat keys
+for (const k of ["heatkey1","heatkey2"]){
+  document.getElementById(k).innerHTML = '<span style="background:var(--sunk);color:var(--muted)">p99</span><span class="h0">&lt; 1 ms</span><span class="h1">1–10 ms</span><span class="h2">10–100 ms</span><span class="h3">0.1–1 s</span><span class="h4">≥ 1 s</span>';
+}
+
+// scorecard
+(function(){
+  const t = document.getElementById("score");
+  let s = '<thead><tr><th>ID</th><th>Workload</th><th>Durability</th><th>Write type</th><th class="r">Max ops/s</th><th class="r">Space amp</th><th class="r">Write amp</th><th class="r">RSS</th><th class="r">p99 @ 25%</th><th class="r">p99 @ 50%</th></tr></thead><tbody>';
+  for (const vs of ["1 KB","8 B"]){
+    const base = vs === "1 KB" ? 0 : 10;
+    const ops = n => { const r = R.find(x => x.id === "T" + n); if (r) return r.ops; return W.find(x => x[0] === "T" + n)[8]; };
+    let max = 0; for (let n = base + 1; n <= base + 10; n++) max = Math.max(max, ops(n));
+    s += `<tr class="gh"><td colspan="10">${vs} values · ${vs === "1 KB" ? "100M keys on disk, 20M in memory" : "1B keys on disk, 200M in memory"}</td></tr>`;
+    for (let n = base + 1; n <= base + 10; n++){
+      const m = meta(n), w = W.find(x => x[0] === "T" + n), v = ops(n), L = DATA.lat["L" + n];
+      const color = m.dur === "du" ? "var(--du)" : m.dur === "nd" ? "var(--nd)" : "var(--rd)";
+      s += `<tr><td class="id">T${n}</td><td>${m.kind}</td><td>${m.dur ? durPill(m.dur) : durPill(null)}</td><td>${m.lk ? wt(m.lk) : '<span class="off">–</span>'}</td>`;
+      s += `<td class="r op"><div class="bar"><span>${fmt(v)}</span><i style="width:${Math.max(2, 110 * v / max)}px;background:${color}"></i></div></td>`;
+      s += `<td class="r">${w ? w[5].toFixed(2) + "×" : '<span class="off">–</span>'}</td><td class="r">${w ? w[6].toFixed(1) + "×" : '<span class="off">–</span>'}</td><td class="r">${(w ? w[11] : R.find(x => x.id === "T" + n).rss).toFixed(1)} GB</td>`;
+      for (const i of [1, 2]) s += `<td class="hc ${heat(L[i][3])}">${lat(L[i][3])}</td>`;
+      s += "</tr>";
+    }
+  }
+  t.innerHTML = s + "</tbody>";
+})();
+
+// write bars
+function writeChart(id, vs){
+  const svg = document.getElementById(id);
+  const rows = [["insert","on"],["insert","off"],["overwrite","on"],["overwrite","off"]].map(([k, l]) => {
+    const nd = W.find(x => x[1] === vs && x[2] === k && x[3] === "nd" && x[4] === l), du = W.find(x => x[1] === vs && x[2] === k && x[3] === "du" && x[4] === l);
+    return [k[0].toUpperCase() + k.slice(1), wt(l), nd, du];
+  });
+  const Wd = 560, L = 118, Rm = 96, top = 8, rowH = 66, bh = 21, H = top + rows.length * rowH + 24;
+  svg.setAttribute("viewBox", `0 0 ${Wd} ${H}`);
+  const max = Math.max(...rows.flatMap(r => [r[2][8], r[3][8]]));
+  const step = max > 2e6 ? 1e6 : 2.5e5, xmax = Math.ceil(max / step) * step;
+  const x = v => L + (Wd - L - Rm) * v / xmax;
+  for (let t = 0; t <= xmax + 1; t += step){
+    el("line", {x1: x(t), x2: x(t), y1: top, y2: H - 20, class: t ? "gl" : "ax"}, svg);
+    el("text", {x: x(t), y: H - 5, "text-anchor": "middle"}, svg, t ? fmt(t) : "0");
+  }
+  rows.forEach((r, i) => {
+    const y = top + i * rowH + 6;
+    el("text", {x: 0, y: y + bh - 2, class: "lbl"}, svg, r[0]);
+    el("text", {x: 0, y: y + bh + 14, class: "dim"}, svg, r[1]);
+    [[r[2], "var(--nd)", 0], [r[3], "var(--du)", bh + 3]].forEach(([w, c, dy]) => {
+      el("rect", {x: L, y: y + dy, width: Math.max(1, x(w[8]) - L), height: bh, fill: c, rx: 1.5}, svg);
+      const t = el("text", {x: x(w[8]) + 6, y: y + dy + 15, class: "val"}, svg, fmt(w[8]));
+      if (dy){ const d = (w[8] / r[2][8] - 1) * 100; el("text", {x: x(w[8]) + 6 + 44, y: y + dy + 15, class: "dim"}, svg, (d >= 0 ? "+" : "−") + Math.abs(d).toFixed(0) + "%"); }
+      el("title", {}, t, `${w[0]} ${comma(w[8])} set/s`);
+    });
+  });
+}
+writeChart("w1k", "1 KB"); writeChart("w8b", "8 B");
+
+// read cards
+(function(){
+  const box = document.getElementById("readcards");
+  for (const r of R){
+    let sq = "";
+    if (r.ios){ let left = r.ios; while (left > 0.001){ const f = Math.min(1, left); sq += `<i><b style="width:${(f * 100).toFixed(0)}%"></b></i>`; left -= f; } sq = `<div class="ios">${sq}<span>${r.ios.toFixed(3)} IOs / GET</span></div>`; }
+    else sq = `<div class="ios zero"><i></i><span class="off">0 IOs · all hits</span></div>`;
+    box.appendChild(h(`<div class="panel rcard"><div class="top"><span class="eyebrow">${r.id} · ${r.vs}</span><span class="pill rd">${r.ios ? "Document Cache off" : "Document Cache on"}</span></div>
+      <span class="v">${fmt(r.ops)}<small>get/s</small></span>${sq}
+      <dl><dt>Dataset</dt><dd>${r.ds}</dd><dt>CPU · disk</dt><dd>${r.cpu}% · ${r.disk}%</dd>${r.kb ? `<dt>Read / GET</dt><dd>${r.kb.toFixed(2)} KB</dd>` : ""}<dt>RSS</dt><dd>${r.rss.toFixed(1)} GB</dd>${r.shape ? `<dt>Client · server</dt><dd>${r.shape}</dd>` : ""}</dl></div>`));
+  }
+})();
+
+// generic line chart
+function lineChart(svg, o){
+  const Wd = o.w || 560, H = o.h || 260, L = o.l || 56, Rm = o.r || 16, T = 14, B = o.b || 30;
+  svg.setAttribute("viewBox", `0 0 ${Wd} ${H}`);
+  const xs = v => L + (Wd - L - Rm) * (v - o.x[0]) / (o.x[1] - o.x[0]);
+  const ly = v => o.log ? Math.log10(v) : v, y0 = ly(o.y[0]), y1 = ly(o.y[1]);
+  const ys = v => T + (H - T - B) * (1 - (ly(Math.max(v, o.y[0])) - y0) / (y1 - y0));
+  for (const t of o.yt){ el("line", {x1: L, x2: Wd - Rm, y1: ys(t), y2: ys(t), class: "gl"}, svg); el("text", {x: L - 8, y: ys(t) + 4, "text-anchor": "end"}, svg, o.yf(t)); }
+  el("line", {x1: L, x2: Wd - Rm, y1: H - B, y2: H - B, class: "ax"}, svg);
+  for (const t of o.xt){ el("text", {x: xs(t), y: H - B + 17, "text-anchor": "middle"}, svg, o.xf(t)); }
+  if (o.xlabel) el("text", {x: Wd - Rm, y: H - 1, "text-anchor": "end", class: "dim"}, svg, o.xlabel);
+  const ends = [];
+  for (const s of o.series){
+    const d = s.pts.map((p, i) => (i ? "L" : "M") + xs(p[0]).toFixed(1) + " " + ys(p[1]).toFixed(1)).join("");
+    el("path", {d, fill: "none", stroke: s.color, "stroke-width": s.sw || 2, "stroke-dasharray": s.dash || "none", "stroke-linejoin": "round", "stroke-linecap": "round"}, svg);
+    if (s.dots) for (const p of s.pts){ el("circle", {cx: xs(p[0]), cy: ys(p[1]), r: 3.5, fill: "var(--panel)", stroke: s.color, "stroke-width": 2}, svg); }
+    if (s.vals) for (const p of s.pts){ el("text", {x: xs(p[0]), y: ys(p[1]) - 9, "text-anchor": "middle", class: "val"}, svg, s.vals(p)); }
+    if (s.end){ const p = s.pts[s.pts.length - 1]; ends.push({y: ys(p[1]), x: xs(p[0]), t: s.end, c: s.color}); }
+  }
+  ends.sort((a, b) => a.y - b.y);
+  for (let i = 1; i < ends.length; i++) if (ends[i].y - ends[i - 1].y < 13) ends[i].y = ends[i - 1].y + 13;
+  for (const e of ends) el("text", {x: e.x + 6, y: e.y + 4, class: "val", style: `fill:${e.c}`}, svg, e.t);
+}
+
+// latency heatmap + detail
+(function(){
+  const hm = document.getElementById("hm");
+  let s = '<div class="hd">Row</div>' + LOADS.map(l => `<div class="hd">${l} load</div>`).join("");
+  for (let n = 1; n <= 20; n++){
+    if (n === 1 || n === 11) s += `<div class="g">${n === 1 ? "1 KB values" : "8 B values"}</div>`;
+    const m = meta(n), id = "L" + n, L = DATA.lat[id];
+    s += `<div class="rw" role="option" tabindex="0" data-id="${id}"><div class="nm"><span class="i">${id}</span><span class="d">${m.kind}${m.dur ? " · " + (m.dur === "nd" ? "non-durable" : "durable") + " · " + wt(m.lk) : ""}</span></div>`;
+    L.forEach((r, i) => { const f = flag(id, i); s += `<div class="c ${heat(r[3])}"><span class="s">${fmt(r[0])}/s</span><span class="p">${lat(r[3])}</span><span class="s">${lat(r[2])} · ${lat(r[4])}</span>${f ? `<span class="f">${f}</span>` : ""}</div>`; });
+    s += "</div>";
+  }
+  hm.innerHTML = s;
+  const detail = document.getElementById("detail");
+  function show(id){
+    hm.querySelectorAll(".rw").forEach(r => { const on = r.dataset.id === id; r.classList.toggle("sel", on); r.setAttribute("aria-selected", on); });
+    const n = +id.slice(1), m = meta(n), L = DATA.lat[id];
+    detail.innerHTML = `<span class="id">${id} · ${m.vs}</span><h3>${m.kind[0].toUpperCase() + m.kind.slice(1)}${m.dur ? ", " + (m.dur === "nd" ? "non-durable" : "durable") + ", " + wt(m.lk) : ""}</h3>
+      <div class="legend"><span><i class="ln" style="border-color:var(--rd)"></i>p50</span><span><i class="ln" style="border-color:var(--ink)"></i>p99</span><span><i class="ln d" style="border-color:var(--bad)"></i>p99.9</span></div>
+      <svg id="dsvg" role="img" aria-label="${id} latency by load"></svg>
+      <div class="tbl"><table><thead><tr><th>Load</th><th class="r">Target</th><th class="r">Achieved</th><th class="r">p50</th><th class="r">p99</th><th class="r">p99.9</th></tr></thead><tbody>${L.map((r, i) => `<tr><td>${LOADS[i]}</td><td class="r">${fmt(r[1])}</td><td class="r">${fmt(r[0])}${flag(id, i) ? ' <span class="tag2 no">' + flag(id, i) + '</span>' : ""}</td><td class="r">${lat(r[2])}</td><td class="r">${lat(r[3])}</td><td class="r">${lat(r[4])}</td></tr>`).join("")}</tbody></table></div>`;
+    const all = L.flatMap(r => [r[2], r[3], r[4]]), lo = Math.pow(10, Math.floor(Math.log10(Math.min(...all)))), hi = Math.pow(10, Math.ceil(Math.log10(Math.max(...all))));
+    const yt = []; for (let v = lo; v <= hi; v *= 10) yt.push(v);
+    const xs = [5, 25, 50, 75];
+    lineChart(document.getElementById("dsvg"), {w: 420, h: 250, l: 62, r: 20, b: 44, x: [0, 80], xt: xs, xf: v => v + "%", log: true, y: [lo, hi], yt, yf: lat,
+      series: [{pts: L.map((r, i) => [xs[i], r[2]]), color: "var(--rd)", dots: true}, {pts: L.map((r, i) => [xs[i], r[3]]), color: "var(--ink)", dots: true, sw: 2.5}, {pts: L.map((r, i) => [xs[i], r[4]]), color: "var(--bad)", dots: true, dash: "5 4"}]});
+    const svg = document.getElementById("dsvg");
+    L.forEach((r, i) => el("text", {x: 62 + (420 - 62 - 20) * xs[i] / 80, y: 250 - 8, "text-anchor": "middle", class: "dim"}, svg, fmt(r[0]) + "/s"));
+  }
+  hm.addEventListener("click", e => { const r = e.target.closest(".rw"); if (r) show(r.dataset.id); });
+  hm.addEventListener("keydown", e => {
+    const r = e.target.closest(".rw"); if (!r) return;
+    if (e.key === "Enter" || e.key === " "){ e.preventDefault(); show(r.dataset.id); }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp"){ e.preventDefault(); const rows = [...hm.querySelectorAll(".rw")], i = rows.indexOf(r) + (e.key === "ArrowDown" ? 1 : -1); if (rows[i]){ rows[i].focus(); show(rows[i].dataset.id); } }
+  });
+  show("L7");
+})();
+
+// sustainability
+(function(){
+  const LIVE = 100e6 * 1036 / 1e9;
+  const sty = {S1: ["var(--nd)", "none"], S2: ["var(--du)", "none"], S3: ["var(--nd)", "6 4"], S4: ["var(--du)", "6 4"]};
+  const mk = f => Object.keys(sty).map(k => ({pts: DATA.sus[k][f].map((v, i) => [i + 1, f === "du" ? v / LIVE : v]).slice(2), color: sty[k][0], dash: sty[k][1], sw: 1.8, end: k}));
+  lineChart(document.getElementById("sops"), {h: 270, r: 34, x: [0, 120], xt: [0, 30, 60, 90, 120], xf: v => v + " min", y: [8e5, 1.3e6], yt: [8e5, 9e5, 1e6, 1.1e6, 1.2e6, 1.3e6], yf: fmt, series: mk("ops")});
+  lineChart(document.getElementById("samp"), {h: 270, r: 34, x: [0, 120], xt: [0, 30, 60, 90, 120], xf: v => v + " min", y: [1.8, 3], yt: [1.8, 2, 2.2, 2.4, 2.6, 2.8, 3], yf: v => v.toFixed(1) + "×", series: mk("du")});
+  const rows = [["S1", "nd", "on", 1012699, "\u00b10.9%", "~2.00", "1.71", 3.51, 11.66], ["S2", "du", "on", 968299, "\u00b11.0%", "~1.95", "1.70", 3.53, 8.51], ["S3", "nd", "off", 1184633, "\u00b11.6%", "~2.31", "1.98", 3.42, 11.68], ["S4", "du", "off", 1173441, "\u00b11.2%", "~2.27", "1.94", 3.44, 8.78]];
+  let s = '<thead><tr><th>Run</th><th>Durability</th><th>Write type</th><th class="r">Sustained set/s</th><th class="r">Spread after 10 min</th><th class="r">Space amp while running</th><th class="r">Space amp at rest</th><th class="r">Write amp</th><th class="r">RSS</th></tr></thead><tbody>';
+  for (const r of rows) s += `<tr><td class="id">${r[0]}</td><td>${durPill(r[1])}</td><td>${wt(r[2])}</td><td class="r"><b>${comma(r[3])}</b></td><td class="r">${r[4]}</td><td class="r">${r[5]}×</td><td class="r">${r[6]}×</td><td class="r">${r[7]}×</td><td class="r">${r[8].toFixed(1)} GB</td></tr>`;
+  document.getElementById("stbl").innerHTML = s + "</tbody>";
+})();
+
+// residency
+(function(){
+  const rows = [["T1 / L1 in-memory read", "30 GB", 100, "100%", "100%", "100%"], ["T2 / L2 disk read", "172–179 GB", 9.8, "100%", "100% (hit 99.99%)", "9.6–9.9%"], ["T7–T10 / L7–L10 overwrite", "186–226 GB", 8.4, "100%", "100%", "7.6–9.2%"], ["S1 / S2 two-hour overwrite", "~204 GB", 8.4, "100%", "100%", "8.4%"], ["T3–T6 insert, run average", "990–1059 GB", 1.7, "~70%", "~25%", "1.6–1.7%"], ["L3–L6 insert, 75% step", "1.83–1.95 TB", 0.9, "~31–33%", "~11%", "0.9%"]];
+  let s = '<thead><tr><th>1 KB rows</th><th class="r">On disk (avg)</th><th class="r">Memory ÷ on disk</th><th class="r">Index blocks resident</th><th class="r">Index + key leaves resident</th></tr></thead><tbody>';
+  for (const r of rows) s += `<tr><td>${r[0]}</td><td class="r">${r[1]}</td><td class="r"><div class="bar"><span>${r[5]}</span><i style="width:${Math.max(2, r[2] * 1.2)}px;background:var(--rd)"></i></div></td><td class="r">${r[3]}</td><td class="r">${r[4]}</td></tr>`;
+  document.getElementById("rtbl").innerHTML = s + "</tbody>";
+
+})();
+
+
+// index residency ladder
+(function(){
+  const bpk = t => { if (!t || t.bc == null) return "–"; const b = t.bc * 1e9 / (t.keys || 1e8); return (b >= 10 ? Math.round(b) : b.toFixed(1)) + " B"; };
+  const E = DATA.E, pct = v => v == null ? "–" : v >= 0.995 ? "100%" : (v * 100 < 10 ? (v * 100).toFixed(1) : Math.round(v * 100)) + "%";
+  const pill = st => st === "done" ? "" : `<span class="tag2 ${st.startsWith("running") ? "ok" : ""}" style="${st.startsWith("running") ? "" : "color:var(--muted);border:1px solid var(--line)"}">${st}</span>`;
+  const latCells = L => L ? ["r5","r25","r50","r75"].map(k => L[k] ? `<td class="hc ${heat(L[k][3])}" title="${fmt(L[k][0])}/s · p50 ${lat(L[k][2])} · p99.9 ${lat(L[k][4])}">${lat(L[k][3])}<span class="off" style="display:block;font:10.5px var(--mono)">${fmt(L[k][0])}/s</span></td>` : '<td class="r off">–</td>').join("") : '<td class="r off" colspan="4">–</td>';
+  const sq = v => { if (v == null) return '<span class="off">–</span>'; let q = "", left = v; while (left > 0.001){ const f = Math.min(1, left); q += `<i><b style="width:${(f * 100).toFixed(0)}%"></b></i>`; left -= f; } return `<div class="ios" style="justify-content:flex-end">${q}<span>${v.toFixed(2)}</span></div>`; };
+    // Memory given: the full 16 GiB quota at 100%; below that, block cache + the 324 MB pinned memtables.
+  const memGB = (r, t) => r.tag === "" ? 16 * 1.073741824 : t && t.bc != null ? t.bc + 0.34 : null;
+  const gb = v => v == null ? "–" : v >= 10 ? v.toFixed(1) + " GB" : v >= 1 ? v.toFixed(2) + " GB" : Math.round(v * 1000) + " MB";
+  let s = '<thead><tr><th>Target</th><th class="r">Block cache</th><th class="r">Memory per key</th><th class="r">Memory given</th><th class="r">Data on disk</th><th class="r">Data resident</th><th class="r">Index resident</th><th class="r">Cache hit</th><th class="r">get/s</th><th class="r">IOs / GET</th><th class="r">5%</th><th class="r">25%</th><th class="r">50%</th><th class="r">75%</th><th class="r">RSS</th><th></th></tr></thead><tbody>';
+  for (const r of DATA.EPLAN.reads){ const t = E["T2" + r.tag], l = E["L2" + r.tag];
+    const mg = memGB(r, t), du = t && t.du, dr = mg && du ? mg / du * 100 : null;
+    s += `<tr><td><b>${r.target}</b></td><td class="r">${r.cache}</td><td class="r"><b>${bpk(t)}</b></td><td class="r">${gb(mg)}</td><td class="r">${du ? Math.round(du) + " GB" : "–"}</td><td class="r"><b>${dr == null ? "–" : (dr >= 1 ? dr.toFixed(1) : dr.toFixed(2)) + "%"}</b></td><td class="r">${pct(t && t.res)}</td><td class="r">${pct(t && t.hit)}</td><td class="r">${t ? comma(t.ops) : "–"}</td><td class="r">${sq(t && t.ios)}</td>${latCells(l)}<td class="r">${t && t.rss ? t.rss.toFixed(1) + " GB" : "–"}</td><td>${pill(r.st)}</td></tr>`; }
+  document.getElementById("ertbl").innerHTML = s + "</tbody>";
+  s = '<thead><tr><th>Workload</th><th>Target</th><th class="r">Block cache</th><th class="r">Memory per key</th><th class="r">Index resident</th><th class="r">set/s</th><th class="r">vs 100%</th><th class="r">Space amp</th><th class="r">Write amp</th><th class="r">5%</th><th class="r">25%</th><th class="r">50%</th><th class="r">75%</th><th class="r">RSS</th><th></th></tr></thead><tbody>';
+  for (const [id, lid, name] of [["T7","L7","non-blind"],["T8","L8","blind"]]){
+    const base = E[id]; let first = true;
+    for (const r of DATA.EPLAN.writes){ const t = E[id + r.tag], l = E[lid + r.tag], st = r.st[id];
+      s += `<tr${first ? "" : ""}><td>${first ? "overwrite · <b>" + name + "</b>" : ""}</td><td><b>${r.target}</b></td><td class="r">${r.cache}</td><td class="r"><b>${bpk(t)}</b></td><td class="r">${pct(t && t.res)}</td><td class="r">${t ? comma(t.ops) : "–"}</td><td class="r">${t && base && r.tag ? ((t.ops / base.ops - 1) * 100).toFixed(0) + "%" : "–"}</td><td class="r">${t && t.sa ? t.sa.toFixed(2) + "×" : "–"}</td><td class="r">${t && t.wa ? t.wa.toFixed(2) + "×" : "–"}</td>${latCells(l)}<td class="r">${t && t.rss ? t.rss.toFixed(1) + " GB" : "–"}</td><td>${pill(st)}</td></tr>`;
+      first = false; }
+  }
+  document.getElementById("ewtbl").innerHTML = s + "</tbody>";
+  const perKey = t => t.bc * 1e9 / (t.keys || 1e8);
+  const lx = v => Math.log10(v);
+  const ser = tags => tags.map(tg => E["T2" + tg]).filter(t => t && t.bc != null && t.ios != null).sort((a, b) => perKey(a) - perKey(b));
+  const base = ser(DATA.EPLAN.reads.map(r => r.tag));
+  const mk = (svgId, yv, yr, yt, yf, extra) => {
+    const svg = document.getElementById(svgId), series = [];
+    if (base.length) series.push({pts: base.map(t => [lx(perKey(t)), yv(t)]), color: "var(--rd)", dots: true});
+    lineChart(svg, {h: 250, r: 20, x: [lx(0.08), lx(150)], xt: [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100].map(lx), xf: v => { const p = Math.pow(10, v); return (p < 1 ? p.toFixed(1) : Math.round(p)) + " B"; }, xlabel: "block cache per key", y: yr, yt, yf, series});
+    if (extra) extra(svg);
+  };
+  mk("eios", t => t.ios, [0, 3.5], [0, 1, 2, 3], v => v.toFixed(2).replace(/\.00$/, ""), svg => {
+    const H = 250, T = 14, B = 30, y = v => T + (H - T - B) * (1 - v / 3.5);
+    el("line", {x1: 56, x2: 560 - 20, y1: y(3), y2: y(3), stroke: "var(--bad)", "stroke-dasharray": "5 4", "stroke-width": 1.5}, svg);
+    el("text", {x: 60, y: y(3) - 6, style: "fill:var(--bad)"}, svg, "goal: 3 IOs per GET");
+  });
+  mk("eops", t => t.ops, [0, 1.6e6], [0, 4e5, 8e5, 1.2e6, 1.6e6], fmt);
+})();
+
+
+// sparklines
+for (const [id, k, c] of [["spk1","S1","var(--nd)"],["spk3","S3","var(--nd)"]]){
+  const svg = document.getElementById(id), v = DATA.sus[k].ops.slice(2), W = 200, H = 26, lo = Math.min(...v) * 0.97, hi = Math.max(...v) * 1.01;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("preserveAspectRatio", "none");
+  const pts = v.map((y, i) => [W * i / (v.length - 1), H - 2 - (H - 4) * (y - lo) / (hi - lo)]);
+  el("path", {d: "M0 " + H + pts.map(p => "L" + p[0].toFixed(1) + " " + p[1].toFixed(1)).join("") + "L" + W + " " + H + "Z", fill: c, opacity: .12}, svg);
+  el("path", {d: pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(""), fill: "none", stroke: c, "stroke-width": 1.4, "vector-effect": "non-scaling-stroke"}, svg);
+}
+// amp scatter: one zoomed panel per value size
+(function(){
+  const svg = document.getElementById("ampsc"), Wd = 1040, H = 320, T = 30, B = 40, PW = 470;
+  svg.setAttribute("viewBox", `0 0 ${Wd} ${H}`);
+  const panels = [
+    {vs: "1 KB", ox: 50, x: [2.6, 3.8], y: [1, 2.8], xt: [2.6, 2.8, 3, 3.2, 3.4, 3.6, 3.8], yt: [1, 1.5, 2, 2.5],
+     lab: {T3: ["T3–T6", 10, 4], T4: null, T5: null, T6: null, T7: ["T7", 10, -8], T9: ["T9", 10, 14], T8: ["T8", -12, 4, "end"], T10: ["T10", 10, 4]}},
+    {vs: "8 B", ox: 50 + PW + 60, x: [10, 28], y: [4, 17], xt: [10, 14, 18, 22, 26], yt: [4, 8, 12, 16],
+     lab: {T13: ["T13", 10, 4], T14: ["T14", 10, 4], T15: ["T15", 10, 4], T16: ["T16", -10, 4, "end"], T17: ["T17", -10, 4, "end"], T18: ["T18", 10, 4], T19: ["T19", 10, 4], T20: ["T20", 10, 4]}}
+  ];
+  for (const P of panels){
+    const x = v => P.ox + PW * (v - P.x[0]) / (P.x[1] - P.x[0]), y = v => T + (H - T - B) * (1 - (v - P.y[0]) / (P.y[1] - P.y[0]));
+    el("text", {x: P.ox, y: 14, class: "grp"}, svg, P.vs + " values");
+    for (const t of P.yt){ el("line", {x1: P.ox, x2: P.ox + PW, y1: y(t), y2: y(t), class: "gl"}, svg); el("text", {x: P.ox - 8, y: y(t) + 4, "text-anchor": "end"}, svg, t + "×"); }
+    for (const t of P.xt){ el("line", {x1: x(t), x2: x(t), y1: T, y2: H - B, class: "gl"}, svg); el("text", {x: x(t), y: H - B + 16, "text-anchor": "middle"}, svg, t + "×"); }
+    el("line", {x1: P.ox, x2: P.ox + PW, y1: H - B, y2: H - B, class: "ax"}, svg);
+    el("text", {x: P.ox + PW, y: H - 4, "text-anchor": "end", class: "dim"}, svg, "write amp →");
+    el("text", {x: P.ox + 6, y: T + 12, class: "dim"}, svg, "↑ space amp");
+    for (const w of W.filter(w => w[1] === P.vs)){
+      const c = w[3] === "nd" ? "var(--nd)" : "var(--du)", cx = x(w[6]), cy = y(w[5]), blind = w[4] === "off";
+      const dot = el("circle", {cx, cy, r: blind ? 8 : 5.5, fill: blind ? "none" : c, stroke: c, "stroke-width": 2.2}, svg);
+      el("title", {}, dot, `${w[0]} · ${w[1]} ${w[2]} · ${w[3] === "nd" ? "non-durable" : "durable"} · ${wt(w[4])} · space ${w[5]}× · write ${w[6]}×`);
+      const o = P.lab[w[0]]; if (o) el("text", {x: cx + o[1], y: cy + o[2], "text-anchor": o[3] || "start", class: "val"}, svg, o[0]);
+    }
+  }
+})();
+
+
+// nav highlight
+(function(){
+  const links = [...document.querySelectorAll("nav.top a")], map = new Map(links.map(a => [a.getAttribute("href").slice(1), a]));
+  if (!("IntersectionObserver" in window)) return;
+  const io = new IntersectionObserver(es => { for (const e of es) if (e.isIntersecting){ links.forEach(a => a.classList.remove("on")); map.get(e.target.id)?.classList.add("on"); } }, {rootMargin: "-45% 0px -50% 0px"});
+  map.forEach((a, id) => { const s = document.getElementById(id); if (s) io.observe(s); });
+})();
+</script>
