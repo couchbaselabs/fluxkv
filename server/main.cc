@@ -103,6 +103,7 @@ struct Config {
     bool learnedSeqLocator = true; // seqIndex blocks located by a learned model
     bool compactMeta = false; // write DocMeta in its compact form
     double bottomBloomAccuracy = -1; // < 0: magma default
+    double blockWritesRatio = 32; // magma's default is 8
     // Sets SeqTreeBlockSize ONLY -- the data blocks holding document values.
     // KeyTreeBlockSize stays at magma's 4096 default: shrinking it too adds
     // key-index reads (IO/GET 1.13 -> 1.35) and cost 7-11% throughput.
@@ -242,6 +243,8 @@ static void printUsage(const char* prog) {
                  "index (default off; --no-value-ptr-write is the default)\n"
               << "  --no-learned-seq-locator  locate seqIndex data blocks "
                  "through their index blocks (default: learned model)\n"
+              << "  --block-writes-ratio R  L0 size ratio at which a writer waits for "
+                 "L0 compaction (default 32; magma's own default is 8)\n"
               << "  --bottom-bloom-accuracy F  bloom filter accuracy of the "
                  "key index's bottom level, 0 for none (magma default 0.95)\n"
               << "  --compact-meta        write document metadata in the "
@@ -385,6 +388,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"value-ptr-write", no_argument, nullptr, 1103},
             {"no-learned-seq-locator", no_argument, nullptr, 1104},
             {"bottom-bloom-accuracy", required_argument, nullptr, 1105},
+            {"block-writes-ratio", required_argument, nullptr, 1106},
             {"data-block-size", required_argument, nullptr, 1008},
             {"dispatch-batch", required_argument, nullptr, 1018},
             {"cache-size", required_argument, nullptr, 1020},
@@ -548,6 +552,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1105:
             cfg.bottomBloomAccuracy = std::stod(optarg);
+            break;
+        case 1106:
+            cfg.blockWritesRatio = std::stod(optarg);
             break;
         case 1008:
             cfg.dataBlockSize = strtoull(optarg, nullptr, 10);
@@ -827,6 +834,13 @@ int main(int argc, char* argv[]) {
     }
     if (cfg.noValuePtrWrite) {
         magmaCfg.EnableValuePtrWrite = false;
+    }
+    // Past this L0 size ratio a writer waits for its tree's L0 compaction.
+    // One blocked vbucket stalls every client whose pipeline holds a request
+    // for it, so at magma's 8 the whole server froze for seconds (8 B durable
+    // overwrites at 75% load: p99 11.7 s; at 32: 47 ms, same rate).
+    if (cfg.blockWritesRatio > 0) {
+        magmaCfg.LSMBlockWritesThresholdRatio = cfg.blockWritesRatio;
     }
     // Every stored key reaches the bottom level, so for existing keys its
     // filter always answers "maybe"; it only saves a leaf search for absent
