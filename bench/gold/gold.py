@@ -246,7 +246,8 @@ def collect(a):
         print("warning: boxes ran different builds:", json.dumps(builds))
     extra = spec.get("extra", "")
     config = ["index-block seq lookup" if "--no-learned-seq-locator" in extra else "learned seq locator",
-              "value pointers" if "--value-ptr-write" in extra else "no value pointers"] + (["compact metadata"] if "--compact-meta" in extra else [])
+              "value pointers" if "--value-ptr-write" in extra else "no value pointers",
+              "legacy metadata" if "--no-compact-meta" in extra else "compact metadata"]
     labels = [label(h) for h in a.hosts]
     run = {"dates": dates(starts) if starts else "", "builds": {"magma": b.get("magma", "unknown"), "fluxkv": b.get("fluxkv", "unknown"),
            "client": b.get("client", "unknown")},
@@ -291,7 +292,7 @@ def main():
         sp.add_argument("--groups", type=lambda s: s.split(","), help="suite groups (default: all)")
         sp.add_argument("--rows", type=lambda s: s.split(","), help="only groups holding these rows")
         if c == "run":
-            sp.add_argument("--extra", default="", help="server flags for every row; pass as --extra='--compact-meta ...'")
+            sp.add_argument("--extra", default="", help="server flags for every row; pass as --extra='--block-writes-ratio 16 ...'")
             sp.add_argument("--smoke", action="store_true", help="1%% of the keys, 120 s phases")
             sp.add_argument("--poll", type=int, default=60)
             sp.add_argument("--out", help="collect results and build the report here when done")

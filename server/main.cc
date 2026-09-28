@@ -101,7 +101,9 @@ struct Config {
     // less memory, and the key index is 5.4 B/key smaller.
     bool noValuePtrWrite = true; // store no value pointers in the key index
     bool learnedSeqLocator = true; // seqIndex blocks located by a learned model
-    bool compactMeta = false; // write DocMeta in its compact form
+    // Compact DocMeta is 14 B instead of 30 for a typical document; readers
+    // decode either form. -1 = on when magma's storage format allows it.
+    int compactMeta = -1;
     double bottomBloomAccuracy = -1; // < 0: magma default
     double blockWritesRatio = 32; // magma's default is 8
     // Sets SeqTreeBlockSize ONLY -- the data blocks holding document values.
@@ -247,8 +249,9 @@ static void printUsage(const char* prog) {
                  "L0 compaction (default 32; magma's own default is 8)\n"
               << "  --bottom-bloom-accuracy F  bloom filter accuracy of the "
                  "key index's bottom level, 0 for none (magma default 0.95)\n"
-              << "  --compact-meta        write document metadata in the "
-                 "compact form (needs magma storage format 2)\n"
+              << "  --no-compact-meta     write document metadata in the "
+                 "legacy 30-byte form (default: compact when magma's storage "
+                 "format is 2 or newer)\n"
               << "  --cache-size N        document cache budget in bytes "
                  "(default 0 = off); write-through, read-fill\n"
               << "  --cache-shards N      lock shards in the cache (default "
@@ -384,6 +387,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"no-value-ptr-read", no_argument, nullptr, 1013},
             {"learned-seq-locator", no_argument, nullptr, 1100},
             {"compact-meta", no_argument, nullptr, 1101},
+            {"no-compact-meta", no_argument, nullptr, 1107},
             {"no-value-ptr-write", no_argument, nullptr, 1102},
             {"value-ptr-write", no_argument, nullptr, 1103},
             {"no-learned-seq-locator", no_argument, nullptr, 1104},
@@ -539,7 +543,10 @@ static Config parseArgs(int argc, char* argv[]) {
             cfg.learnedSeqLocator = true;
             break;
         case 1101:
-            cfg.compactMeta = true;
+            cfg.compactMeta = 1;
+            break;
+        case 1107:
+            cfg.compactMeta = 0;
             break;
         case 1102:
             cfg.noValuePtrWrite = true;
@@ -857,6 +864,9 @@ int main(int argc, char* argv[]) {
     // Magma stamps each tree with its storage format and refuses newer ones,
     // so tying compact metas to format 2 keeps binaries that cannot read them
     // from opening the data at all.
+    if (cfg.compactMeta < 0) {
+        cfg.compactMeta = magma::GetStorageFormatVersion() >= 2;
+    }
     if (cfg.compactMeta) {
         if (magma::GetStorageFormatVersion() < 2) {
             spdlog::error("--compact-meta needs magma storage format 2, this "

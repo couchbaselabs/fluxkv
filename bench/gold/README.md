@@ -45,7 +45,7 @@ cd bench/gold
     --server ../../build/fluxkv_server --client ../../build/fluxbench --magma-sha <sha>
 ./gold.py plan --hosts 10.0.0.51,10.0.0.52,10.0.0.53,10.0.0.54   # expected wall clock
 nohup ./gold.py run --hosts 10.0.0.51,10.0.0.52,10.0.0.53,10.0.0.54 --name 2026-10-01 \
-    --extra='--compact-meta' --out results/2026-10-01 > gold.log 2>&1 &
+    --out results/2026-10-01 > gold.log 2>&1 &
 ```
 
 `run` hands each group of rows to whichever box is idle, longest group first, and polls until
