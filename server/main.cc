@@ -157,6 +157,12 @@ struct Config {
     // has few victims to choose from; smaller tables let it pick the most
     // fragmented ones. 0 = magma's.
     double sstableDynamicRatio = 0;
+    // Magma checkpoints when a kvstore has written this fraction of its data
+    // (magma default 0.02). At 128 kvstores of ~160 MB that is a checkpoint,
+    // and a forced persistent flush, every ~3 MB per kvstore. Checkpoints
+    // serve rollback; crash safety comes from the WAL. 0 = magma's.
+    double checkpointThreshold = 0;
+    int maxCheckpoints = -1; // -1 = magma's (5)
     size_t lsmBaseLevelSize = 0;
     // Fraction of the seqIndex data level that delta levels may reach before
     // they are merged down. magma's own default is 0.25; Couchbase ships 0.5
@@ -310,6 +316,9 @@ static void printUsage(const char* prog) {
               << "  --lsm-sstable-size N     max sstable bytes (magma "
                  "default 2MB)\n"
               << "  --lsd-levels N       seqIndex LSD levels (magma default 5)\n"
+              << "  --checkpoint-threshold F  checkpoint after a kvstore writes this "
+                 "fraction of its data (magma default 0.02); each forces a flush\n"
+              << "  --max-checkpoints N  checkpoints kept per kvstore (magma default 5)\n"
               << "  --sstable-dynamic-ratio R  max sstable size as a fraction of its "
                  "level (magma default 0.05); smaller gives LSD GC finer victims\n"
               << "  --lsd-tiered-l0      tiered level-0 seqIndex GC (needs "
@@ -431,6 +440,8 @@ static Config parseArgs(int argc, char* argv[]) {
             {"lsm-base-level-size", required_argument, nullptr, 1054},
             {"lsd-frag-ratio", required_argument, nullptr, 1066},
             {"sstable-dynamic-ratio", required_argument, nullptr, 1201},
+            {"checkpoint-threshold", required_argument, nullptr, 1202},
+            {"max-checkpoints", required_argument, nullptr, 1203},
             {"key-level-multiplier", required_argument, nullptr, 1067},
             {"key-warm-new-tables", no_argument, nullptr, 1072},
             {"sstable-write-buffer", required_argument, nullptr, 1074},
@@ -663,6 +674,12 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1201:
             cfg.sstableDynamicRatio = strtod(optarg, nullptr);
+            break;
+        case 1202:
+            cfg.checkpointThreshold = strtod(optarg, nullptr);
+            break;
+        case 1203:
+            cfg.maxCheckpoints = atoi(optarg);
             break;
         case 1067:
             cfg.keyLevelMultiplier = atoi(optarg);
@@ -954,6 +971,12 @@ int main(int argc, char* argv[]) {
     magmaCfg.LSDFragmentationRatio = cfg.lsdFragRatio;
     if (cfg.sstableDynamicRatio > 0) {
         magmaCfg.MaxSSTableDynamicSizeRatio = cfg.sstableDynamicRatio;
+    }
+    if (cfg.checkpointThreshold > 0) {
+        magmaCfg.CheckpointCreationThreshold = cfg.checkpointThreshold;
+    }
+    if (cfg.maxCheckpoints >= 0) {
+        magmaCfg.MaxCheckpoints = cfg.maxCheckpoints;
     }
     magmaCfg.KeyLevelSizeMultiplier = cfg.keyLevelMultiplier;
     magmaCfg.KeyTreeWarmNewTables = cfg.keyWarmNewTables;
