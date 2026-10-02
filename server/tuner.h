@@ -133,6 +133,16 @@ struct TunerConfig {
     // be kept in both directions, which would cycle at the boundary.
     double minGain{0.01};
     double maxLoss{0.005};
+    // Floors under the noise-scaled verdict thresholds. A quiet load (0.1%
+    // window noise) resolves a 0.6% gain; flooring grows at minGain x 2.8
+    // reverted a 24->32 reader grow worth +0.7% four times running. Same
+    // ordering rule as above: growFloor > shrinkFloor.
+    double growFloor{0.006};
+    double shrinkFloor{0.003};
+    // A pool at least this busy is shrunk by at most a quarter of its size:
+    // with growth already failed the busy guard is off, and 2->1 IO threads
+    // at 0.99 busy cost half the throughput for a whole trial.
+    double peggedBusy{0.95};
     // A pool whose threads are this idle is not measurable against global
     // throughput: shrinking it is judged on the idleness alone.
     double idleBusy{0.02};

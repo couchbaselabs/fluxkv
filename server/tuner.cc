@@ -172,9 +172,10 @@ ThreadTuner::Direction& ThreadTuner::dirRef(PoolState& ps, bool grew) {
 }
 
 double ThreadTuner::tolerance(const PoolState& ps) const {
-    // Averaging `measure` windows divides the noise by sqrt(measure).
+    // Standard error of a verdict median: averaging `measure` windows divides
+    // the noise by sqrt(measure). The floors live with the verdicts.
     const double n = ps.measure > 0 ? static_cast<double>(ps.measure) : 1.0;
-    return std::max(cfg_.minGain, ps.noise / std::sqrt(n));
+    return ps.noise / std::sqrt(n);
 }
 
 bool ThreadTuner::rampingUp() const {
@@ -411,6 +412,9 @@ bool ThreadTuner::startTrial(PoolState& ps) {
         n = std::min(n, ps.bounds.max - size);
     } else {
         n = std::min(n, size - ps.bounds.min);
+        if (busy >= cfg_.peggedBusy && !dir.lastGained) {
+            n = std::min(n, roundToStep(size / 4, step));
+        }
         // Do not shrink into the range that would just ask to grow again,
         // unless growing has already been shown not to help, or the last
         // shrink raised throughput: then busy is not what limits this pool
@@ -526,10 +530,13 @@ void ThreadTuner::judge(PoolState& ps, double tput) {
         // counts at about two standard errors of their difference. At one,
         // noisy non-durable loads kept grows on noise (+5-11% under 6-18%).
         const double margin =
-                std::max(cfg_.minGain, 2.0 * std::sqrt(2.0) * tol);
+                std::max(cfg_.growFloor, 2.0 * std::sqrt(2.0) * tol);
         keep = ratio >= 1.0 + margin;
     } else {
-        const double allow = std::max(cfg_.maxLoss, std::min(tol, 0.02));
+        // At most one standard error of the difference, so a shrink cannot
+        // keep a loss a grow of the same step would be able to see.
+        const double allow = std::max(cfg_.shrinkFloor,
+                                      std::min(std::sqrt(2.0) * tol, 0.02));
         keep = ratio >= 1.0 - allow && streakRatio >= 1.0 - allow;
     }
 
@@ -553,7 +560,10 @@ void ThreadTuner::judge(PoolState& ps, double tput) {
             ps.shrinkScale = 0.5 * ps.shrinkScale + 0.5 * seen;
         }
     }
-    dir.lastGained = keep && ratio >= 1.0 + tol;
+    // A gain a grow would have been kept on; momentum and the shrink guard
+    // key off it, so a noise-sized shrink "gain" must not count.
+    dir.lastGained = keep && ratio >= 1.0 + std::max(cfg_.growFloor,
+                                                     2.0 * std::sqrt(2.0) * tol);
     ps.lastTrialGrew = grew;
     if (keep) {
         dir.cap = 0;
