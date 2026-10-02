@@ -207,6 +207,10 @@ struct Config {
     // last flush. Measurement only: it prices the log, it is not a mode to
     // serve from.
     bool noWal = false;
+    // With --no-wal: sync every kvstore (flush + checkpoint, aligned across
+    // its trees) within this many ms, round-robin. Bounds the crash loss
+    // window to ~this interval. 0 = off.
+    int syncIntervalMs = 0;
     // Acknowledge a durable write from a completion thread when the shared
     // log reports it persisted, instead of blocking the writer inside
     // WriteDocs. Needs --durable and --shared-wal.
@@ -319,6 +323,8 @@ static void printUsage(const char* prog) {
               << "  --checkpoint-threshold F  checkpoint after a kvstore writes this "
                  "fraction of its data (magma default 0.02); each forces a flush\n"
               << "  --max-checkpoints N  checkpoints kept per kvstore (magma default 5)\n"
+              << "  --sync-interval-ms N  with --no-wal, sync every kvstore within N ms "
+                 "(round-robin), bounding the crash loss window to ~N ms\n"
               << "  --sstable-dynamic-ratio R  max sstable size as a fraction of its "
                  "level (magma default 0.05); smaller gives LSD GC finer victims\n"
               << "  --lsd-tiered-l0      tiered level-0 seqIndex GC (needs "
@@ -459,6 +465,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"lsm-min-compact-size", required_argument, nullptr, 1056},
             {"lsm-level-multiplier", required_argument, nullptr, 1057},
             {"no-wal", no_argument, nullptr, 1058},
+            {"sync-interval-ms", required_argument, nullptr, 1204},
             {"async-durable", no_argument, nullptr, 1059},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
@@ -680,6 +687,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1203:
             cfg.maxCheckpoints = atoi(optarg);
+            break;
+        case 1204:
+            cfg.syncIntervalMs = atoi(optarg);
             break;
         case 1067:
             cfg.keyLevelMultiplier = atoi(optarg);
@@ -1172,7 +1182,33 @@ int main(int argc, char* argv[]) {
                 wr.max);
     }
 
+    // --no-wal --sync-interval-ms: spread SyncKVStore calls over the interval
+    // so each vbucket is checkpointed once per interval without a burst.
+    std::atomic<bool> syncStop{false};
+    std::thread syncThread;
+    if (cfg.noWal && cfg.syncIntervalMs > 0) {
+        syncThread = std::thread([&] {
+            const auto step = std::chrono::microseconds(
+                    int64_t(cfg.syncIntervalMs) * 1000 / std::max(1, cfg.vbuckets));
+            auto next = std::chrono::steady_clock::now();
+            for (uint16_t vb = 0; !syncStop.load(std::memory_order_relaxed);
+                 vb = uint16_t((vb + 1) % cfg.vbuckets)) {
+                auto st = bucket.GetShard(vb).GetMagma()->SyncKVStore(vb);
+                if (!st.IsOK()) {
+                    spdlog::warn("SyncKVStore({}) failed: {}", vb, st.String());
+                }
+                next += step;
+                std::this_thread::sleep_until(next);
+            }
+        });
+        spdlog::info("  sync-interval: every kvstore within {} ms", cfg.syncIntervalMs);
+    }
+
     server.Start(); // returns once RequestStop() has been called
+    syncStop = true;
+    if (syncThread.joinable()) {
+        syncThread.join();
+    }
 
     if (int sig = gSignal.load(std::memory_order_relaxed)) {
         spdlog::info("Caught signal {}, shutting down...", sig);
