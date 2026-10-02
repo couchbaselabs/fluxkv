@@ -1189,7 +1189,7 @@ int main(int argc, char* argv[]) {
     if (cfg.noWal && cfg.syncIntervalMs > 0) {
         syncThread = std::thread([&] {
             const auto step = std::chrono::microseconds(
-                    int64_t(cfg.syncIntervalMs) * 1000 / std::max(1, cfg.vbuckets));
+                    int64_t(cfg.syncIntervalMs) * 1000 / std::max<int64_t>(1, cfg.vbuckets));
             auto next = std::chrono::steady_clock::now();
             for (uint16_t vb = 0; !syncStop.load(std::memory_order_relaxed);
                  vb = uint16_t((vb + 1) % cfg.vbuckets)) {
