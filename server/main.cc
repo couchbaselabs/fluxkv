@@ -152,6 +152,11 @@ struct Config {
     // sstables are rewritten, so table size, base level size and the L0
     // table count are the knobs that matter for a write-only workload.
     size_t lsmSSTableSize = 0;
+    // Max sstable size as a fraction of the level (magma default 0.05). Data
+    // tables in a 20M-key store come out ~24 MB, ~10 per kvstore, so LSD GC
+    // has few victims to choose from; smaller tables let it pick the most
+    // fragmented ones. 0 = magma's.
+    double sstableDynamicRatio = 0;
     size_t lsmBaseLevelSize = 0;
     // Fraction of the seqIndex data level that delta levels may reach before
     // they are merged down. magma's own default is 0.25; Couchbase ships 0.5
@@ -305,6 +310,8 @@ static void printUsage(const char* prog) {
               << "  --lsm-sstable-size N     max sstable bytes (magma "
                  "default 2MB)\n"
               << "  --lsd-levels N       seqIndex LSD levels (magma default 5)\n"
+              << "  --sstable-dynamic-ratio R  max sstable size as a fraction of its "
+                 "level (magma default 0.05); smaller gives LSD GC finer victims\n"
               << "  --lsd-tiered-l0      tiered level-0 seqIndex GC (needs "
                  "--lsd-levels 3 and the magma research branch)\n"
               << "  --tune-pools LIST    comma list of io,readers,writers that "
@@ -423,6 +430,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"lsm-sstable-size", required_argument, nullptr, 1053},
             {"lsm-base-level-size", required_argument, nullptr, 1054},
             {"lsd-frag-ratio", required_argument, nullptr, 1066},
+            {"sstable-dynamic-ratio", required_argument, nullptr, 1201},
             {"key-level-multiplier", required_argument, nullptr, 1067},
             {"key-warm-new-tables", no_argument, nullptr, 1072},
             {"sstable-write-buffer", required_argument, nullptr, 1074},
@@ -652,6 +660,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1066:
             cfg.lsdFragRatio = strtod(optarg, nullptr);
+            break;
+        case 1201:
+            cfg.sstableDynamicRatio = strtod(optarg, nullptr);
             break;
         case 1067:
             cfg.keyLevelMultiplier = atoi(optarg);
@@ -941,6 +952,9 @@ int main(int argc, char* argv[]) {
         magmaCfg.LSMLSDMaxSSTableSize = cfg.lsmSSTableSize;
     }
     magmaCfg.LSDFragmentationRatio = cfg.lsdFragRatio;
+    if (cfg.sstableDynamicRatio > 0) {
+        magmaCfg.MaxSSTableDynamicSizeRatio = cfg.sstableDynamicRatio;
+    }
     magmaCfg.KeyLevelSizeMultiplier = cfg.keyLevelMultiplier;
     magmaCfg.KeyTreeWarmNewTables = cfg.keyWarmNewTables;
     if (cfg.sstableWriteBuffer > 0) {
