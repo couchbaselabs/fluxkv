@@ -1191,11 +1191,21 @@ int main(int argc, char* argv[]) {
             const auto step = std::chrono::microseconds(
                     int64_t(cfg.syncIntervalMs) * 1000 / std::max<int64_t>(1, cfg.vbuckets));
             auto next = std::chrono::steady_clock::now();
+            // A sync writes a checkpoint and fsyncs even when nothing changed;
+            // skipping idle vbuckets kept it off the read path (read-only
+            // phase 210K -> 176K GET/s with unconditional syncs).
+            std::vector<Magma::SeqNo> synced(cfg.vbuckets, 0);
             for (uint16_t vb = 0; !syncStop.load(std::memory_order_relaxed);
                  vb = uint16_t((vb + 1) % cfg.vbuckets)) {
-                auto st = bucket.GetShard(vb).GetMagma()->SyncKVStore(vb);
-                if (!st.IsOK()) {
-                    spdlog::warn("SyncKVStore({}) failed: {}", vb, st.String());
+                auto* magma = bucket.GetShard(vb).GetMagma();
+                Magma::SeqNo seq = 0;
+                if (magma->GetMaxSeqno(vb, seq).IsOK() && seq != synced[vb]) {
+                    auto st = magma->SyncKVStore(vb);
+                    if (st.IsOK()) {
+                        synced[vb] = seq;
+                    } else {
+                        spdlog::warn("SyncKVStore({}) failed: {}", vb, st.String());
+                    }
                 }
                 next += step;
                 std::this_thread::sleep_until(next);
