@@ -1256,18 +1256,22 @@ int main(int argc, char* argv[]) {
     std::thread boostThread;
     if (cfg.readBoostMB > 0) {
         boostThread = std::thread([&] {
-            const size_t mb = 1024 * 1024;
-            const size_t base = cfg.memQuota / cfg.shards;
-            const size_t maxExtra = cfg.readBoostMB * mb / cfg.shards;
-            // Grow in steps of 1/16 of the boost so resident memory can be
-            // checked between them.
-            const size_t step = std::max<size_t>(maxExtra / 16, 1);
-            const size_t rssLimit = cfg.readBoostMaxRssMB * mb;
-            const size_t rssHigh = rssLimit;
-            const size_t rssLow = rssLimit > 128 * mb ? rssLimit - 128 * mb : 0;
+            // Memory governor. The magma quota is base + extra per shard:
+            // extra grows (up to the boost, scaled down by the write rate)
+            // while resident memory is under the cap, and shrinks - below
+            // base if need be - above it. Below-base matters: with data
+            // blocks cached, a full block cache plus overwrite memtables
+            // outgrew the cgroup at the base quota itself.
+            const int64_t mb = 1024 * 1024;
+            const int64_t base = int64_t(cfg.memQuota / cfg.shards);
+            const int64_t maxExtra = int64_t(cfg.readBoostMB) * mb / int64_t(cfg.shards);
+            const int64_t minExtra = -base / 2;
+            const int64_t step = std::max<int64_t>(maxExtra / 16, mb);
+            const int64_t rssLimit = int64_t(cfg.readBoostMaxRssMB) * mb;
+            const int64_t rssLow = rssLimit > 128 * mb ? rssLimit - 128 * mb : 0;
             const auto idle = std::chrono::milliseconds(cfg.readBoostIdleMs);
             const long page = sysconf(_SC_PAGESIZE);
-            auto rss = [&]() -> size_t {
+            auto rss = [&]() -> int64_t {
                 long pages = 0, resident = 0;
                 if (FILE* f = fopen("/proc/self/statm", "r")) {
                     if (fscanf(f, "%ld %ld", &pages, &resident) != 2) {
@@ -1275,17 +1279,24 @@ int main(int argc, char* argv[]) {
                     }
                     fclose(f);
                 }
-                return size_t(resident) * size_t(page);
+                return int64_t(resident) * page;
             };
-            auto setQuota = [&](size_t q, bool blocking) {
+            int64_t extra = 0;
+            auto apply = [&](int64_t e, bool shrink) {
+                extra = e;
                 for (size_t i = 0; i < cfg.shards; i++) {
-                    bucket.GetShard(uint16_t(i)).GetMagma()->SetMemoryQuota(q, blocking);
+                    bucket.GetShard(uint16_t(i)).GetMagma()->SetMemoryQuota(
+                            size_t(base + extra), shrink);
+                }
+                if (shrink) {
+                    // Evicted blocks stay resident in jemalloc dirty pages
+                    // for its decay time unless purged.
+                    je_mallctl("arena.4096.purge", nullptr, nullptr, nullptr, 0);
                 }
             };
             uint64_t last = 0;
             auto lastWrite = std::chrono::steady_clock::now();
             auto lastGrow = lastWrite;
-            size_t extra = 0;
             double writeRate = 0;
             bool purged = false;
             while (!syncStop.load(std::memory_order_relaxed)) {
@@ -1295,68 +1306,52 @@ int main(int argc, char* argv[]) {
                     n += bucket.GetShard(uint16_t(i)).SeqnoSum();
                 }
                 const auto now = std::chrono::steady_clock::now();
-                // Writes/s over this 100 ms tick, smoothed.
-                const double tickRate = double(n - last) * 10.0;
-                writeRate = last == 0 ? 0 : 0.7 * writeRate + 0.3 * tickRate;
-                const bool wrote = n != last;
+                const double tickRate = last == 0 ? 0 : double(n - last) * 10.0;
+                writeRate = 0.7 * writeRate + 0.3 * tickRate;
+                const bool wrote = last != 0 && n != last;
                 last = n;
-                size_t cap = maxExtra;
+                int64_t cap = maxExtra;
                 if (wrote) {
                     lastWrite = now;
                     purged = false;
                     cap = cfg.readBoostWriteRate == 0
                                   ? 0
-                                  : size_t(double(maxExtra) *
-                                           std::clamp(1.0 - std::max(writeRate, tickRate) /
-                                                                    double(cfg.readBoostWriteRate),
-                                                      0.0,
-                                                      1.0));
+                                  : int64_t(double(maxExtra) *
+                                            std::clamp(1.0 - std::max(writeRate, tickRate) /
+                                                                     double(cfg.readBoostWriteRate),
+                                                       0.0,
+                                                       1.0));
+                }
+                const int64_t r = rss();
+                if (rssLimit > 0 && r > rssLimit && extra > minExtra) {
+                    // Over the cap: shrink at once, in proportion to the excess.
+                    const int64_t over = (r - rssLimit) / int64_t(cfg.shards);
+                    apply(std::max(minExtra, extra - std::max(step, 2 * over)), true);
+                    continue;
                 }
                 if (extra > cap) {
-                    // Blocking: evict here, before memtables can push the
-                    // process past its cgroup limit. Evicted blocks stay
-                    // resident in jemalloc dirty pages for its decay time, so
-                    // purge too: a 359K/s write burst OOM-killed the server
-                    // 3 s after an eviction that had freed nothing yet.
-                    extra = cap;
-                    setQuota(base + extra, true);
-                    je_mallctl("arena.4096.purge", nullptr, nullptr, nullptr, 0);
-                    if (extra == 0) {
-                        spdlog::info("read-boost off (writes)");
-                    }
+                    apply(cap, true);
                     continue;
                 }
                 if (!wrote && now - lastWrite < idle) {
                     continue;
                 }
-                if (extra == 0 && !purged) {
-                    // Memory freed after a load stays resident in jemalloc's
-                    // dirty pages and would hold the boost at a few hundred
-                    // MB under the cap; hand it back before the first step.
+                if (!wrote && !purged) {
                     je_mallctl("arena.4096.purge", nullptr, nullptr, nullptr, 0);
                     purged = true;
+                    continue;
                 }
-                const size_t r = rss();
-                if (rssLimit > 0 && r > rssHigh && extra > 0) {
-                    extra = extra > step ? extra - step : 0;
-                    setQuota(base + extra, true);
-                    je_mallctl("arena.4096.purge", nullptr, nullptr, nullptr, 0);
-                } else if ((rssLimit == 0 || r < rssLow) && extra < cap &&
-                           now - lastGrow >= std::chrono::seconds(1)) {
+                if ((rssLimit == 0 || r < rssLow) && extra < cap &&
+                    now - lastGrow >= std::chrono::seconds(1)) {
                     // Once a second: reads fill a step in well under that,
                     // so the next check sees what the last step cost.
                     lastGrow = now;
-                    extra = std::min(cap, extra + step);
-                    setQuota(base + extra, false);
-                    if (extra == maxExtra) {
-                        spdlog::info("read-boost full: quota {} -> {} MB per shard (rss {} MB)",
-                                     base / mb, (base + extra) / mb, r / mb);
-                    }
+                    apply(std::min(cap, extra + step), false);
                 }
             }
         });
-        spdlog::info("  read-boost: up to +{} MB after {} ms without writes, rss cap {} MB",
-                     cfg.readBoostMB, cfg.readBoostIdleMs, cfg.readBoostMaxRssMB);
+        spdlog::info("  memory governor: boost up to +{} MB, rss cap {} MB, write-rate scale {}/s",
+                     cfg.readBoostMB, cfg.readBoostMaxRssMB, cfg.readBoostWriteRate);
     }
 
     server.Start(); // returns once RequestStop() has been called
