@@ -1449,55 +1449,65 @@ int main(int argc, char* argv[]) {
     std::thread spaceThread;
     if (cfg.diskLimitBytes > 0) {
         spaceThread = std::thread([&] {
-            // Write admission rate under an AIMD rule: above 97% of the
-            // budget it drops 10% per check (starting from the measured SET
-            // rate), below 96% it grows 5% until it no longer binds. GC then
-            // sets the pace just under the budget; an on/off hold instead
-            // stalled writers for 20 s, past client timeouts.
+            // Paces SETs so disk use settles at 95% of the budget. Disk use
+            // is smoothed (compaction swings it by GBs as outputs land before
+            // inputs go); the rate follows the gap between the growth that
+            // would close the distance to target in ~30 s and the observed
+            // growth, at ~1.1 KB of disk per SET. A multiplicative cut per
+            // check instead swung 10K <-> 100K/s; an on/off hold stalled
+            // writers past client timeouts.
             using kvserver::gDispStats;
-            constexpr int64_t kMinRate = 10000;
+            constexpr double kMinRate = 10000;
+            constexpr double kBytesPerSet = 1100;
+            constexpr double kApproachSec = 30;
+            constexpr double kGain = 0.5;
             constexpr auto kTick = std::chrono::milliseconds(10);
-            constexpr int kCheckTicks = 25;
-            const double high = 0.97 * double(cfg.diskLimitBytes);
-            const double low = 0.96 * double(cfg.diskLimitBytes);
-            int64_t rate = 0; // 0 = not limiting
-            int64_t setRate = 0;
+            constexpr int kCheckTicks = 100; // 1 s
+            const double budget = double(cfg.diskLimitBytes);
+            const double target = 0.95 * budget;
+            const double engage = 0.92 * budget;
+            const double release = 0.88 * budget;
+            double rate = 0; // 0 = not limiting
+            double ema = double(bucket.DiskUsage());
+            double prevEma = ema;
             uint64_t lastSets = gDispStats.cmdSet.Sum();
             int tick = 0;
             while (!syncStop.load(std::memory_order_relaxed)) {
                 std::this_thread::sleep_for(kTick);
                 if (rate > 0) {
-                    bucket.RefillWriteTokens(rate / 100, rate / 20);
+                    bucket.RefillWriteTokens(int64_t(rate / 100), int64_t(rate / 20));
                 }
                 if (++tick % kCheckTicks != 0) {
                     continue;
                 }
                 const uint64_t sets = gDispStats.cmdSet.Sum();
-                setRate = int64_t(sets - lastSets) * 1000 /
-                          (kCheckTicks * kTick.count());
+                const double setRate = double(sets - lastSets);
                 lastSets = sets;
-                const double disk = double(bucket.DiskUsage());
-                if (disk > high) {
-                    const int64_t from = rate > 0 ? rate : setRate;
-                    if (rate == 0) {
+                prevEma = ema;
+                ema += 0.2 * (double(bucket.DiskUsage()) - ema);
+                const double slope = ema - prevEma; // bytes per second
+                if (rate == 0) {
+                    if (ema > engage) {
+                        rate = std::max(kMinRate, setRate);
                         bucket.RefillWriteTokens(0, 0);
                         bucket.SetWriteLimited(true);
-                        spdlog::info("disk {} MB: write limit on at {}/s",
-                                     int64_t(disk) >> 20, from);
+                        spdlog::info("disk {} MB: write limit on at {:.0f}/s",
+                                     int64_t(ema) >> 20, rate);
                     }
-                    rate = std::max(kMinRate, from * 9 / 10);
-                } else if (disk < low && rate > 0) {
-                    rate = rate * 21 / 20;
-                    // Not binding once the clients ask for less.
-                    if (setRate < rate * 3 / 4) {
-                        rate = 0;
-                        bucket.SetWriteLimited(false);
-                        spdlog::info("disk {} MB: write limit off", int64_t(disk) >> 20);
-                    }
+                    continue;
                 }
-                if (rate > 0 && tick % (40 * kCheckTicks) == 0) {
-                    spdlog::info("disk {} MB: write limit {}/s, sets {}/s",
-                                 int64_t(disk) >> 20, rate, setRate);
+                const double want = (target - ema) / kApproachSec;
+                rate = std::max(kMinRate,
+                                rate + kGain * (want - slope) / kBytesPerSet);
+                // No windup past what the clients ask for.
+                rate = std::min(rate, std::max(kMinRate, 1.5 * setRate));
+                if (ema < release && setRate < rate * 0.75) {
+                    rate = 0;
+                    bucket.SetWriteLimited(false);
+                    spdlog::info("disk {} MB: write limit off", int64_t(ema) >> 20);
+                } else if (tick % (10 * kCheckTicks) == 0) {
+                    spdlog::info("disk {} MB: write limit {:.0f}/s, sets {:.0f}/s",
+                                 int64_t(ema) >> 20, rate, setRate);
                 }
             }
             bucket.SetWriteLimited(false);
