@@ -244,6 +244,9 @@ struct Config {
     // a fixed-size device: with blind writes the live size is not known
     // (key-index dups run ~40% under heavy overwrite). 0 = off.
     size_t diskLimitBytes = 0;
+    // Keep data blocks out of the block cache while the write rate is above
+    // this (needs --read-boost-mb). 0 = never.
+    size_t dataCacheMaxWriteRate = 0;
     // Acknowledge a durable write from a completion thread when the shared
     // log reports it persisted, instead of blocking the writer inside
     // WriteDocs. Needs --durable and --shared-wal.
@@ -372,6 +375,7 @@ static void printUsage(const char* prog) {
               << "  --block-cache-policy P  block cache eviction: LRU (magma "
                  "default), DFR (delayed FIFO reinsertion) or C2QP (Clock2Q+)\n"
               << "  --disk-limit-bytes N  hold SETs while disk use > N bytes (default: off)\n"
+              << "  --data-cache-max-write-rate N  no data-block caching above N writes/s (default: off)\n"
               << "  --read-ahead N       compaction read-ahead buffer bytes; with "
                  "direct IO the reads bypass the page cache (magma default 0: "
                  "buffered fd, kernel readahead)\n"
@@ -512,6 +516,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"compaction-rate-limit-mb", required_argument, nullptr, 1210},
             {"compaction-limit-min-gets", required_argument, nullptr, 1211},
             {"disk-limit-bytes", required_argument, nullptr, 1212},
+            {"data-cache-max-write-rate", required_argument, nullptr, 1213},
             {"async-durable", no_argument, nullptr, 1059},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
@@ -760,6 +765,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1212:
             cfg.diskLimitBytes = strtoull(optarg, nullptr, 10);
+            break;
+        case 1213:
+            cfg.dataCacheMaxWriteRate = strtoull(optarg, nullptr, 10);
             break;
         case 1067:
             cfg.keyLevelMultiplier = atoi(optarg);
@@ -1336,6 +1344,7 @@ int main(int argc, char* argv[]) {
             auto lastGrow = lastWrite;
             double writeRate = 0;
             bool purged = false;
+            bool dataCachePaused = false;
             while (!syncStop.load(std::memory_order_relaxed)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 uint64_t n = 0;
@@ -1347,6 +1356,17 @@ int main(int argc, char* argv[]) {
                 writeRate = 0.7 * writeRate + 0.3 * tickRate;
                 const bool wrote = last != 0 && n != last;
                 last = n;
+                // Data blocks only pay while reads have the cache to
+                // themselves: under writes they hit ~1% and evict the key
+                // index.
+                const bool pauseData = cfg.dataCacheMaxWriteRate > 0 &&
+                                       writeRate > double(cfg.dataCacheMaxWriteRate);
+                if (pauseData != dataCachePaused) {
+                    dataCachePaused = pauseData;
+                    Magma::SetDataBlockCachingPaused(pauseData);
+                    spdlog::info("data block caching {} ({:.0f} writes/s)",
+                                 pauseData ? "paused" : "resumed", writeRate);
+                }
                 int64_t cap = maxExtra;
                 if (wrote) {
                     lastWrite = now;
