@@ -1452,15 +1452,15 @@ int main(int argc, char* argv[]) {
             // Paces SETs so disk use settles at 95% of the budget. Disk use
             // is smoothed (compaction swings it by GBs as outputs land before
             // inputs go); the rate follows the gap between the growth that
-            // would close the distance to target in ~30 s and the observed
+            // would close the distance to target in ~60 s and the observed
             // growth, at ~1.1 KB of disk per SET. A multiplicative cut per
             // check instead swung 10K <-> 100K/s; an on/off hold stalled
             // writers past client timeouts.
             using kvserver::gDispStats;
             constexpr double kMinRate = 10000;
             constexpr double kBytesPerSet = 1100;
-            constexpr double kApproachSec = 30;
-            constexpr double kGain = 0.5;
+            constexpr double kApproachSec = 60;
+            constexpr double kGain = 0.1;
             constexpr auto kTick = std::chrono::milliseconds(10);
             constexpr int kCheckTicks = 100; // 1 s
             const double budget = double(cfg.diskLimitBytes);
@@ -1484,7 +1484,7 @@ int main(int argc, char* argv[]) {
                 const double setRate = double(sets - lastSets);
                 lastSets = sets;
                 prevEma = ema;
-                ema += 0.2 * (double(bucket.DiskUsage()) - ema);
+                ema += 0.1 * (double(bucket.DiskUsage()) - ema);
                 const double slope = ema - prevEma; // bytes per second
                 if (rate == 0) {
                     if (ema > engage) {
