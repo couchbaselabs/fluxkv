@@ -260,6 +260,11 @@ struct Config {
     // a fixed-size device: with blind writes the live size is not known
     // (key-index dups run ~40% under heavy overwrite). 0 = off.
     size_t diskLimitBytes = 0;
+    // Fractions of the disk budget: GC tightens above diskFragHigh and
+    // relaxes below diskFragLow; SET pacing engages at diskPaceAt.
+    double diskFragLow = 0.88;
+    double diskFragHigh = 0.92;
+    double diskPaceAt = 0.95;
     // Keep data blocks out of the block cache while the write rate is above
     // this (needs --read-boost-mb). 0 = never.
     size_t dataCacheMaxWriteRate = 0;
@@ -391,6 +396,8 @@ static void printUsage(const char* prog) {
               << "  --block-cache-policy P  block cache eviction: LRU (magma "
                  "default), DFR (delayed FIFO reinsertion) or C2QP (Clock2Q+)\n"
               << "  --disk-limit-bytes N  hold SETs while disk use > N bytes (default: off)\n"
+              << "  --disk-gc-band LO:HI  budget fractions GC holds disk use between (default 0.88:0.92)\n"
+              << "  --disk-pace-at F      budget fraction where SET pacing engages (default 0.95)\n"
               << "  --data-cache-max-write-rate N  no data-block caching above N writes/s (default: off)\n"
               << "  --read-ahead N       compaction read-ahead buffer bytes; with "
                  "direct IO the reads bypass the page cache (magma default 0: "
@@ -533,6 +540,8 @@ static Config parseArgs(int argc, char* argv[]) {
             {"compaction-limit-min-gets", required_argument, nullptr, 1211},
             {"disk-limit-bytes", required_argument, nullptr, 1212},
             {"data-cache-max-write-rate", required_argument, nullptr, 1213},
+            {"disk-gc-band", required_argument, nullptr, 1214},
+            {"disk-pace-at", required_argument, nullptr, 1215},
             {"async-durable", no_argument, nullptr, 1059},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
@@ -784,6 +793,16 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1213:
             cfg.dataCacheMaxWriteRate = strtoull(optarg, nullptr, 10);
+            break;
+        case 1214:
+            if (sscanf(optarg, "%lf:%lf", &cfg.diskFragLow, &cfg.diskFragHigh) != 2 ||
+                cfg.diskFragLow >= cfg.diskFragHigh) {
+                std::cerr << "--disk-gc-band wants LO:HI\n";
+                exit(1);
+            }
+            break;
+        case 1215:
+            cfg.diskPaceAt = atof(optarg);
             break;
         case 1067:
             cfg.keyLevelMultiplier = atoi(optarg);
@@ -1497,9 +1516,10 @@ int main(int argc, char* argv[]) {
         spaceThread = std::thread([&] {
             // Holds disk use under the budget. First by GC: the LSD
             // fragmentation ratio steps down from --lsd-frag-ratio while
-            // disk use is over 92% of the budget, and back up under 88%,
-            // trading write amp for space. Pacing SETs is the backstop
-            // from 95%, above where GC holds disk use: GC runs off
+            // disk use is above --disk-gc-band (default 88-92% of the
+            // budget), and back up below it, trading write amp for space.
+            // Pacing SETs is the backstop from --disk-pace-at (95%), above
+            // where GC holds disk use: GC runs off
             // flushes, so pacing writes inside GC's own range starved it
             // (mixed loads deadlocked at ~5K writes/s; T7 lost 17%). Disk use is smoothed (compaction swings it
             // by GBs as outputs land before inputs go); the SET rate
@@ -1513,12 +1533,12 @@ int main(int argc, char* argv[]) {
             constexpr auto kTick = std::chrono::milliseconds(10);
             constexpr int kCheckTicks = 100; // 1 s
             const double budget = double(cfg.diskLimitBytes);
-            const double target = 0.965 * budget;
-            const double engage = 0.95 * budget;
-            const double release = 0.90 * budget;
-            const double ceiling = 0.985 * budget;
-            const double fragHigh = 0.92 * budget;
-            const double fragLow = 0.88 * budget;
+            const double target = (cfg.diskPaceAt + 0.015) * budget;
+            const double engage = cfg.diskPaceAt * budget;
+            const double release = (cfg.diskPaceAt - 0.05) * budget;
+            const double ceiling = std::min(0.99, cfg.diskPaceAt + 0.035) * budget;
+            const double fragHigh = cfg.diskFragHigh * budget;
+            const double fragLow = cfg.diskFragLow * budget;
             const double fragMax = cfg.lsdFragRatio;
             constexpr double kFragMin = 0.25;
             constexpr double kFragStep = 0.01;
