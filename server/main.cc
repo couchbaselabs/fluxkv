@@ -232,6 +232,13 @@ struct Config {
     // overwrites run above it, and one shared limit held a whole overwrite
     // phase at half the write cache (200K -> 161K writes/s).
     size_t memHardRssMB = 0;
+    // While GETs run above compactionLimitMinGets/s, cap magma compaction
+    // IO (reads + writes) at this many MB/s; lift it otherwise. GC in a
+    // mixed load comes in bursts that halve GET throughput while they last;
+    // a cap near its average smooths them without starving a pure
+    // overwrite, which keeps the full device. 0 = off.
+    size_t compactionRateLimitMB = 0;
+    size_t compactionLimitMinGets = 20000;
     // Acknowledge a durable write from a completion thread when the shared
     // log reports it persisted, instead of blocking the writer inside
     // WriteDocs. Needs --durable and --shared-wal.
@@ -496,6 +503,8 @@ static Config parseArgs(int argc, char* argv[]) {
             {"read-boost-max-rss-mb", required_argument, nullptr, 1207},
             {"read-boost-write-rate", required_argument, nullptr, 1208},
             {"mem-hard-rss-mb", required_argument, nullptr, 1209},
+            {"compaction-rate-limit-mb", required_argument, nullptr, 1210},
+            {"compaction-limit-min-gets", required_argument, nullptr, 1211},
             {"async-durable", no_argument, nullptr, 1059},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
@@ -735,6 +744,12 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1209:
             cfg.memHardRssMB = strtoull(optarg, nullptr, 10);
+            break;
+        case 1210:
+            cfg.compactionRateLimitMB = strtoull(optarg, nullptr, 10);
+            break;
+        case 1211:
+            cfg.compactionLimitMinGets = strtoull(optarg, nullptr, 10);
             break;
         case 1067:
             cfg.keyLevelMultiplier = atoi(optarg);
@@ -1395,6 +1410,32 @@ int main(int argc, char* argv[]) {
                      cfg.readBoostMB, cfg.readBoostMaxRssMB, cfg.readBoostWriteRate);
     }
 
+    std::thread compactionLimitThread;
+    if (cfg.compactionRateLimitMB > 0) {
+        compactionLimitThread = std::thread([&] {
+            using kvserver::gDispStats;
+            uint64_t last = 0;
+            bool limited = false;
+            while (!syncStop.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                const uint64_t n = gDispStats.cmdGetResp.Sum() +
+                                   gDispStats.cmdGetRespMiss.Sum();
+                const double rate = last == 0 ? 0 : double(n - last) * 2.0;
+                last = n;
+                const bool want = rate >= double(cfg.compactionLimitMinGets);
+                if (want != limited) {
+                    limited = want;
+                    Magma::SetCompactionRateLimit(
+                            want ? cfg.compactionRateLimitMB * 1024 * 1024 : 0);
+                    spdlog::info("compaction rate limit {} ({:.0f} gets/s)",
+                                 want ? std::to_string(cfg.compactionRateLimitMB) + " MB/s"
+                                      : std::string("off"),
+                                 rate);
+                }
+            }
+        });
+    }
+
     server.Start(); // returns once RequestStop() has been called
     syncStop = true;
     if (syncThread.joinable()) {
@@ -1402,6 +1443,9 @@ int main(int argc, char* argv[]) {
     }
     if (boostThread.joinable()) {
         boostThread.join();
+    }
+    if (compactionLimitThread.joinable()) {
+        compactionLimitThread.join();
     }
 
     if (int sig = gSignal.load(std::memory_order_relaxed)) {
