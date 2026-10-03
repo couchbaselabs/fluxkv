@@ -1585,7 +1585,13 @@ int main(int argc, char* argv[]) {
                     // ~10 s: a write burst after a read phase outran GC and
                     // peaked at 2.1x on the slower box.
                     if (ema > engage || ema + 10 * slope > engage) {
-                        rate = std::max(kMinRate, setRate);
+                        // Start at the rate that reaches the target in
+                        // kApproachSec with no GC help, not at the clients'
+                        // rate: a 333K/s burst into an idle GC took 20 s of
+                        // gain steps to cut and peaked at 99.1%.
+                        rate = std::clamp(std::max(0.0, target - ema) / kApproachSec / kBytesPerSet,
+                                          kMinRate,
+                                          std::max(kMinRate, setRate));
                         bucket.RefillWriteTokens(0, 0);
                         bucket.SetWriteLimited(true);
                         spdlog::info("disk {} MB: write limit on at {:.0f}/s",
