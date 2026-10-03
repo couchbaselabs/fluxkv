@@ -828,11 +828,23 @@ public:
     bool StageWrite(Request* req);
     // Room for more staged writes? Used to lift read backpressure; the
     // margin keeps a connection from resuming straight back into a refusal.
+    // Set by the space governor while disk use is over budget: SETs stay in
+    // the socket until compaction catches up instead of being refused.
+    bool WritesStalled() const {
+        return writesStalled_.load(std::memory_order_relaxed);
+    }
+    void SetWritesStalled(bool v) {
+        writesStalled_.store(v, std::memory_order_relaxed);
+    }
+    // Disk bytes over an upper bound on live bytes: key-index items (dups
+    // included) times the data level's bytes per item.
+    double SpaceRatio();
     size_t QueuedBytes() const {
         return queuedBytes_.load(std::memory_order_relaxed);
     }
     bool WriteQueueHasRoom() const {
-        return queuedBytes_.load(std::memory_order_relaxed) <
+        return !WritesStalled() &&
+               queuedBytes_.load(std::memory_order_relaxed) <
                writeQueueMemLimit_ - writeQueueMemLimit_ / 8;
     }
     void FlushStaged();
@@ -888,6 +900,7 @@ public:
 
     // Public for writer pool access
     std::atomic<size_t> queuedBytes_{0};
+    std::atomic<bool> writesStalled_{false};
 
 private:
     std::string name_;

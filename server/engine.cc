@@ -2013,6 +2013,25 @@ std::string Bucket::GetStatsJson() {
     return merged.dump(2);
 }
 
+double Bucket::SpaceRatio() {
+    double disk = 0, items = 0, dataBytes = 0, dataItems = 0;
+    for (auto& shard : shards_) {
+        Magma::MagmaStats stats;
+        shard->GetMagma()->GetStats(stats);
+        disk += double(stats.TotalDiskUsage);
+        items += double(stats.KeyStats.TotalItemCount);
+        const auto& lv = stats.SeqStats.LevelStats;
+        if (!lv.empty()) {
+            dataBytes += double(lv.back().PhysicalSize);
+            dataItems += double(lv.back().ItemCount);
+        }
+    }
+    if (items == 0 || dataItems == 0) {
+        return 0;
+    }
+    return disk / (items * dataBytes / dataItems);
+}
+
 std::string Bucket::GetKVStoreStatsJson() {
     nlohmann::json out = nlohmann::json::array();
     for (uint16_t vbid = 0; vbid < numVBuckets_; vbid++) {

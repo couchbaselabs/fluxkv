@@ -573,6 +573,13 @@ bool Connection::parseAndDispatch() {
         return false;
     }
 
+    // Over the space budget: leave the SET unread and pause the connection
+    // until compaction catches up, rather than refuse it.
+    if (op == Opcode::Set && bucket_->WritesStalled()) {
+        stageFull_ = true;
+        return false;
+    }
+
     // Fast path: echo-mode GET — skip IOBuf allocation entirely.
     // Just consume the bytes and respond inline.
     if (op == Opcode::Get && !echoResponseBuf_.empty()) {
