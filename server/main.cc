@@ -1314,9 +1314,16 @@ int main(int argc, char* argv[]) {
                 }
                 if (extra > cap) {
                     // Blocking: evict here, before memtables can push the
-                    // process past its cgroup limit.
+                    // process past its cgroup limit. Evicted blocks stay
+                    // resident in jemalloc dirty pages for its decay time, so
+                    // purge too: a 359K/s write burst OOM-killed the server
+                    // 3 s after an eviction that had freed nothing yet.
                     extra = cap;
                     setQuota(base + extra, true);
+                    je_mallctl("arena.4096.purge", nullptr, nullptr, nullptr, 0);
+                    if (extra == 0) {
+                        spdlog::info("read-boost off (writes)");
+                    }
                     continue;
                 }
                 if (!wrote && now - lastWrite < idle) {
@@ -1333,6 +1340,7 @@ int main(int argc, char* argv[]) {
                 if (rssLimit > 0 && r > rssHigh && extra > 0) {
                     extra = extra > step ? extra - step : 0;
                     setQuota(base + extra, true);
+                    je_mallctl("arena.4096.purge", nullptr, nullptr, nullptr, 0);
                 } else if ((rssLimit == 0 || r < rssLow) && extra < cap &&
                            now - lastGrow >= std::chrono::seconds(1)) {
                     // Once a second: reads fill a step in well under that,
