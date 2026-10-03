@@ -1329,7 +1329,10 @@ int main(int argc, char* argv[]) {
                     apply(std::max(minExtra, extra - std::max(step, 2 * over)), true);
                     continue;
                 }
-                if (extra > cap) {
+                // Hysteresis: the cap follows a noisy write rate, and each
+                // SetMemoryQuota recomputes magma's limits (1.6% of CPU in a
+                // mixed load when applied every tick).
+                if (extra > cap && (cap == 0 || extra - cap >= step / 2)) {
                     apply(cap, true);
                     continue;
                 }
@@ -1341,7 +1344,7 @@ int main(int argc, char* argv[]) {
                     purged = true;
                     continue;
                 }
-                if ((rssLimit == 0 || r < rssLow) && extra < cap &&
+                if ((rssLimit == 0 || r < rssLow) && cap - extra >= step / 2 &&
                     now - lastGrow >= std::chrono::seconds(1)) {
                     // Once a second: reads fill a step in well under that,
                     // so the next check sees what the last step cost.
