@@ -1542,6 +1542,9 @@ int main(int argc, char* argv[]) {
             const double fragMax = cfg.lsdFragRatio;
             constexpr double kFragMin = 0.25;
             constexpr double kFragStep = 0.01;
+            // Steps every 5 s, or every second while SETs are paced: from
+            // a high --lsd-frag-ratio, 5 s steps left GC idle for ~50 s
+            // while paced writes still filled the disk past the budget.
             constexpr int kFragTicks = 500; // 5 s
             double frag = fragMax;
             double rate = 0; // 0 = not limiting
@@ -1564,7 +1567,7 @@ int main(int argc, char* argv[]) {
                 const double disk = double(allocatedBytes(cfg.dataDir));
                 ema += 0.3 * (disk - ema);
                 const double slope = ema - prevEma; // bytes per second
-                if (tick % kFragTicks == 0) {
+                if (tick % kFragTicks == 0 || (rate > 0 && ema > fragHigh)) {
                     const double prevFrag = frag;
                     if (ema > fragHigh) {
                         frag = std::max(kFragMin, frag - kFragStep);
