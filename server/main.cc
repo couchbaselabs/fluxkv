@@ -1469,13 +1469,16 @@ int main(int argc, char* argv[]) {
     std::thread spaceThread;
     if (cfg.diskLimitBytes > 0) {
         spaceThread = std::thread([&] {
-            // Paces SETs so disk use settles at 95% of the budget. Disk use
-            // is smoothed (compaction swings it by GBs as outputs land before
-            // inputs go); the rate follows the gap between the growth that
-            // would close the distance to target in ~60 s and the observed
-            // growth, at ~1.1 KB of disk per SET. A multiplicative cut per
-            // check instead swung 10K <-> 100K/s; an on/off hold stalled
-            // writers past client timeouts.
+            // Holds disk use under the budget. First by GC: the LSD
+            // fragmentation ratio steps down from --lsd-frag-ratio while
+            // disk use is over 93% of the budget, and back up under 90%,
+            // trading write amp for space. Pacing SETs is the backstop
+            // above 96%: GC runs off flushes, so throttling writes below
+            // GC's own equilibrium starved it and deadlocked mixed loads
+            // at ~5K writes/s. Disk use is smoothed (compaction swings it
+            // by GBs as outputs land before inputs go); the SET rate
+            // follows the gap between the growth that reaches 97.5% in
+            // ~60 s and the observed growth, at ~1.1 KB of disk per SET.
             using kvserver::gDispStats;
             constexpr double kMinRate = 10000;
             constexpr double kBytesPerSet = 1100;
@@ -1484,9 +1487,16 @@ int main(int argc, char* argv[]) {
             constexpr auto kTick = std::chrono::milliseconds(10);
             constexpr int kCheckTicks = 100; // 1 s
             const double budget = double(cfg.diskLimitBytes);
-            const double target = 0.95 * budget;
-            const double engage = 0.92 * budget;
-            const double release = 0.88 * budget;
+            const double target = 0.975 * budget;
+            const double engage = 0.96 * budget;
+            const double release = 0.94 * budget;
+            const double fragHigh = 0.93 * budget;
+            const double fragLow = 0.90 * budget;
+            const double fragMax = cfg.lsdFragRatio;
+            constexpr double kFragMin = 0.25;
+            constexpr double kFragStep = 0.01;
+            constexpr int kFragTicks = 500; // 5 s
+            double frag = fragMax;
             double rate = 0; // 0 = not limiting
             double ema = double(bucket.DiskUsage());
             double prevEma = ema;
@@ -1506,6 +1516,22 @@ int main(int argc, char* argv[]) {
                 prevEma = ema;
                 ema += 0.1 * (double(bucket.DiskUsage()) - ema);
                 const double slope = ema - prevEma; // bytes per second
+                if (tick % kFragTicks == 0) {
+                    const double prevFrag = frag;
+                    if (ema > fragHigh) {
+                        frag = std::max(kFragMin, frag - kFragStep);
+                    } else if (ema < fragLow) {
+                        frag = std::min(fragMax, frag + kFragStep);
+                    }
+                    if (frag != prevFrag) {
+                        for (size_t i = 0; i < cfg.shards; i++) {
+                            bucket.GetShard(uint16_t(i)).GetMagma()->SetFragmentationRatio(frag);
+                        }
+                        if (tick % (6 * kFragTicks) == 0 || frag == kFragMin || frag == fragMax) {
+                            spdlog::info("disk {} MB: frag ratio {:.2f}", int64_t(ema) >> 20, frag);
+                        }
+                    }
+                }
                 if (rate == 0) {
                     if (ema > engage) {
                         rate = std::max(kMinRate, setRate);
