@@ -791,6 +791,9 @@ static Config parseArgs(int argc, char* argv[]) {
     return cfg;
 }
 
+extern "C" int je_mallctl(const char* name, void* oldp, size_t* oldlenp,
+                          void* newp, size_t newlen);
+
 int main(int argc, char* argv[]) {
     Config cfg = parseArgs(argc, argv);
 
@@ -1284,6 +1287,7 @@ int main(int argc, char* argv[]) {
             auto lastGrow = lastWrite;
             size_t extra = 0;
             double writeRate = 0;
+            bool purged = false;
             while (!syncStop.load(std::memory_order_relaxed)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 uint64_t n = 0;
@@ -1299,6 +1303,7 @@ int main(int argc, char* argv[]) {
                 size_t cap = maxExtra;
                 if (wrote) {
                     lastWrite = now;
+                    purged = false;
                     cap = cfg.readBoostWriteRate == 0
                                   ? 0
                                   : size_t(double(maxExtra) *
@@ -1316,6 +1321,13 @@ int main(int argc, char* argv[]) {
                 }
                 if (!wrote && now - lastWrite < idle) {
                     continue;
+                }
+                if (extra == 0 && !purged) {
+                    // Memory freed after a load stays resident in jemalloc's
+                    // dirty pages and would hold the boost at a few hundred
+                    // MB under the cap; hand it back before the first step.
+                    je_mallctl("arena.4096.purge", nullptr, nullptr, nullptr, 0);
+                    purged = true;
                 }
                 const size_t r = rss();
                 if (rssLimit > 0 && r > rssHigh && extra > 0) {
