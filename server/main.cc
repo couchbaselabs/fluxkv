@@ -227,6 +227,11 @@ struct Config {
     // reaching 0 at this many writes/s (mixed loads keep most of it; a pure
     // overwrite none). 0 = drop the boost on any write.
     size_t readBoostWriteRate = 0;
+    // Resident memory above which the governor takes the quota below base
+    // (default: boost cap + 550 MB). Kept apart from the boost cap: steady
+    // overwrites run above it, and one shared limit held a whole overwrite
+    // phase at half the write cache (200K -> 161K writes/s).
+    size_t memHardRssMB = 0;
     // Acknowledge a durable write from a completion thread when the shared
     // log reports it persisted, instead of blocking the writer inside
     // WriteDocs. Needs --durable and --shared-wal.
@@ -490,6 +495,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"read-boost-idle-ms", required_argument, nullptr, 1206},
             {"read-boost-max-rss-mb", required_argument, nullptr, 1207},
             {"read-boost-write-rate", required_argument, nullptr, 1208},
+            {"mem-hard-rss-mb", required_argument, nullptr, 1209},
             {"async-durable", no_argument, nullptr, 1059},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
@@ -726,6 +732,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1208:
             cfg.readBoostWriteRate = strtoull(optarg, nullptr, 10);
+            break;
+        case 1209:
+            cfg.memHardRssMB = strtoull(optarg, nullptr, 10);
             break;
         case 1067:
             cfg.keyLevelMultiplier = atoi(optarg);
@@ -1269,6 +1278,9 @@ int main(int argc, char* argv[]) {
             const int64_t step = std::max<int64_t>(maxExtra / 16, mb);
             const int64_t rssLimit = int64_t(cfg.readBoostMaxRssMB) * mb;
             const int64_t rssLow = rssLimit > 128 * mb ? rssLimit - 128 * mb : 0;
+            const int64_t rssHard = cfg.memHardRssMB > 0
+                                            ? int64_t(cfg.memHardRssMB) * mb
+                                            : rssLimit + 550 * mb;
             const auto idle = std::chrono::milliseconds(cfg.readBoostIdleMs);
             const long page = sysconf(_SC_PAGESIZE);
             auto rss = [&]() -> int64_t {
@@ -1323,10 +1335,24 @@ int main(int argc, char* argv[]) {
                                                        1.0));
                 }
                 const int64_t r = rss();
-                if (rssLimit > 0 && r > rssLimit && extra > minExtra) {
-                    // Over the cap: shrink at once, in proportion to the excess.
-                    const int64_t over = (r - rssLimit) / int64_t(cfg.shards);
+                if (rssLimit > 0 && r > rssHard && extra > minExtra) {
+                    // Over the hard cap: shrink at once, below base if need
+                    // be, in proportion to the excess.
+                    const int64_t over = (r - rssHard) / int64_t(cfg.shards);
                     apply(std::max(minExtra, extra - std::max(step, 2 * over)), true);
+                    continue;
+                }
+                if (rssLimit > 0 && r > rssLimit && extra > 0) {
+                    // Over the boost cap: give the boost back, not below base.
+                    const int64_t over = (r - rssLimit) / int64_t(cfg.shards);
+                    apply(std::max<int64_t>(0, extra - std::max(step, 2 * over)), true);
+                    continue;
+                }
+                if (extra < 0 && r < rssHard - 256 * mb &&
+                    now - lastGrow >= std::chrono::seconds(1)) {
+                    // Back toward base once there is room again.
+                    lastGrow = now;
+                    apply(std::min<int64_t>(0, extra + step), false);
                     continue;
                 }
                 // Hysteresis: the cap follows a noisy write rate, and each
