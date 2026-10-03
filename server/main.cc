@@ -239,9 +239,11 @@ struct Config {
     // overwrite, which keeps the full device. 0 = off.
     size_t compactionRateLimitMB = 0;
     size_t compactionLimitMinGets = 20000;
-    // Hold SETs in the socket while disk use exceeds this many times the live
-    // data, so overwrites cannot outrun GC into unbounded space. 0 = off.
-    double spaceLimit = 0;
+    // Hold SETs in the socket while disk use exceeds this many bytes, so
+    // overwrites cannot outrun GC into unbounded space. A byte budget like
+    // a fixed-size device: with blind writes the live size is not known
+    // (key-index dups run ~40% under heavy overwrite). 0 = off.
+    size_t diskLimitBytes = 0;
     // Acknowledge a durable write from a completion thread when the shared
     // log reports it persisted, instead of blocking the writer inside
     // WriteDocs. Needs --durable and --shared-wal.
@@ -369,7 +371,7 @@ static void printUsage(const char* prog) {
                  "sizes (default all)\n"
               << "  --block-cache-policy P  block cache eviction: LRU (magma "
                  "default), DFR (delayed FIFO reinsertion) or C2QP (Clock2Q+)\n"
-              << "  --space-limit X    hold SETs while disk use > X times live data (default: off)\n"
+              << "  --disk-limit-bytes N  hold SETs while disk use > N bytes (default: off)\n"
               << "  --read-ahead N       compaction read-ahead buffer bytes; with "
                  "direct IO the reads bypass the page cache (magma default 0: "
                  "buffered fd, kernel readahead)\n"
@@ -509,7 +511,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"mem-hard-rss-mb", required_argument, nullptr, 1209},
             {"compaction-rate-limit-mb", required_argument, nullptr, 1210},
             {"compaction-limit-min-gets", required_argument, nullptr, 1211},
-            {"space-limit", required_argument, nullptr, 1212},
+            {"disk-limit-bytes", required_argument, nullptr, 1212},
             {"async-durable", no_argument, nullptr, 1059},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
@@ -757,7 +759,7 @@ static Config parseArgs(int argc, char* argv[]) {
             cfg.compactionLimitMinGets = strtoull(optarg, nullptr, 10);
             break;
         case 1212:
-            cfg.spaceLimit = strtod(optarg, nullptr);
+            cfg.diskLimitBytes = strtoull(optarg, nullptr, 10);
             break;
         case 1067:
             cfg.keyLevelMultiplier = atoi(optarg);
@@ -1445,20 +1447,20 @@ int main(int argc, char* argv[]) {
     }
 
     std::thread spaceThread;
-    if (cfg.spaceLimit > 0) {
+    if (cfg.diskLimitBytes > 0) {
         spaceThread = std::thread([&] {
-            // Hysteresis keeps a ratio sitting at the limit from toggling
+            // Hysteresis keeps usage sitting at the limit from toggling
             // every tick.
-            const double resume = cfg.spaceLimit - 0.02;
+            const size_t resume = cfg.diskLimitBytes - cfg.diskLimitBytes / 100;
             bool stalled = false;
             while (!syncStop.load(std::memory_order_relaxed)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                const double r = bucket.SpaceRatio();
-                const bool want = stalled ? r > resume : r > cfg.spaceLimit;
+                const size_t disk = bucket.DiskUsage();
+                const bool want = stalled ? disk > resume : disk > cfg.diskLimitBytes;
                 if (want != stalled) {
                     stalled = want;
                     bucket.SetWritesStalled(want);
-                    spdlog::info("space {:.3f}: writes {}", r, want ? "held" : "resumed");
+                    spdlog::info("disk {} MB: writes {}", disk >> 20, want ? "held" : "resumed");
                 }
             }
             bucket.SetWritesStalled(false);

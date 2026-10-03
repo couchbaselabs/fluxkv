@@ -836,9 +836,7 @@ public:
     void SetWritesStalled(bool v) {
         writesStalled_.store(v, std::memory_order_relaxed);
     }
-    // Disk bytes over an upper bound on live bytes: key-index items (dups
-    // included) times the data level's bytes per item.
-    double SpaceRatio();
+    size_t DiskUsage();
     size_t QueuedBytes() const {
         return queuedBytes_.load(std::memory_order_relaxed);
     }
