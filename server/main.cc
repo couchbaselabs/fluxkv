@@ -1483,23 +1483,24 @@ int main(int argc, char* argv[]) {
             // fragmentation ratio steps down from --lsd-frag-ratio while
             // disk use is over 93% of the budget, and back up under 90%,
             // trading write amp for space. Pacing SETs is the backstop
-            // above 96%: GC runs off flushes, so throttling writes below
+            // from 90%: GC runs off flushes, so throttling writes below
             // GC's own equilibrium starved it and deadlocked mixed loads
             // at ~5K writes/s. Disk use is smoothed (compaction swings it
             // by GBs as outputs land before inputs go); the SET rate
-            // follows the gap between the growth that reaches 97.5% in
+            // follows the gap between the growth that reaches 94% in
             // ~60 s and the observed growth, at ~1.1 KB of disk per SET.
             using kvserver::gDispStats;
-            constexpr double kMinRate = 10000;
+            constexpr double kMinRate = 30000;
             constexpr double kBytesPerSet = 1100;
             constexpr double kApproachSec = 60;
             constexpr double kGain = 0.1;
             constexpr auto kTick = std::chrono::milliseconds(10);
             constexpr int kCheckTicks = 100; // 1 s
             const double budget = double(cfg.diskLimitBytes);
-            const double target = 0.975 * budget;
-            const double engage = 0.96 * budget;
-            const double release = 0.94 * budget;
+            const double target = 0.94 * budget;
+            const double engage = 0.90 * budget;
+            const double release = 0.85 * budget;
+            const double ceiling = 0.985 * budget;
             const double fragHigh = 0.93 * budget;
             const double fragLow = 0.90 * budget;
             const double fragMax = cfg.lsdFragRatio;
@@ -1524,7 +1525,8 @@ int main(int argc, char* argv[]) {
                 const double setRate = double(sets - lastSets);
                 lastSets = sets;
                 prevEma = ema;
-                ema += 0.1 * (double(bucket.DiskUsage()) - ema);
+                const double disk = double(bucket.DiskUsage());
+                ema += 0.3 * (disk - ema);
                 const double slope = ema - prevEma; // bytes per second
                 if (tick % kFragTicks == 0) {
                     const double prevFrag = frag;
@@ -1543,7 +1545,10 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 if (rate == 0) {
-                    if (ema > engage) {
+                    // Engage early when growth would cross the line within
+                    // ~10 s: a write burst after a read phase outran GC and
+                    // peaked at 2.1x on the slower box.
+                    if (ema > engage || ema + 10 * slope > engage) {
                         rate = std::max(kMinRate, setRate);
                         bucket.RefillWriteTokens(0, 0);
                         bucket.SetWriteLimited(true);
@@ -1555,6 +1560,9 @@ int main(int argc, char* argv[]) {
                 const double want = (target - ema) / kApproachSec;
                 rate = std::max(kMinRate,
                                 rate + kGain * (want - slope) / kBytesPerSet);
+                if (disk > ceiling) {
+                    rate = kMinRate;
+                }
                 // No windup past what the clients ask for.
                 rate = std::min(rate, std::max(kMinRate, 1.5 * setRate));
                 if (ema < release && setRate < rate * 0.75) {
