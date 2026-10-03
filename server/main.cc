@@ -1481,13 +1481,13 @@ int main(int argc, char* argv[]) {
         spaceThread = std::thread([&] {
             // Holds disk use under the budget. First by GC: the LSD
             // fragmentation ratio steps down from --lsd-frag-ratio while
-            // disk use is over 93% of the budget, and back up under 90%,
+            // disk use is over 92% of the budget, and back up under 88%,
             // trading write amp for space. Pacing SETs is the backstop
-            // from 90%: GC runs off flushes, so throttling writes below
-            // GC's own equilibrium starved it and deadlocked mixed loads
-            // at ~5K writes/s. Disk use is smoothed (compaction swings it
+            // from 95%, above where GC holds disk use: GC runs off
+            // flushes, so pacing writes inside GC's own range starved it
+            // (mixed loads deadlocked at ~5K writes/s; T7 lost 17%). Disk use is smoothed (compaction swings it
             // by GBs as outputs land before inputs go); the SET rate
-            // follows the gap between the growth that reaches 94% in
+            // follows the gap between the growth that reaches 96.5% in
             // ~60 s and the observed growth, at ~1.1 KB of disk per SET.
             using kvserver::gDispStats;
             constexpr double kMinRate = 30000;
@@ -1497,12 +1497,12 @@ int main(int argc, char* argv[]) {
             constexpr auto kTick = std::chrono::milliseconds(10);
             constexpr int kCheckTicks = 100; // 1 s
             const double budget = double(cfg.diskLimitBytes);
-            const double target = 0.94 * budget;
-            const double engage = 0.90 * budget;
-            const double release = 0.85 * budget;
+            const double target = 0.965 * budget;
+            const double engage = 0.95 * budget;
+            const double release = 0.90 * budget;
             const double ceiling = 0.985 * budget;
-            const double fragHigh = 0.93 * budget;
-            const double fragLow = 0.90 * budget;
+            const double fragHigh = 0.92 * budget;
+            const double fragLow = 0.88 * budget;
             const double fragMax = cfg.lsdFragRatio;
             constexpr double kFragMin = 0.25;
             constexpr double kFragStep = 0.01;
