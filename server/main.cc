@@ -1,3 +1,5 @@
+#include <unistd.h>
+#include <cstdio>
 #include "engine.h"
 #include "include/libmagma/magma.h"
 #include "include/libmagma/storage_format_version.h"
@@ -217,6 +219,10 @@ struct Config {
     // back, evicting before memtables grow. 0 = off.
     size_t readBoostMB = 0;
     int readBoostIdleMs = 3000;
+    // The boost grows only while resident memory is under this, and shrinks
+    // above it: after a load the memtables are still full and flushing, and
+    // a flat +2.7 GB boost 4 s after the last write OOM-killed the server.
+    size_t readBoostMaxRssMB = 0;
     // Acknowledge a durable write from a completion thread when the shared
     // log reports it persisted, instead of blocking the writer inside
     // WriteDocs. Needs --durable and --shared-wal.
@@ -478,6 +484,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"sync-interval-ms", required_argument, nullptr, 1204},
             {"read-boost-mb", required_argument, nullptr, 1205},
             {"read-boost-idle-ms", required_argument, nullptr, 1206},
+            {"read-boost-max-rss-mb", required_argument, nullptr, 1207},
             {"async-durable", no_argument, nullptr, 1059},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
@@ -708,6 +715,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1206:
             cfg.readBoostIdleMs = atoi(optarg);
+            break;
+        case 1207:
+            cfg.readBoostMaxRssMB = strtoull(optarg, nullptr, 10);
             break;
         case 1067:
             cfg.keyLevelMultiplier = atoi(optarg);
@@ -1235,9 +1245,27 @@ int main(int argc, char* argv[]) {
     std::thread boostThread;
     if (cfg.readBoostMB > 0) {
         boostThread = std::thread([&] {
+            const size_t mb = 1024 * 1024;
             const size_t base = cfg.memQuota / cfg.shards;
-            const size_t boosted = base + cfg.readBoostMB * 1024 * 1024 / cfg.shards;
+            const size_t maxExtra = cfg.readBoostMB * mb / cfg.shards;
+            // Grow in steps of 1/16 of the boost so resident memory can be
+            // checked between them.
+            const size_t step = std::max<size_t>(maxExtra / 16, 1);
+            const size_t rssLimit = cfg.readBoostMaxRssMB * mb;
+            const size_t rssHigh = rssLimit;
+            const size_t rssLow = rssLimit > 128 * mb ? rssLimit - 128 * mb : 0;
             const auto idle = std::chrono::milliseconds(cfg.readBoostIdleMs);
+            const long page = sysconf(_SC_PAGESIZE);
+            auto rss = [&]() -> size_t {
+                long pages = 0, resident = 0;
+                if (FILE* f = fopen("/proc/self/statm", "r")) {
+                    if (fscanf(f, "%ld %ld", &pages, &resident) != 2) {
+                        resident = 0;
+                    }
+                    fclose(f);
+                }
+                return size_t(resident) * size_t(page);
+            };
             auto setQuota = [&](size_t q, bool blocking) {
                 for (size_t i = 0; i < cfg.shards; i++) {
                     bucket.GetShard(uint16_t(i)).GetMagma()->SetMemoryQuota(q, blocking);
@@ -1245,7 +1273,8 @@ int main(int argc, char* argv[]) {
             };
             uint64_t last = 0;
             auto lastWrite = std::chrono::steady_clock::now();
-            bool on = false;
+            auto lastGrow = lastWrite;
+            size_t extra = 0;
             while (!syncStop.load(std::memory_order_relaxed)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 uint64_t n = 0;
@@ -1256,23 +1285,38 @@ int main(int argc, char* argv[]) {
                 if (n != last) {
                     last = n;
                     lastWrite = now;
-                    if (on) {
+                    if (extra > 0) {
                         // Blocking: evict here, before memtables can push
                         // the process past its cgroup limit.
                         setQuota(base, true);
-                        on = false;
+                        extra = 0;
                         spdlog::info("read-boost off (writes)");
                     }
-                } else if (!on && now - lastWrite >= idle) {
-                    setQuota(boosted, false);
-                    on = true;
-                    spdlog::info("read-boost on: quota {} -> {} MB per shard",
-                                 base >> 20, boosted >> 20);
+                    continue;
+                }
+                if (now - lastWrite < idle) {
+                    continue;
+                }
+                const size_t r = rss();
+                if (rssLimit > 0 && r > rssHigh && extra > 0) {
+                    extra = extra > step ? extra - step : 0;
+                    setQuota(base + extra, true);
+                } else if ((rssLimit == 0 || r < rssLow) && extra < maxExtra &&
+                           now - lastGrow >= std::chrono::seconds(1)) {
+                    // Once a second: reads fill a step in well under that,
+                    // so the next check sees what the last step cost.
+                    lastGrow = now;
+                    extra = std::min(maxExtra, extra + step);
+                    setQuota(base + extra, false);
+                    if (extra == maxExtra) {
+                        spdlog::info("read-boost full: quota {} -> {} MB per shard (rss {} MB)",
+                                     base / mb, (base + extra) / mb, r / mb);
+                    }
                 }
             }
         });
-        spdlog::info("  read-boost: +{} MB after {} ms without writes",
-                     cfg.readBoostMB, cfg.readBoostIdleMs);
+        spdlog::info("  read-boost: up to +{} MB after {} ms without writes, rss cap {} MB",
+                     cfg.readBoostMB, cfg.readBoostIdleMs, cfg.readBoostMaxRssMB);
     }
 
     server.Start(); // returns once RequestStop() has been called
