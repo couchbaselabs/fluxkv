@@ -573,9 +573,9 @@ bool Connection::parseAndDispatch() {
         return false;
     }
 
-    // Over the space budget: leave the SET unread and pause the connection
-    // until compaction catches up, rather than refuse it.
-    if (op == Opcode::Set && bucket_->WritesStalled()) {
+    // Write rate held down by the space governor: leave the SET unread and
+    // pause the connection until tokens refill, rather than refuse it.
+    if (op == Opcode::Set && !bucket_->TakeWriteToken()) {
         stageFull_ = true;
         return false;
     }

@@ -1449,21 +1449,58 @@ int main(int argc, char* argv[]) {
     std::thread spaceThread;
     if (cfg.diskLimitBytes > 0) {
         spaceThread = std::thread([&] {
-            // Hysteresis keeps usage sitting at the limit from toggling
-            // every tick.
-            const size_t resume = cfg.diskLimitBytes - cfg.diskLimitBytes / 100;
-            bool stalled = false;
+            // Write admission rate under an AIMD rule: above 97% of the
+            // budget it drops 10% per check (starting from the measured SET
+            // rate), below 96% it grows 5% until it no longer binds. GC then
+            // sets the pace just under the budget; an on/off hold instead
+            // stalled writers for 20 s, past client timeouts.
+            using kvserver::gDispStats;
+            constexpr int64_t kMinRate = 10000;
+            constexpr auto kTick = std::chrono::milliseconds(10);
+            constexpr int kCheckTicks = 25;
+            const double high = 0.97 * double(cfg.diskLimitBytes);
+            const double low = 0.96 * double(cfg.diskLimitBytes);
+            int64_t rate = 0; // 0 = not limiting
+            int64_t setRate = 0;
+            uint64_t lastSets = gDispStats.cmdSet.Sum();
+            int tick = 0;
             while (!syncStop.load(std::memory_order_relaxed)) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                const size_t disk = bucket.DiskUsage();
-                const bool want = stalled ? disk > resume : disk > cfg.diskLimitBytes;
-                if (want != stalled) {
-                    stalled = want;
-                    bucket.SetWritesStalled(want);
-                    spdlog::info("disk {} MB: writes {}", disk >> 20, want ? "held" : "resumed");
+                std::this_thread::sleep_for(kTick);
+                if (rate > 0) {
+                    bucket.RefillWriteTokens(rate / 100, rate / 20);
+                }
+                if (++tick % kCheckTicks != 0) {
+                    continue;
+                }
+                const uint64_t sets = gDispStats.cmdSet.Sum();
+                setRate = int64_t(sets - lastSets) * 1000 /
+                          (kCheckTicks * kTick.count());
+                lastSets = sets;
+                const double disk = double(bucket.DiskUsage());
+                if (disk > high) {
+                    const int64_t from = rate > 0 ? rate : setRate;
+                    if (rate == 0) {
+                        bucket.RefillWriteTokens(0, 0);
+                        bucket.SetWriteLimited(true);
+                        spdlog::info("disk {} MB: write limit on at {}/s",
+                                     int64_t(disk) >> 20, from);
+                    }
+                    rate = std::max(kMinRate, from * 9 / 10);
+                } else if (disk < low && rate > 0) {
+                    rate = rate * 21 / 20;
+                    // Not binding once the clients ask for less.
+                    if (setRate < rate * 3 / 4) {
+                        rate = 0;
+                        bucket.SetWriteLimited(false);
+                        spdlog::info("disk {} MB: write limit off", int64_t(disk) >> 20);
+                    }
+                }
+                if (rate > 0 && tick % (40 * kCheckTicks) == 0) {
+                    spdlog::info("disk {} MB: write limit {}/s, sets {}/s",
+                                 int64_t(disk) >> 20, rate, setRate);
                 }
             }
-            bucket.SetWritesStalled(false);
+            bucket.SetWriteLimited(false);
         });
     }
 

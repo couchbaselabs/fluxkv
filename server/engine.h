@@ -828,20 +828,36 @@ public:
     bool StageWrite(Request* req);
     // Room for more staged writes? Used to lift read backpressure; the
     // margin keeps a connection from resuming straight back into a refusal.
-    // Set by the space governor while disk use is over budget: SETs stay in
-    // the socket until compaction catches up instead of being refused.
-    bool WritesStalled() const {
-        return writesStalled_.load(std::memory_order_relaxed);
+    // Write admission for the space governor: each SET takes a token, the
+    // governor refills them at its current rate. Out of tokens, SETs stay in
+    // the socket (paused connection) instead of being refused.
+    bool TakeWriteToken() {
+        return !writeLimited_.load(std::memory_order_relaxed) ||
+               writeTokens_.fetch_sub(1, std::memory_order_relaxed) > 0;
     }
-    void SetWritesStalled(bool v) {
-        writesStalled_.store(v, std::memory_order_relaxed);
+    bool HasWriteTokens() const {
+        return !writeLimited_.load(std::memory_order_relaxed) ||
+               writeTokens_.load(std::memory_order_relaxed) > 0;
+    }
+    // Adds n tokens, keeping at most cap banked. Debt from refused takes is
+    // repaid first.
+    void RefillWriteTokens(int64_t n, int64_t cap) {
+        auto t = writeTokens_.load(std::memory_order_relaxed);
+        int64_t want;
+        do {
+            want = std::min(t + n, cap);
+        } while (!writeTokens_.compare_exchange_weak(
+                t, want, std::memory_order_relaxed));
+    }
+    void SetWriteLimited(bool v) {
+        writeLimited_.store(v, std::memory_order_relaxed);
     }
     size_t DiskUsage();
     size_t QueuedBytes() const {
         return queuedBytes_.load(std::memory_order_relaxed);
     }
     bool WriteQueueHasRoom() const {
-        return !WritesStalled() &&
+        return HasWriteTokens() &&
                queuedBytes_.load(std::memory_order_relaxed) <
                writeQueueMemLimit_ - writeQueueMemLimit_ / 8;
     }
@@ -898,7 +914,8 @@ public:
 
     // Public for writer pool access
     std::atomic<size_t> queuedBytes_{0};
-    std::atomic<bool> writesStalled_{false};
+    std::atomic<bool> writeLimited_{false};
+    std::atomic<int64_t> writeTokens_{0};
 
 private:
     std::string name_;
