@@ -1364,6 +1364,16 @@ int main(int argc, char* argv[]) {
                 if (pauseData != dataCachePaused) {
                     dataCachePaused = pauseData;
                     Magma::SetDataBlockCachingPaused(pauseData);
+                    if (pauseData) {
+                        // Paused data blocks are never looked up again, but
+                        // the ones a read phase left in the protected queue
+                        // stay there and push index blocks out (M1 went from
+                        // 1.17 to 2.02 device reads per GET). Shrinking to
+                        // the floor evicts them first, as the least recently
+                        // used; the boost grows back from there.
+                        apply(minExtra, true);
+                        lastGrow = now;
+                    }
                     spdlog::info("data block caching {} ({:.0f} writes/s)",
                                  pauseData ? "paused" : "resumed", writeRate);
                 }
