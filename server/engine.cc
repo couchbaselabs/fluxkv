@@ -2013,16 +2013,6 @@ std::string Bucket::GetStatsJson() {
     return merged.dump(2);
 }
 
-size_t Bucket::DiskUsage() {
-    size_t disk = 0;
-    for (auto& shard : shards_) {
-        Magma::MagmaStats stats;
-        shard->GetMagma()->GetStats(stats);
-        disk += stats.TotalDiskUsage;
-    }
-    return disk;
-}
-
 std::string Bucket::GetKVStoreStatsJson() {
     nlohmann::json out = nlohmann::json::array();
     for (uint16_t vbid = 0; vbid < numVBuckets_; vbid++) {

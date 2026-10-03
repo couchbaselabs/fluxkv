@@ -19,6 +19,7 @@
 #include <cstring>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <algorithm>
 #include <filesystem>
 #include <iostream>
@@ -31,6 +32,21 @@ using namespace magma::kvserver;
 
 static Server* gServer = nullptr;
 static std::atomic<int> gSignal{0};
+
+// Blocks allocated under a directory: the disk use that counts. Magma's
+// TotalDiskUsage sums file sizes, which miss blocks preallocated past EOF.
+static size_t gAllocBytes = 0;
+static int addAllocated(const char*, const struct stat* st, int type, struct FTW*) {
+    if (type == FTW_F) {
+        gAllocBytes += size_t(st->st_blocks) * 512;
+    }
+    return 0;
+}
+static size_t allocatedBytes(const std::string& dir) {
+    gAllocBytes = 0;
+    nftw(dir.c_str(), addAllocated, 32, FTW_PHYS);
+    return gAllocBytes;
+}
 
 // Only async-signal-safe work here. Stop() used to run from this handler:
 // it joins threads and locks a mutex, and a second SIGTERM during the 5-15 s
@@ -1509,7 +1525,7 @@ int main(int argc, char* argv[]) {
             constexpr int kFragTicks = 500; // 5 s
             double frag = fragMax;
             double rate = 0; // 0 = not limiting
-            double ema = double(bucket.DiskUsage());
+            double ema = double(allocatedBytes(cfg.dataDir));
             double prevEma = ema;
             uint64_t lastSets = gDispStats.cmdSet.Sum();
             int tick = 0;
@@ -1525,7 +1541,7 @@ int main(int argc, char* argv[]) {
                 const double setRate = double(sets - lastSets);
                 lastSets = sets;
                 prevEma = ema;
-                const double disk = double(bucket.DiskUsage());
+                const double disk = double(allocatedBytes(cfg.dataDir));
                 ema += 0.3 * (disk - ema);
                 const double slope = ema - prevEma; // bytes per second
                 if (tick % kFragTicks == 0) {

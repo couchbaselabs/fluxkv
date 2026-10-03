@@ -852,7 +852,6 @@ public:
     void SetWriteLimited(bool v) {
         writeLimited_.store(v, std::memory_order_relaxed);
     }
-    size_t DiskUsage();
     size_t QueuedBytes() const {
         return queuedBytes_.load(std::memory_order_relaxed);
     }
