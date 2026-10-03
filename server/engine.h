@@ -774,6 +774,11 @@ private:
     void workerLoop(Worker* self);
     // Returns the number of requests served.
     size_t executeRead(ReadTask& task);
+    void collectRead(ReadTask& task, std::vector<Request*>& batch);
+    // Several vbucket tasks of this shard in one magma GetDocsMulti, so their
+    // device reads are in flight together (a one-request batch otherwise
+    // costs a reader thread per outstanding read).
+    size_t executeReadMulti(std::vector<ReadTask>& tasks);
 
     std::vector<std::unique_ptr<Worker>> workers_;
     std::atomic<size_t> live_{0};

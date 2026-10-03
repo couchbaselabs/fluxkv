@@ -1429,22 +1429,55 @@ void ReaderPool::workerLoop(Worker* self) {
             // Stop, or retire this one worker. Either way this thread ends.
             break;
         }
+        // FLUXKV_READER_MULTI=N: take up to N vbucket tasks at once (see
+        // executeReadMulti). A sentinel met on the way ends the loop after.
+        static const size_t kMulti = []() {
+            const char* env = std::getenv("FLUXKV_READER_MULTI");
+            return env ? size_t(std::max(1, std::atoi(env))) : size_t(1);
+        }();
+        bool stopAfter = false;
         auto& acct = acct_[statSlot()];
         const uint64_t t0 = nowNs();
-        const size_t served = executeRead(task);
+        size_t served = 0;
+        if (kMulti > 1) {
+            std::vector<ReadTask> tasks{task};
+            ReadTask extra;
+            while (tasks.size() < kMulti && taskQueue_.read(extra)) {
+                if (!extra.shard) {
+                    stopAfter = true;
+                    break;
+                }
+                tasks.push_back(extra);
+            }
+            served = tasks.size() > 1 ? executeReadMulti(tasks) : executeRead(task);
+        } else {
+            served = executeRead(task);
+        }
         const uint64_t t1 = nowNs();
         acct.busyNs.fetch_add(t1 - t0, std::memory_order_relaxed);
         acct.waitNs.fetch_add(t0 - task.enqueuedNs, std::memory_order_relaxed);
         acct.tasks.fetch_add(1, std::memory_order_relaxed);
         acct.items.fetch_add(served, std::memory_order_relaxed);
+        if (stopAfter) {
+            break;
+        }
     }
     self->done.store(true, std::memory_order_release);
 }
 
-size_t ReaderPool::executeRead(ReadTask& task) {
+static void completeGets(Bucket* bucket_,
+                         uint16_t vbid,
+                         std::vector<Request*>& reqs,
+                         Status s,
+                         const Slice& meta,
+                         const Slice& value,
+                         DispatchAccum& accum);
+
+// Takes this vbucket's next batch (overflow first, then one sweep) and
+// accounts it. An empty batch has already released the queue.
+void ReaderPool::collectRead(ReadTask& task, std::vector<Request*>& batch) {
     auto* shard = task.shard;
     auto& vbq = shard->GetVBReadQueue(task.vbid);
-    Magma::FetchBuffer idxBuf, seqBuf;
 
     // Cap batch size to allow multiple reader threads to work on the same VB
     // concurrently. Raised from 32 → 128 so a single executeRead call can hand
@@ -1452,8 +1485,6 @@ size_t ReaderPool::executeRead(ReadTask& task) {
     // coroutines busy and pushes NVMe queue depth from aqu-sz≈37 (43%% of
     // NVMe peak) toward saturation.
     const size_t kMaxReadBatch = gMaxReadBatch;
-    std::vector<Request*> batch;
-    batch.reserve(kMaxReadBatch);
 
     // Drain the overflow first: those are strictly older than anything the
     // lock-free list can hold right now (see VBQueue::overflow*). Mutex-
@@ -1485,7 +1516,7 @@ size_t ReaderPool::executeRead(ReadTask& task) {
 
     if (batch.empty()) {
         releaseReadVBQueue(vbq, taskQueue_, ReadTask{shard, task.vbid, nowNs()});
-        return 0;
+        return;
     }
 
     // Whatever is left past the cap becomes the new overflow, oldest-first.
@@ -1547,6 +1578,18 @@ size_t ReaderPool::executeRead(ReadTask& task) {
                                              std::memory_order_relaxed);
             gVbidRounds[task.vbid].fetch_add(1, std::memory_order_relaxed);
         }
+    }
+}
+
+size_t ReaderPool::executeRead(ReadTask& task) {
+    auto* shard = task.shard;
+    auto& vbq = shard->GetVBReadQueue(task.vbid);
+    Magma::FetchBuffer idxBuf, seqBuf;
+    std::vector<Request*> batch;
+    batch.reserve(gMaxReadBatch);
+    collectRead(task, batch);
+    if (batch.empty()) {
+        return 0;
     }
 
     if (batch.size() == 1) {
@@ -1616,8 +1659,87 @@ size_t ReaderPool::executeRead(ReadTask& task) {
                    const Magma::GetOperation& op,
                    const Slice& meta,
                    const Slice& value) {
-                    auto* reqs =
-                            static_cast<std::vector<Request*>*>(op.UserContext);
+                    completeGets(bucket_,
+                                 task.vbid,
+                                 *static_cast<std::vector<Request*>*>(op.UserContext),
+                                 s,
+                                 meta,
+                                 value,
+                                 accum);
+                });
+        accum.FlushAll();
+    }
+
+    releaseReadVBQueue(vbq, taskQueue_, ReadTask{shard, task.vbid, nowNs()});
+    return batch.size();
+}
+
+size_t ReaderPool::executeReadMulti(std::vector<ReadTask>& tasks) {
+    auto* shard = tasks.front().shard;
+    struct KeyReqs {
+        uint16_t vbid;
+        std::vector<Request*> reqs;
+    };
+    std::vector<std::vector<Request*>> batches(tasks.size());
+    std::deque<KeyReqs> keyReqs; // stable addresses for UserContext
+    std::vector<OperationsList<Magma::GetOperation>> getOps(tasks.size());
+    std::vector<Magma::MultiGetBatch> multi;
+    multi.reserve(tasks.size());
+    size_t served = 0;
+    for (size_t i = 0; i < tasks.size(); i++) {
+        batches[i].reserve(gMaxReadBatch);
+        collectRead(tasks[i], batches[i]);
+        if (batches[i].empty()) {
+            continue;
+        }
+        served += batches[i].size();
+        // Deduped by key, as executeRead does.
+        folly::F14FastMap<std::string_view, KeyReqs*> byKey;
+        for (auto* req : batches[i]) {
+            std::string_view k(reinterpret_cast<const char*>(req->key.Data()),
+                               req->key.Len());
+            auto& slot = byKey[k];
+            if (!slot) {
+                keyReqs.push_back(KeyReqs{tasks[i].vbid, {}});
+                slot = &keyReqs.back();
+                getOps[i].Add(Magma::GetOperation(req->key, slot));
+            }
+            slot->reqs.push_back(req);
+        }
+        multi.push_back(Magma::MultiGetBatch{tasks[i].vbid, &getOps[i]});
+    }
+    if (!multi.empty()) {
+        thread_local DispatchAccum accum;
+        shard->GetMagma()->GetDocsMulti(
+                multi,
+                [&accum, this](Status s,
+                               const Magma::GetOperation& op,
+                               const Slice& meta,
+                               const Slice& value) {
+                    auto* kr = static_cast<KeyReqs*>(op.UserContext);
+                    completeGets(bucket_, kr->vbid, kr->reqs, s, meta, value, accum);
+                });
+        accum.FlushAll();
+    }
+    for (size_t i = 0; i < tasks.size(); i++) {
+        if (!batches[i].empty()) {
+            releaseReadVBQueue(shard->GetVBReadQueue(tasks[i].vbid),
+                               taskQueue_,
+                               ReadTask{shard, tasks[i].vbid, nowNs()});
+        }
+    }
+    return served;
+}
+
+// Results of one GetOperation to every request that asked for its key.
+static void completeGets(Bucket* bucket_,
+                         uint16_t vbid,
+                         std::vector<Request*>& reqs,
+                         Status s,
+                         const Slice& meta,
+                         const Slice& value,
+                         DispatchAccum& accum) {
+                    auto* reqsPtr = &reqs;
                     bool hit = s.IsOK() && !s.IsOkDocNotFound();
                     DocMeta dm;
                     if (hit) {
@@ -1625,7 +1747,7 @@ size_t ReaderPool::executeRead(ReadTask& task) {
                     }
                     const uint64_t tReadDone =
                             gTraceLatency ? steadyNowNs() : 0;
-                    for (auto* req : *reqs) {
+                    for (auto* req : *reqsPtr) {
                         req->tReadDone = tReadDone;
                         req->resultStatus = s;
                         if (hit) {
@@ -1640,7 +1762,7 @@ size_t ReaderPool::executeRead(ReadTask& task) {
                                                 value.Len());
                             }
                             req->resultDatatype = dm.datatype;
-                            fillCache(bucket_, task.vbid, req, dm, value);
+                            fillCache(bucket_, vbid, req, dm, value);
                             hotStatAdd(gDispStats.cmdGetResp);
                         } else {
                             // OkDocNotFound (legitimate miss) or other error.
@@ -1668,12 +1790,6 @@ size_t ReaderPool::executeRead(ReadTask& task) {
                         // evb thread before GetDocs returns is safe.
                         accum.Add(req);
                     }
-                });
-        accum.FlushAll();
-    }
-
-    releaseReadVBQueue(vbq, taskQueue_, ReadTask{shard, task.vbid, nowNs()});
-    return batch.size();
 }
 
 
