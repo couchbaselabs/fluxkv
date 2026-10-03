@@ -1358,6 +1358,18 @@ int main(int argc, char* argv[]) {
                 // Hysteresis: the cap follows a noisy write rate, and each
                 // SetMemoryQuota recomputes magma's limits (1.6% of CPU in a
                 // mixed load when applied every tick).
+                if (wrote && extra > 0 && cap < extra) {
+                    // Writes after a boosted read phase: evict down to base
+                    // minus the write cache, so memtables refill into room
+                    // that is already free. Shrinking only to base let a
+                    // 300K/s burst outrun the next ticks (OOM-killed 2 s
+                    // into an overwrite).
+                    const int64_t wc = cfg.writeCache > 0
+                                               ? int64_t(cfg.writeCache)
+                                               : base / 2;
+                    apply(std::max(minExtra, std::min<int64_t>(0, cap) - wc), true);
+                    continue;
+                }
                 if (extra > cap && (cap == 0 || extra - cap >= step / 2)) {
                     apply(cap, true);
                     continue;
