@@ -572,6 +572,14 @@ public:
     void RecoverSeqno(uint16_t vbid, uint64_t seq) {
         seqnos_[vbid].store(seq, std::memory_order_relaxed);
     }
+    // Moves on every write to this shard; a write-activity signal.
+    uint64_t SeqnoSum() const {
+        uint64_t n = 0;
+        for (const auto& s : seqnos_) {
+            n += s.load(std::memory_order_relaxed);
+        }
+        return n;
+    }
 
     // KVStore creation tracking
     bool IsKVStoreCreated(uint16_t vbid) const {

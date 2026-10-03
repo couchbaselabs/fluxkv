@@ -211,6 +211,12 @@ struct Config {
     // its trees) within this many ms, round-robin. Bounds the crash loss
     // window to ~this interval. 0 = off.
     int syncIntervalMs = 0;
+    // While no writes arrive for readBoostIdleMs, add this much to the magma
+    // quota (split over shards) so the block cache takes the memory the idle
+    // write cache and low-water mark hold back; the first write takes it
+    // back, evicting before memtables grow. 0 = off.
+    size_t readBoostMB = 0;
+    int readBoostIdleMs = 3000;
     // Acknowledge a durable write from a completion thread when the shared
     // log reports it persisted, instead of blocking the writer inside
     // WriteDocs. Needs --durable and --shared-wal.
@@ -323,6 +329,10 @@ static void printUsage(const char* prog) {
               << "  --checkpoint-threshold F  checkpoint after a kvstore writes this "
                  "fraction of its data (magma default 0.02); each forces a flush\n"
               << "  --max-checkpoints N  checkpoints kept per kvstore (magma default 5)\n"
+              << "  --read-boost-mb N     add N MB to the magma quota while no writes "
+                 "arrive (block cache uses the idle write cache)\n"
+              << "  --read-boost-idle-ms N  writes-free time before boosting "
+                 "(default 3000)\n"
               << "  --sync-interval-ms N  with --no-wal, sync every kvstore within N ms "
                  "(round-robin), bounding the crash loss window to ~N ms\n"
               << "  --sstable-dynamic-ratio R  max sstable size as a fraction of its "
@@ -466,6 +476,8 @@ static Config parseArgs(int argc, char* argv[]) {
             {"lsm-level-multiplier", required_argument, nullptr, 1057},
             {"no-wal", no_argument, nullptr, 1058},
             {"sync-interval-ms", required_argument, nullptr, 1204},
+            {"read-boost-mb", required_argument, nullptr, 1205},
+            {"read-boost-idle-ms", required_argument, nullptr, 1206},
             {"async-durable", no_argument, nullptr, 1059},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
@@ -690,6 +702,12 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1204:
             cfg.syncIntervalMs = atoi(optarg);
+            break;
+        case 1205:
+            cfg.readBoostMB = strtoull(optarg, nullptr, 10);
+            break;
+        case 1206:
+            cfg.readBoostIdleMs = atoi(optarg);
             break;
         case 1067:
             cfg.keyLevelMultiplier = atoi(optarg);
@@ -1214,10 +1232,56 @@ int main(int argc, char* argv[]) {
         spdlog::info("  sync-interval: every kvstore within {} ms", cfg.syncIntervalMs);
     }
 
+    std::thread boostThread;
+    if (cfg.readBoostMB > 0) {
+        boostThread = std::thread([&] {
+            const size_t base = cfg.memQuota / cfg.shards;
+            const size_t boosted = base + cfg.readBoostMB * 1024 * 1024 / cfg.shards;
+            const auto idle = std::chrono::milliseconds(cfg.readBoostIdleMs);
+            auto setQuota = [&](size_t q, bool blocking) {
+                for (size_t i = 0; i < cfg.shards; i++) {
+                    bucket.GetShard(uint16_t(i)).GetMagma()->SetMemoryQuota(q, blocking);
+                }
+            };
+            uint64_t last = 0;
+            auto lastWrite = std::chrono::steady_clock::now();
+            bool on = false;
+            while (!syncStop.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                uint64_t n = 0;
+                for (size_t i = 0; i < cfg.shards; i++) {
+                    n += bucket.GetShard(uint16_t(i)).SeqnoSum();
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (n != last) {
+                    last = n;
+                    lastWrite = now;
+                    if (on) {
+                        // Blocking: evict here, before memtables can push
+                        // the process past its cgroup limit.
+                        setQuota(base, true);
+                        on = false;
+                        spdlog::info("read-boost off (writes)");
+                    }
+                } else if (!on && now - lastWrite >= idle) {
+                    setQuota(boosted, false);
+                    on = true;
+                    spdlog::info("read-boost on: quota {} -> {} MB per shard",
+                                 base >> 20, boosted >> 20);
+                }
+            }
+        });
+        spdlog::info("  read-boost: +{} MB after {} ms without writes",
+                     cfg.readBoostMB, cfg.readBoostIdleMs);
+    }
+
     server.Start(); // returns once RequestStop() has been called
     syncStop = true;
     if (syncThread.joinable()) {
         syncThread.join();
+    }
+    if (boostThread.joinable()) {
+        boostThread.join();
     }
 
     if (int sig = gSignal.load(std::memory_order_relaxed)) {
