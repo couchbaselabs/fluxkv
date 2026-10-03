@@ -223,6 +223,10 @@ struct Config {
     // above it: after a load the memtables are still full and flushing, and
     // a flat +2.7 GB boost 4 s after the last write OOM-killed the server.
     size_t readBoostMaxRssMB = 0;
+    // With writes running the boost scales down with the write rate,
+    // reaching 0 at this many writes/s (mixed loads keep most of it; a pure
+    // overwrite none). 0 = drop the boost on any write.
+    size_t readBoostWriteRate = 0;
     // Acknowledge a durable write from a completion thread when the shared
     // log reports it persisted, instead of blocking the writer inside
     // WriteDocs. Needs --durable and --shared-wal.
@@ -485,6 +489,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"read-boost-mb", required_argument, nullptr, 1205},
             {"read-boost-idle-ms", required_argument, nullptr, 1206},
             {"read-boost-max-rss-mb", required_argument, nullptr, 1207},
+            {"read-boost-write-rate", required_argument, nullptr, 1208},
             {"async-durable", no_argument, nullptr, 1059},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
@@ -718,6 +723,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1207:
             cfg.readBoostMaxRssMB = strtoull(optarg, nullptr, 10);
+            break;
+        case 1208:
+            cfg.readBoostWriteRate = strtoull(optarg, nullptr, 10);
             break;
         case 1067:
             cfg.keyLevelMultiplier = atoi(optarg);
@@ -1275,6 +1283,7 @@ int main(int argc, char* argv[]) {
             auto lastWrite = std::chrono::steady_clock::now();
             auto lastGrow = lastWrite;
             size_t extra = 0;
+            double writeRate = 0;
             while (!syncStop.load(std::memory_order_relaxed)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 uint64_t n = 0;
@@ -1282,31 +1291,42 @@ int main(int argc, char* argv[]) {
                     n += bucket.GetShard(uint16_t(i)).SeqnoSum();
                 }
                 const auto now = std::chrono::steady_clock::now();
-                if (n != last) {
-                    last = n;
+                // Writes/s over this 100 ms tick, smoothed.
+                const double tickRate = double(n - last) * 10.0;
+                writeRate = last == 0 ? 0 : 0.7 * writeRate + 0.3 * tickRate;
+                const bool wrote = n != last;
+                last = n;
+                size_t cap = maxExtra;
+                if (wrote) {
                     lastWrite = now;
-                    if (extra > 0) {
-                        // Blocking: evict here, before memtables can push
-                        // the process past its cgroup limit.
-                        setQuota(base, true);
-                        extra = 0;
-                        spdlog::info("read-boost off (writes)");
-                    }
+                    cap = cfg.readBoostWriteRate == 0
+                                  ? 0
+                                  : size_t(double(maxExtra) *
+                                           std::clamp(1.0 - std::max(writeRate, tickRate) /
+                                                                    double(cfg.readBoostWriteRate),
+                                                      0.0,
+                                                      1.0));
+                }
+                if (extra > cap) {
+                    // Blocking: evict here, before memtables can push the
+                    // process past its cgroup limit.
+                    extra = cap;
+                    setQuota(base + extra, true);
                     continue;
                 }
-                if (now - lastWrite < idle) {
+                if (!wrote && now - lastWrite < idle) {
                     continue;
                 }
                 const size_t r = rss();
                 if (rssLimit > 0 && r > rssHigh && extra > 0) {
                     extra = extra > step ? extra - step : 0;
                     setQuota(base + extra, true);
-                } else if ((rssLimit == 0 || r < rssLow) && extra < maxExtra &&
+                } else if ((rssLimit == 0 || r < rssLow) && extra < cap &&
                            now - lastGrow >= std::chrono::seconds(1)) {
                     // Once a second: reads fill a step in well under that,
                     // so the next check sees what the last step cost.
                     lastGrow = now;
-                    extra = std::min(maxExtra, extra + step);
+                    extra = std::min(cap, extra + step);
                     setQuota(base + extra, false);
                     if (extra == maxExtra) {
                         spdlog::info("read-boost full: quota {} -> {} MB per shard (rss {} MB)",
