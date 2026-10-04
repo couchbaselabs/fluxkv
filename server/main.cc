@@ -1523,15 +1523,17 @@ int main(int argc, char* argv[]) {
             // Pacing SETs is the backstop from --disk-pace-at (95%), above
             // where GC holds disk use: GC runs off
             // flushes, so pacing writes inside GC's own range starved it
-            // (mixed loads deadlocked at ~5K writes/s; T7 lost 17%). Disk use is smoothed (compaction swings it
-            // by GBs as outputs land before inputs go); the SET rate
-            // follows the gap between the growth that reaches 96.5% in
-            // ~60 s and the observed growth, at ~1.1 KB of disk per SET.
+            // (mixed loads deadlocked at ~5K writes/s; T7 lost 17%). Disk
+            // use is smoothed (compaction swings it by GBs as outputs land
+            // before inputs go). The SET rate is feed-forward: what GC
+            // reclaims (SETs at ~1.1 KB each minus the smoothed growth) plus
+            // the growth that reaches the target in ~60 s. A gain-stepped
+            // rate swung 30K-300K/s every few seconds and those bursts
+            // synchronised GC.
             using kvserver::gDispStats;
             constexpr double kMinRate = 30000;
             constexpr double kBytesPerSet = 1100;
             constexpr double kApproachSec = 60;
-            constexpr double kGain = 0.1;
             constexpr auto kTick = std::chrono::milliseconds(10);
             constexpr int kCheckTicks = 100; // 1 s
             const double budget = double(cfg.diskLimitBytes);
@@ -1564,6 +1566,8 @@ int main(int argc, char* argv[]) {
             double rate = 0; // 0 = not limiting
             double ema = double(allocatedBytes(cfg.dataDir));
             double prevEma = ema;
+            double slowSlope = 0;
+            int quietSecs = 0;
             uint64_t lastSets = gDispStats.cmdSet.Sum();
             int tick = 0;
             while (!syncStop.load(std::memory_order_relaxed)) {
@@ -1581,6 +1585,7 @@ int main(int argc, char* argv[]) {
                 const double disk = double(allocatedBytes(cfg.dataDir));
                 ema += 0.3 * (disk - ema);
                 const double slope = ema - prevEma; // bytes per second
+                slowSlope += 0.1 * (slope - slowSlope);
                 if (fragHigh > 0 && (tick % kFragTicks == 0 || (rate > 0 && ema > fragHigh))) {
                     const double prevFrag = frag;
                     if (ema > fragHigh) {
@@ -1615,14 +1620,16 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
                 const double want = (target - ema) / kApproachSec;
-                rate = std::max(kMinRate,
-                                rate + kGain * (want - slope) / kBytesPerSet);
+                const double reclaim = std::max(0.0, setRate * kBytesPerSet - slowSlope);
+                const double desired = (reclaim + want) / kBytesPerSet;
+                rate = std::max(kMinRate, rate + 0.3 * (desired - rate));
                 if (disk > ceiling) {
-                    rate = kMinRate;
+                    rate = std::max(kMinRate, 0.5 * rate);
                 }
                 // No windup past what the clients ask for.
                 rate = std::min(rate, std::max(kMinRate, 1.5 * setRate));
-                if (ema < release && setRate < rate * 0.75) {
+                quietSecs = ema < release && setRate < rate * 0.75 ? quietSecs + 1 : 0;
+                if (quietSecs >= 10) {
                     rate = 0;
                     bucket.SetWriteLimited(false);
                     spdlog::info("disk {} MB: write limit off", int64_t(ema) >> 20);
