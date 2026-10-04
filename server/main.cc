@@ -1546,7 +1546,19 @@ int main(int argc, char* argv[]) {
             // a high --lsd-frag-ratio, 5 s steps left GC idle for ~50 s
             // while paced writes still filled the disk past the budget.
             constexpr int kFragTicks = 500; // 5 s
+            // Shards get ratios spread over kFragStagger below frag. Under
+            // uniform overwrites every kvstore crossed one shared ratio
+            // together, and the GC wave's outputs, written before their
+            // inputs are freed, lifted disk use by 5 GB in 15 s (2.10x).
+            constexpr double kFragStagger = 0.06;
+            auto applyFrag = [&](double f) {
+                for (size_t i = 0; i < cfg.shards; i++) {
+                    const double off = cfg.shards > 1 ? kFragStagger * double(i) / double(cfg.shards - 1) : 0;
+                    bucket.GetShard(uint16_t(i)).GetMagma()->SetFragmentationRatio(std::max(kFragMin, f - off));
+                }
+            };
             double frag = fragMax;
+            applyFrag(frag);
             double rate = 0; // 0 = not limiting
             double ema = double(allocatedBytes(cfg.dataDir));
             double prevEma = ema;
@@ -1575,9 +1587,7 @@ int main(int argc, char* argv[]) {
                         frag = std::min(fragMax, frag + kFragStep);
                     }
                     if (frag != prevFrag) {
-                        for (size_t i = 0; i < cfg.shards; i++) {
-                            bucket.GetShard(uint16_t(i)).GetMagma()->SetFragmentationRatio(frag);
-                        }
+                        applyFrag(frag);
                         if (tick % (6 * kFragTicks) == 0 || frag == kFragMin || frag == fragMax) {
                             spdlog::info("disk {} MB: frag ratio {:.2f}", int64_t(ema) >> 20, frag);
                         }
