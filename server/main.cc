@@ -261,9 +261,11 @@ struct Config {
     // (key-index dups run ~40% under heavy overwrite). 0 = off.
     size_t diskLimitBytes = 0;
     // Fractions of the disk budget: GC tightens above diskFragHigh and
-    // relaxes below diskFragLow; SET pacing engages at diskPaceAt.
-    double diskFragLow = 0.88;
-    double diskFragHigh = 0.92;
+    // relaxes below diskFragLow (0 = off: every global ratio change made all
+    // kvstores GC together, and the waves swung disk use by 0.3x and cost
+    // T7 10%); SET pacing engages at diskPaceAt.
+    double diskFragLow = 0;
+    double diskFragHigh = 0;
     double diskPaceAt = 0.95;
     // Keep data blocks out of the block cache while the write rate is above
     // this (needs --read-boost-mb). 0 = never.
@@ -396,7 +398,7 @@ static void printUsage(const char* prog) {
               << "  --block-cache-policy P  block cache eviction: LRU (magma "
                  "default), DFR (delayed FIFO reinsertion) or C2QP (Clock2Q+)\n"
               << "  --disk-limit-bytes N  hold SETs while disk use > N bytes (default: off)\n"
-              << "  --disk-gc-band LO:HI  budget fractions GC holds disk use between (default 0.88:0.92)\n"
+              << "  --disk-gc-band LO:HI  budget fractions GC holds disk use between (default off)\n"
               << "  --disk-pace-at F      budget fraction where SET pacing engages (default 0.95)\n"
               << "  --data-cache-max-write-rate N  no data-block caching above N writes/s (default: off)\n"
               << "  --read-ahead N       compaction read-ahead buffer bytes; with "
@@ -1514,10 +1516,10 @@ int main(int argc, char* argv[]) {
     std::thread spaceThread;
     if (cfg.diskLimitBytes > 0) {
         spaceThread = std::thread([&] {
-            // Holds disk use under the budget. First by GC: the LSD
-            // fragmentation ratio steps down from --lsd-frag-ratio while
-            // disk use is above --disk-gc-band (default 88-92% of the
-            // budget), and back up below it, trading write amp for space.
+            // Holds disk use under the budget. Optionally by GC: with
+            // --disk-gc-band the LSD fragmentation ratio steps down from
+            // --lsd-frag-ratio while disk use is above the band and back up
+            // below it, trading write amp for space.
             // Pacing SETs is the backstop from --disk-pace-at (95%), above
             // where GC holds disk use: GC runs off
             // flushes, so pacing writes inside GC's own range starved it
@@ -1579,7 +1581,7 @@ int main(int argc, char* argv[]) {
                 const double disk = double(allocatedBytes(cfg.dataDir));
                 ema += 0.3 * (disk - ema);
                 const double slope = ema - prevEma; // bytes per second
-                if (tick % kFragTicks == 0 || (rate > 0 && ema > fragHigh)) {
+                if (fragHigh > 0 && (tick % kFragTicks == 0 || (rate > 0 && ema > fragHigh))) {
                     const double prevFrag = frag;
                     if (ema > fragHigh) {
                         frag = std::max(kFragMin, frag - kFragStep);
