@@ -255,6 +255,11 @@ struct Config {
     // overwrite, which keeps the full device. 0 = off.
     size_t compactionRateLimitMB = 0;
     size_t compactionLimitMinGets = 20000;
+    // With compactionRatePerSet, the cap follows GC's demand: this many
+    // bytes of compaction IO per SET/s (GC costs ~3 B per user byte at 1 KB
+    // docs), floored at compactionRateLimitMB. A fixed cap that smoothed a
+    // 50K SET/s mix starved GC at 95K SET/s (M1 190K -> 106K, 2.0x space).
+    size_t compactionRatePerSet = 0;
     // Hold SETs in the socket while disk use exceeds this many bytes, so
     // overwrites cannot outrun GC into unbounded space. A byte budget like
     // a fixed-size device: with blind writes the live size is not known
@@ -540,6 +545,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"mem-hard-rss-mb", required_argument, nullptr, 1209},
             {"compaction-rate-limit-mb", required_argument, nullptr, 1210},
             {"compaction-limit-min-gets", required_argument, nullptr, 1211},
+            {"compaction-rate-per-set", required_argument, nullptr, 1216},
             {"disk-limit-bytes", required_argument, nullptr, 1212},
             {"data-cache-max-write-rate", required_argument, nullptr, 1213},
             {"disk-gc-band", required_argument, nullptr, 1214},
@@ -805,6 +811,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1215:
             cfg.diskPaceAt = atof(optarg);
+            break;
+        case 1216:
+            cfg.compactionRatePerSet = strtoull(optarg, nullptr, 10);
             break;
         case 1067:
             cfg.keyLevelMultiplier = atoi(optarg);
@@ -1496,23 +1505,40 @@ int main(int argc, char* argv[]) {
     if (cfg.compactionRateLimitMB > 0) {
         compactionLimitThread = std::thread([&] {
             using kvserver::gDispStats;
-            uint64_t last = 0;
-            bool limited = false;
+            const double floorBytes = double(cfg.compactionRateLimitMB) * 1024 * 1024;
+            uint64_t last = 0, lastSets = 0;
+            double setRate = 0;
+            uint64_t applied = 0;
             while (!syncStop.load(std::memory_order_relaxed)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 const uint64_t n = gDispStats.cmdGetResp.Sum() +
                                    gDispStats.cmdGetRespMiss.Sum();
+                const uint64_t sets = gDispStats.cmdSet.Sum();
                 const double rate = last == 0 ? 0 : double(n - last) * 2.0;
+                const double tick = lastSets == 0 ? 0 : double(sets - lastSets) * 2.0;
                 last = n;
+                lastSets = sets;
+                // Rise at once, decay slowly: a lagging cap starves GC.
+                setRate = std::max(tick, 0.9 * setRate + 0.1 * tick);
                 const bool want = rate >= double(cfg.compactionLimitMinGets);
-                if (want != limited) {
-                    limited = want;
-                    Magma::SetCompactionRateLimit(
-                            want ? cfg.compactionRateLimitMB * 1024 * 1024 : 0);
-                    spdlog::info("compaction rate limit {} ({:.0f} gets/s)",
-                                 want ? std::to_string(cfg.compactionRateLimitMB) + " MB/s"
-                                      : std::string("off"),
-                                 rate);
+                uint64_t limit = 0;
+                if (want) {
+                    limit = uint64_t(std::max(floorBytes,
+                                              setRate * double(cfg.compactionRatePerSet)));
+                }
+                // Re-apply only on a >10% change.
+                const bool changed = (limit == 0) != (applied == 0) ||
+                                     (limit > 0 && (limit > applied * 11 / 10 ||
+                                                    limit < applied * 9 / 10));
+                if (changed) {
+                    if ((limit == 0) != (applied == 0)) {
+                        spdlog::info("compaction rate limit {} ({:.0f} gets/s, {:.0f} sets/s)",
+                                     limit ? std::to_string(limit >> 20) + " MB/s"
+                                           : std::string("off"),
+                                     rate, setRate);
+                    }
+                    applied = limit;
+                    Magma::SetCompactionRateLimit(limit);
                 }
             }
         });
