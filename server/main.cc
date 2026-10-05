@@ -1415,6 +1415,9 @@ int main(int argc, char* argv[]) {
                                  pauseData ? "paused" : "resumed", writeRate);
                 }
                 int64_t cap = maxExtra;
+                // Writes after an idle (read-only) stretch, as opposed to a
+                // dip in a steady mixed load's noisy write rate.
+                const bool resumed = wrote && now - lastWrite >= idle;
                 if (wrote) {
                     lastWrite = now;
                     purged = false;
@@ -1450,12 +1453,14 @@ int main(int argc, char* argv[]) {
                 // Hysteresis: the cap follows a noisy write rate, and each
                 // SetMemoryQuota recomputes magma's limits (1.6% of CPU in a
                 // mixed load when applied every tick).
-                if (wrote && extra > 0 && cap < extra) {
+                if (resumed && extra > 0 && cap < extra) {
                     // Writes after a boosted read phase: evict down to base
                     // minus the write cache, so memtables refill into room
                     // that is already free. Shrinking only to base let a
                     // 300K/s burst outrun the next ticks (OOM-killed 2 s
-                    // into an overwrite).
+                    // into an overwrite). Only on resume: in steady mixed
+                    // load this fired on every rate dip and dumped the
+                    // index blocks every ~12 s (p99 175 ms at 100K/s).
                     const int64_t wc = cfg.writeCache > 0
                                                ? int64_t(cfg.writeCache)
                                                : base / 2;
