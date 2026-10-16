@@ -247,6 +247,7 @@ void Connection::destroy() {
         sendClosed_ = true;
         spill_.clear();
     }
+    drainPendingSends(); // finishes them unsent
     socket_->setReadCB(nullptr);
     socket_->close();
     // Defer delete to next event loop iteration to avoid use-after-free
@@ -442,6 +443,13 @@ void Connection::readDataAvailable(size_t len) noexcept {
 }
 
 void Connection::flushPending() {
+    flushPendingImpl();
+    if (gDirectSend) {
+        drainPendingSends();
+    }
+}
+
+void Connection::flushPendingImpl() {
     if (closing_) {
         return;
     }
@@ -493,6 +501,10 @@ void Connection::writeChainLocked(std::unique_ptr<folly::IOBuf> buf) {
             inflightBufs_.end(), spareBufs_, spareBufs_.begin());
     follyWrites_.fetch_add(1, std::memory_order_relaxed);
     socket_->writeChain(this, std::move(buf));
+    if (g.owns_lock()) {
+        g.unlock();
+        drainPendingSends();
+    }
 }
 
 // Detach from the socket and re-check shortly. The kernel receive buffer
@@ -1463,7 +1475,7 @@ void Connection::sendGetResponse(Request* req) {
     }
 }
 
-void Connection::sendDirect(Request* const* reqs, size_t n) {
+bool Connection::writeDirectLocked(Request* const* reqs, size_t n) {
     // Header + flags per response; values go out from each responseBuf.
     thread_local std::vector<std::array<uint8_t, kHeaderSize + 4>> hdrs;
     thread_local std::vector<iovec> iov;
@@ -1510,10 +1522,8 @@ void Connection::sendDirect(Request* const* reqs, size_t n) {
             total += r->responseBuf.size();
         }
     }
-    folly::EventBase* evb = reqs[0]->evb;
     bool post = false;
     {
-        std::lock_guard<std::recursive_mutex> g(sendMu_);
         if (!sendClosed_) {
             size_t sent = 0;
             if (spill_.empty() &&
@@ -1552,25 +1562,106 @@ void Connection::sendDirect(Request* const* reqs, size_t n) {
         }
     }
     gDirectSends.fetch_add(1, std::memory_order_relaxed);
-    if (post) {
-        // These requests keep the connection on this loop until the
-        // spill is handed to folly.
-        gDirectHandoffs.fetch_add(1, std::memory_order_relaxed);
-        std::vector<Request*> batch(reqs, reqs + n);
-        evb->runInEventBaseThread([this, batch = std::move(batch)]() {
-            flushPending();
-            for (auto* r : batch) {
-                releaseRequest(r);
-            }
-            const int k = static_cast<int>(batch.size());
-            if (outstandingRequests_.fetch_sub(k, std::memory_order_acq_rel) ==
-                k) {
-                onDrained();
-            }
-        });
+    return post;
+}
+
+void Connection::sendDirect(Request* const* reqs, size_t n) {
+    std::unique_lock<std::recursive_mutex> g(sendMu_, std::try_to_lock);
+    if (!g.owns_lock()) {
+        // Someone is writing to this socket: leave these to them rather
+        // than sleep on the lock. The extra count keeps the connection
+        // alive until this thread is done with it.
+        folly::EventBase* evb = reqs[0]->evb;
+        outstandingRequests_.fetch_add(1, std::memory_order_relaxed);
+        for (size_t i = 0; i + 1 < n; i++) {
+            reqs[i]->hook.next = reqs[i + 1];
+        }
+        Request* old = sendPending_.load(std::memory_order_relaxed);
+        do {
+            reqs[n - 1]->hook.next = old;
+        } while (!sendPending_.compare_exchange_weak(
+                old, reqs[0], std::memory_order_seq_cst, std::memory_order_relaxed));
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (!g.try_lock()) {
+            gDirectCombined.fetch_add(1, std::memory_order_relaxed);
+            releaseOutstanding(1, evb);
+            return;
+        }
+        sendHeld(g, nullptr, 0);
+        releaseOutstanding(1, evb);
         return;
     }
-    finishDirect(reqs, n);
+    sendHeld(g, reqs, n);
+}
+
+void Connection::sendHeld(std::unique_lock<std::recursive_mutex>& g,
+                          Request* const* reqs,
+                          size_t n) {
+    constexpr size_t kMaxPerSend = 256; // <= 512 iovecs
+    thread_local std::vector<Request*> all;
+    thread_local std::vector<std::pair<size_t, bool>> chunks;
+    all.assign(reqs, reqs + n);
+    chunks.clear();
+    size_t sent = 0;
+    for (;;) {
+        for (Request* r = sendPending_.exchange(nullptr, std::memory_order_seq_cst);
+             r;) {
+            Request* next = r->hook.next;
+            r->hook.next = nullptr;
+            all.push_back(r);
+            r = next;
+        }
+        while (sent < all.size()) {
+            const size_t end = std::min(all.size(), sent + kMaxPerSend);
+            chunks.emplace_back(end, writeDirectLocked(all.data() + sent, end - sent));
+            sent = end;
+        }
+        g.unlock();
+        // A sender that pushed while we held the lock and then failed its
+        // retry left its responses to us.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (sendPending_.load(std::memory_order_relaxed) == nullptr ||
+            !g.try_lock()) {
+            break;
+        }
+    }
+    size_t start = 0;
+    for (const auto& c : chunks) {
+        finishBatch(all.data() + start, c.first - start, c.second);
+        start = c.first;
+    }
+}
+
+void Connection::drainPendingSends() {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (sendPending_.load(std::memory_order_relaxed) == nullptr) {
+        return;
+    }
+    std::unique_lock<std::recursive_mutex> g(sendMu_, std::try_to_lock);
+    if (g.owns_lock()) {
+        sendHeld(g, nullptr, 0);
+    }
+}
+
+void Connection::finishBatch(Request* const* reqs, size_t n, bool post) {
+    if (!post) {
+        finishDirect(reqs, n);
+        return;
+    }
+    // These requests keep the connection on this loop until the spill is
+    // handed to folly.
+    gDirectHandoffs.fetch_add(1, std::memory_order_relaxed);
+    std::vector<Request*> batch(reqs, reqs + n);
+    reqs[0]->evb->runInEventBaseThread([this, batch = std::move(batch)]() {
+        flushPending();
+        for (auto* r : batch) {
+            releaseRequest(r);
+        }
+        const int k = static_cast<int>(batch.size());
+        if (outstandingRequests_.fetch_sub(k, std::memory_order_acq_rel) == k) {
+            onDrained();
+        }
+    });
 }
 
 void Connection::finishDirect(Request* const* reqs, size_t n) {
@@ -1587,19 +1678,22 @@ void Connection::finishDirect(Request* const* reqs, size_t n) {
         tail->hook.next = old;
     } while (!returned_.compare_exchange_weak(
             old, head, std::memory_order_release, std::memory_order_relaxed));
+    releaseOutstanding(static_cast<int>(n), evb);
+}
+
+void Connection::releaseOutstanding(int k, folly::EventBase* evb) {
     {
-        std::lock_guard<std::recursive_mutex> g(sendMu_);
-        if (!sendClosed_ && !drainWatch_) {
+        // Without the lock, fall through: correct in any state.
+        std::unique_lock<std::recursive_mutex> g(sendMu_, std::try_to_lock);
+        if (g.owns_lock() && !sendClosed_ && !drainWatch_) {
             // Nothing waits for zero; destroy() and migrateTo() set
             // these under this lock before they read the count.
-            outstandingRequests_.fetch_sub(static_cast<int>(n),
-                                           std::memory_order_acq_rel);
+            outstandingRequests_.fetch_sub(k, std::memory_order_acq_rel);
             return;
         }
     }
     // Never take the count to zero here: onDrained runs on the loop and
     // may delete the connection.
-    int k = static_cast<int>(n);
     int v = outstandingRequests_.load(std::memory_order_relaxed);
     while (k > 0 && v > 1) {
         const int d = std::min(k, v - 1);

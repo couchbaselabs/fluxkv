@@ -187,6 +187,7 @@ extern bool gDirectSend;
 extern std::atomic<uint64_t> gDirectSends;
 extern std::atomic<uint64_t> gDirectSpills;
 extern std::atomic<uint64_t> gDirectHandoffs;
+extern std::atomic<uint64_t> gDirectCombined;
 struct StageTimers {
     // arrival -> writer picks the batch up
     std::atomic<uint64_t> toWriterNs{0};

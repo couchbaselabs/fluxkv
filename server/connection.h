@@ -82,6 +82,19 @@ private:
     void writeChainLocked(std::unique_ptr<folly::IOBuf> buf);
     void traceRead(Request* req);
     void finishDirect(Request* const* reqs, size_t n);
+    // Writes the responses with sendMu_ held; true if the IO thread must
+    // finish them (their tail was spilled).
+    bool writeDirectLocked(Request* const* reqs, size_t n);
+    // Sends reqs and whatever other senders left, then unlocks g.
+    void sendHeld(std::unique_lock<std::recursive_mutex>& g,
+                  Request* const* reqs,
+                  size_t n);
+    void finishBatch(Request* const* reqs, size_t n, bool post);
+    // Drops k in-flight counts, never to zero off the loop.
+    void releaseOutstanding(int k, folly::EventBase* evb);
+    // Sends what others left if nobody holds the lock.
+    void drainPendingSends();
+    void flushPendingImpl();
     void scheduleFlush();
 
     // Bootstrap handlers (respond inline on IO thread)
@@ -138,6 +151,8 @@ private:
     int fd_{-1};
     // Requests finished on reader threads, for acquireRequest().
     std::atomic<Request*> returned_{nullptr};
+    // Responses left by senders that found sendMu_ taken (via hook.next).
+    std::atomic<Request*> sendPending_{nullptr};
 
     // SCRAM auth state
     std::string scramServerNonce_;

@@ -66,6 +66,7 @@ bool gDirectSend = false;
 std::atomic<uint64_t> gDirectSends{0};
 std::atomic<uint64_t> gDirectSpills{0};
 std::atomic<uint64_t> gDirectHandoffs{0};
+std::atomic<uint64_t> gDirectCombined{0};
 StageTimers gStages;
 int gDurableSpinIters = 4000;
 size_t gCompletionSlice = 512;
@@ -237,6 +238,7 @@ std::string DispatcherStats::toJson() const {
     j["direct_sends"] = gDirectSends.load(std::memory_order_relaxed);
     j["direct_spills"] = gDirectSpills.load(std::memory_order_relaxed);
     j["direct_handoffs"] = gDirectHandoffs.load(std::memory_order_relaxed);
+    j["direct_combined"] = gDirectCombined.load(std::memory_order_relaxed);
     // Every allocation goes through jemalloc (alloc.cc), so these account for
     // the whole heap: resident minus allocated is what it holds unpurged.
     {
