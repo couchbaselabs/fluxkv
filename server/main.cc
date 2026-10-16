@@ -1,3 +1,4 @@
+#include <sys/resource.h>
 #include <unistd.h>
 #include <cstdio>
 #include "engine.h"
@@ -1246,6 +1247,24 @@ int main(int argc, char* argv[]) {
     if (cfg.directSend) {
         gDirectSend = true;
         spdlog::info("  responses: direct from readers");
+    }
+    {
+        constexpr rlim_t kMaxOpenFiles = 300000;
+        constexpr rlim_t kOtherFds = 65536; // sockets, WAL, logs
+        rlim_t n = kMaxOpenFiles;
+        rlimit rl{};
+        if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY &&
+            rl.rlim_cur < n + kOtherFds) {
+            rl.rlim_cur = std::min(rl.rlim_max, n + kOtherFds);
+            (void)::setrlimit(RLIMIT_NOFILE, &rl);
+            (void)::getrlimit(RLIMIT_NOFILE, &rl);
+            if (rl.rlim_cur < n + kOtherFds) {
+                n = rl.rlim_cur > 2 * kOtherFds ? rl.rlim_cur - kOtherFds
+                                                : rl.rlim_cur / 2;
+            }
+        }
+        Magma::SetMaxOpenFiles(static_cast<size_t>(n));
+        spdlog::info("  magma max open files: {}", static_cast<size_t>(n));
     }
     // Reader threads pick their loop as they start, inside the Bucket
     // constructor.
