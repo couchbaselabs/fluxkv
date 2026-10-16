@@ -58,6 +58,7 @@ struct DocCacheStats {
     uint64_t items{0};
     uint64_t pendingItems{0}; // items pinned by an unapplied write
     uint64_t maxBytes{0};
+    uint64_t seqnoIndexItems{0}; // keys with a known seqno (EnableSeqnoIndex)
 };
 
 class DocCache {
@@ -127,6 +128,18 @@ public:
     // refused by the write queue, so the cache does not hold a version the
     // store will never see.
     virtual void Erase(uint16_t vbid, std::string_view key) = 0;
+
+    // Keep each key's latest applied seqno after its value is evicted, so a
+    // read miss can go to the store by seqno (SeqnoHint).
+    virtual void EnableSeqnoIndex() {}
+
+    // The key's latest applied seqno, or 0 if unknown or deleted. A hint
+    // only: the store checks it and falls back to a key lookup.
+    virtual uint64_t SeqnoHint(uint16_t vbid, std::string_view key) {
+        (void)vbid;
+        (void)key;
+        return 0;
+    }
 
     virtual DocCacheStats GetStats() const = 0;
     virtual const char* Policy() const = 0;

@@ -41,6 +41,7 @@ std::atomic<int64_t> gMailDepth{0};
 Bucket* gStatsBucket{nullptr};
 
 DocCache* gDocCache = nullptr;
+bool gCacheSeqnoIndex = false;
 // Runtime-tunable read-batch cap (--max-read-batch). 128 matches the
 // libaio + IOQueueDepth=16 sweet spot; lower (8-16) is better for sync
 // QD=1 multi-thread parallelism.
@@ -1592,7 +1593,7 @@ size_t ReaderPool::executeRead(ReadTask& task) {
         return 0;
     }
 
-    if (batch.size() == 1) {
+    if (batch.size() == 1 && !gCacheSeqnoIndex) {
         // Single Get — no OperationsList overhead
         auto* req = batch[0];
         Slice meta, value;
@@ -1649,7 +1650,11 @@ size_t ReaderPool::executeRead(ReadTask& task) {
         }
         OperationsList<Magma::GetOperation> getOps;
         for (auto& [key, reqs] : byKey) {
-            getOps.Add(Magma::GetOperation(reqs.front()->key, &reqs));
+            Magma::GetOperation op(reqs.front()->key, &reqs);
+            if (gCacheSeqnoIndex) {
+                op.SeqnoHint = gDocCache->SeqnoHint(task.vbid, key);
+            }
+            getOps.Add(op);
         }
         thread_local DispatchAccum accum;
         shard->GetMagma()->GetDocs(
@@ -1702,7 +1707,13 @@ size_t ReaderPool::executeReadMulti(std::vector<ReadTask>& tasks) {
             if (!slot) {
                 keyReqs.push_back(KeyReqs{tasks[i].vbid, {}});
                 slot = &keyReqs.back();
-                getOps[i].Add(Magma::GetOperation(req->key, slot));
+                Magma::GetOperation op(req->key, slot);
+                if (gCacheSeqnoIndex) {
+                    op.SeqnoHint = gDocCache->SeqnoHint(
+                            tasks[i].vbid,
+                            std::string_view(req->key.Data(), req->key.Len()));
+                }
+                getOps[i].Add(op);
             }
             slot->reqs.push_back(req);
         }

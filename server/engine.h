@@ -115,6 +115,8 @@ extern Bucket* gStatsBucket;
 // The bucket's document cache, or null. Published by Bucket::SetCache so the
 // stats endpoint can report it alongside the dispatcher counters.
 extern DocCache* gDocCache;
+// Readers send the doc cache's seqno hints to magma (--cache-seqno-index).
+extern bool gCacheSeqnoIndex;
 // Runtime read-batch cap (set from main via --max-read-batch).
 extern size_t gMaxReadBatch;
 // Max concurrent owners one vbucket's reads can have (--max-read-owners).

@@ -26,6 +26,8 @@ constexpr size_t kMapSlotOverhead = 24;
 constexpr size_t kSmallPercent = 10;
 constexpr uint8_t kMaxFreq = 3;
 enum Queue : uint8_t { kSmall = 0, kMain = 1 };
+// Set on a seqno-index value whose latest write was a delete.
+constexpr uint64_t kSeqnoDeleted = uint64_t(1) << 63;
 
 // Read-path counters, one cache-line-aligned slot per thread. A single atomic
 // per shard is still a contended RMW on every lookup; giving each thread its
@@ -333,6 +335,21 @@ struct S3FifoCache::Shard {
     std::atomic<uint64_t> fillsRejected{0};
     std::atomic<uint64_t> pendingItems{0};
 
+    // hash(vbid, key) -> latest applied seqno, kept across value eviction.
+    // Only ever raised, so a read fill that lands after a newer write (or a
+    // delete) cannot make the hint stale. Locked after mu when both are held.
+    std::mutex seqMu;
+    folly::F14FastMap<uint64_t, uint64_t> seqIdx;
+
+    void noteSeqno(uint64_t h, uint64_t seqno, bool deleted) {
+        std::lock_guard g(seqMu);
+        auto& v = seqIdx[h];
+        const uint64_t cur = v & ~kSeqnoDeleted;
+        if (seqno > cur || (seqno == cur && deleted)) {
+            v = deleted ? (seqno | kSeqnoDeleted) : seqno;
+        }
+    }
+
     size_t bytes() const {
         return small.bytes + main.bytes;
     }
@@ -618,6 +635,9 @@ void S3FifoCache::PutIfAbsent(uint16_t vbid,
     uint64_t h = hashKey(vbid, key);
     auto& s = shardFor(h);
     MapKeyBuf mk(vbid, key);
+    if (seqnoIndex_ && seqno != 0) {
+        s.noteSeqno(h, seqno, false);
+    }
     {
         // Cheap reject under the shared lock; the common case after a burst
         // of misses on the same key is that the first fill already landed.
@@ -650,6 +670,9 @@ void S3FifoCache::MarkPersisted(uint16_t vbid,
     {
         std::shared_lock lock(s.mu);
         Entry* e = s.find(h, mk.view);
+        if (seqnoIndex_ && seqno != 0) {
+            s.noteSeqno(h, seqno, e != nullptr && e->deleted);
+        }
         if (e == nullptr) {
             return; // replaced and freed already; nothing left to unpin
         }
@@ -682,6 +705,20 @@ void S3FifoCache::Erase(uint16_t vbid, std::string_view key) {
     s.free(e);
 }
 
+uint64_t S3FifoCache::SeqnoHint(uint16_t vbid, std::string_view key) {
+    if (!seqnoIndex_) {
+        return 0;
+    }
+    uint64_t h = hashKey(vbid, key);
+    auto& s = shardFor(h);
+    std::lock_guard g(s.seqMu);
+    auto it = s.seqIdx.find(h);
+    if (it == s.seqIdx.end() || (it->second & kSeqnoDeleted)) {
+        return 0;
+    }
+    return it->second;
+}
+
 DocCacheStats S3FifoCache::GetStats() const {
     DocCacheStats st;
     st.maxBytes = maxBytes_;
@@ -694,6 +731,10 @@ DocCacheStats S3FifoCache::GetStats() const {
     for (size_t i = 0; i < numShards_; i++) {
         auto& s = shards_[i];
         st.pendingItems += s.pendingItems.load(std::memory_order_relaxed);
+        {
+            std::lock_guard g(s.seqMu);
+            st.seqnoIndexItems += s.seqIdx.size();
+        }
         std::shared_lock lock(s.mu);
         st.puts += s.puts;
         st.fills += s.fills;

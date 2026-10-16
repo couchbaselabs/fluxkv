@@ -132,6 +132,7 @@ struct Config {
     size_t cacheSize = 0;
     size_t cacheShards = 256;
     std::string cachePolicy = "s3fifo";
+    bool cacheSeqnoIndex = false;
     // Size IO threads and readers from load at run time. --io-threads and
     // --readers become the starting points; these are the ceilings.
     bool autoTune = false;
@@ -336,6 +337,8 @@ static void printUsage(const char* prog) {
               << "  --cache-shards N      lock shards in the cache (default "
                  "256)\n"
               << "  --cache-policy NAME   eviction policy: s3fifo (default)\n"
+              << "  --cache-seqno-index   keep every key's seqno in the cache after its "
+                 "value is evicted; read misses go to magma by seqno (needs --cache-size)\n"
               << "  --auto-tune           size IO threads and readers from "
                  "load; --io-threads/--readers are the starting points\n"
               << "  --max-io-threads N    ceiling for --auto-tune (default: "
@@ -492,6 +495,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"cache-size", required_argument, nullptr, 1020},
             {"cache-shards", required_argument, nullptr, 1021},
             {"cache-policy", required_argument, nullptr, 1022},
+            {"cache-seqno-index", no_argument, nullptr, 1301},
             {"auto-tune", no_argument, nullptr, 1030},
             {"max-io-threads", required_argument, nullptr, 1031},
             {"max-readers", required_argument, nullptr, 1032},
@@ -687,6 +691,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1022:
             cfg.cachePolicy = optarg;
+            break;
+        case 1301:
+            cfg.cacheSeqnoIndex = true;
             break;
         case 1030:
             cfg.autoTune = true;
@@ -1237,6 +1244,11 @@ int main(int argc, char* argv[]) {
                      cache->Policy(),
                      cfg.cacheSize / (1024 * 1024),
                      cfg.cacheShards);
+        if (cfg.cacheSeqnoIndex) {
+            cache->EnableSeqnoIndex();
+            gCacheSeqnoIndex = true;
+            spdlog::info("  cache: seqno index on (read misses go to magma by seqno)");
+        }
         bucket.SetCache(std::move(cache));
     }
     auto status = bucket.Open();
