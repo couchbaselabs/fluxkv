@@ -136,6 +136,7 @@ struct Config {
     bool cacheFillDoorkeeper = false;
     bool cacheValuePtr = false;
     bool streamReaders = false;
+    bool directSend = false;
     // Size IO threads and readers from load at run time. --io-threads and
     // --readers become the starting points; these are the ceilings.
     bool autoTune = false;
@@ -344,6 +345,8 @@ static void printUsage(const char* prog) {
                  "value is evicted; read misses go to magma by seqno (needs --cache-size)\n"
               << "  --cache-fill-doorkeeper  a read miss stores the value only if the "
                  "key missed recently (needs --cache-size)\n"
+              << "  --direct-send         readers write GET responses to the socket "
+                 "themselves, not via the IO thread\n"
               << "  --stream-readers      readers keep reads in flight as a stream, not "
                  "one blocking batch at a time (needs MAGMA_ASYNC_IO=uring)\n"
               << "  --cache-value-ptr     the seqno index also keeps each doc's last known "
@@ -508,6 +511,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"cache-fill-doorkeeper", no_argument, nullptr, 1302},
             {"cache-value-ptr", no_argument, nullptr, 1303},
             {"stream-readers", no_argument, nullptr, 1307},
+            {"direct-send", no_argument, nullptr, 1308},
             {"auto-tune", no_argument, nullptr, 1030},
             {"max-io-threads", required_argument, nullptr, 1031},
             {"max-readers", required_argument, nullptr, 1032},
@@ -709,6 +713,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1302:
             cfg.cacheFillDoorkeeper = true;
+            break;
+        case 1308:
+            cfg.directSend = true;
             break;
         case 1307:
             cfg.streamReaders = true;
@@ -1236,6 +1243,10 @@ int main(int argc, char* argv[]) {
         return std::make_unique<SimpleCompactionCB>();
     };
 
+    if (cfg.directSend) {
+        gDirectSend = true;
+        spdlog::info("  responses: direct from readers");
+    }
     // Reader threads pick their loop as they start, inside the Bucket
     // constructor.
     if (cfg.streamReaders) {

@@ -182,6 +182,11 @@ extern bool gCompactMeta;
 extern bool gTraceLatency;
 // Readers stream their reads instead of blocking per batch (--stream-readers).
 extern bool gStreamReaders;
+// Readers write GET responses to the socket themselves (--direct-send).
+extern bool gDirectSend;
+extern std::atomic<uint64_t> gDirectSends;
+extern std::atomic<uint64_t> gDirectSpills;
+extern std::atomic<uint64_t> gDirectHandoffs;
 struct StageTimers {
     // arrival -> writer picks the batch up
     std::atomic<uint64_t> toWriterNs{0};

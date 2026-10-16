@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <list>
+#include <mutex>
 #include <memory>
 #include <string>
 
@@ -31,6 +32,9 @@ public:
     // Called from engine threads via evb->runInEventBaseThread
     void sendWriteResponse(Request* req);
     void sendGetResponse(Request* req);
+    // --direct-send, any thread: write these GET responses to the socket
+    // and finish the requests. All belong to this connection.
+    void sendDirect(Request* const* reqs, size_t n);
 
     // Move this connection to another loop. Called on the owning loop thread.
     // Reading stops at once; once every request in flight has been answered
@@ -51,6 +55,7 @@ private:
 
     // folly::AsyncSocket::WriteCallback
     void writeSuccess() noexcept override {
+        follyWrites_.fetch_sub(1, std::memory_order_release);
         if (!inflightBufs_.empty()) {
             if (spareBufs_.size() < 2) {
                 inflightBufs_.front().clear();
@@ -71,6 +76,12 @@ private:
     bool parseAndDispatch();
     void dispatch(McbpHeader& hdr, std::unique_ptr<folly::IOBuf> body);
     void flushPending();
+    // Hands src to folly (kept alive until writeSuccess); leaves src
+    // empty. Under sendMu_ with --direct-send.
+    void writeOwned(std::vector<uint8_t>& src);
+    void writeChainLocked(std::unique_ptr<folly::IOBuf> buf);
+    void traceRead(Request* req);
+    void finishDirect(Request* const* reqs, size_t n);
     void scheduleFlush();
 
     // Bootstrap handlers (respond inline on IO thread)
@@ -110,6 +121,23 @@ private:
     bool migrating_{false};
     bool migrateCheckPending_{false};
     std::atomic<int> outstandingRequests_{0};
+
+    // --direct-send: readers and this loop share the socket. Readers write
+    // only while folly has nothing queued and nothing is spilled; else
+    // they append whole frames (or a partial write's tail) to spill_,
+    // which the loop writes before anything else. Recursive: folly can
+    // call writeErr -> destroy() inside a write made under the lock.
+    std::recursive_mutex sendMu_;
+    bool sendClosed_{false};
+    // Migrating: the loop waits for the count to reach zero.
+    bool drainWatch_{false};
+    bool spillPosted_{false};
+    std::vector<uint8_t> spill_;
+    // folly writes issued and not yet completed.
+    std::atomic<int> follyWrites_{0};
+    int fd_{-1};
+    // Requests finished on reader threads, for acquireRequest().
+    std::atomic<Request*> returned_{nullptr};
 
     // SCRAM auth state
     std::string scramServerNonce_;

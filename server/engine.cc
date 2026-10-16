@@ -62,6 +62,10 @@ bool gAsyncDurable = false;
 bool gCompactMeta = false;
 bool gTraceLatency = false;
 bool gStreamReaders = false;
+bool gDirectSend = false;
+std::atomic<uint64_t> gDirectSends{0};
+std::atomic<uint64_t> gDirectSpills{0};
+std::atomic<uint64_t> gDirectHandoffs{0};
 StageTimers gStages;
 int gDurableSpinIters = 4000;
 size_t gCompletionSlice = 512;
@@ -230,6 +234,9 @@ std::string DispatcherStats::toJson() const {
     j["paused_conns"] = gPausedConns.load(std::memory_order_relaxed);
     j["resp_pending_bytes"] = gRespPendingBytes.load(std::memory_order_relaxed);
     j["mail_depth"] = gMailDepth.load(std::memory_order_relaxed);
+    j["direct_sends"] = gDirectSends.load(std::memory_order_relaxed);
+    j["direct_spills"] = gDirectSpills.load(std::memory_order_relaxed);
+    j["direct_handoffs"] = gDirectHandoffs.load(std::memory_order_relaxed);
     // Every allocation goes through jemalloc (alloc.cc), so these account for
     // the whole heap: resident minus allocated is what it holds unpurged.
     {
@@ -877,6 +884,15 @@ namespace {
 class DispatchAccum {
 public:
     void Add(Request* req) {
+        if (gDirectSend) {
+            auto& vec = connSlot(req->conn);
+            vec.push_back(req);
+            if (vec.size() >= kDirectMax) {
+                req->conn->sendDirect(vec.data(), vec.size());
+                vec.clear();
+            }
+            return;
+        }
         if (gDispatchBatch <= 1) {
             if (gTraceLatency) {
                 req->tReadPosted = steadyNowNs();
@@ -898,6 +914,17 @@ public:
     }
 
     void FlushAll() {
+        for (auto& g : direct_) {
+            if (!g.second.empty()) {
+                g.first->sendDirect(g.second.data(), g.second.size());
+                g.second.clear();
+            }
+        }
+        // Keys are only compared; drop them now and then so closed
+        // connections do not accumulate.
+        if (direct_.size() > 256) {
+            direct_.clear();
+        }
         for (auto& g : groups_) {
             if (!g.second.empty()) {
                 post(g.first, g.second);
@@ -907,6 +934,19 @@ public:
     }
 
 private:
+    static constexpr size_t kDirectMax = 64;
+    std::vector<Request*>& connSlot(Connection* c) {
+        for (auto& g : direct_) {
+            if (g.first == c) {
+                return g.second;
+            }
+        }
+        direct_.emplace_back(c, std::vector<Request*>{});
+        direct_.back().second.reserve(kDirectMax);
+        return direct_.back().second;
+    }
+    std::vector<std::pair<Connection*, std::vector<Request*>>> direct_;
+
     // A GetDocs batch spans few distinct EventBases, so linear scan beats a map.
     std::vector<Request*>& slotFor(folly::EventBase* evb) {
         for (auto& g : groups_) {

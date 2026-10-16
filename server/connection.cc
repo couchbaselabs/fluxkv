@@ -8,6 +8,9 @@
 #include <random>
 
 #include <sys/socket.h>
+#include <sys/uio.h>
+#include <array>
+#include <cerrno>
 #include <cstdlib>
 
 namespace {
@@ -56,6 +59,7 @@ Connection::Connection(folly::AsyncSocket::UniquePtr socket,
     // and adds tail latency on the order of 100s of microseconds to
     // milliseconds at moderate concurrency. Critical for low-latency.
     socket_->setNoDelay(true);
+    fd_ = socket_->getNetworkSocket().toFd();
 
     // Refilled every loop iteration and never exceeds one flush, so reserve
     // that up front instead of reallocating on the hot path.
@@ -126,6 +130,11 @@ Connection::~Connection() {
     for (auto* r : reqPool_) {
         delete r;
     }
+    for (Request* r = returned_.exchange(nullptr); r;) {
+        Request* next = r->hook.next;
+        delete r;
+        r = next;
+    }
 }
 
 namespace {
@@ -163,6 +172,20 @@ Request* Connection::acquireRequest(uint16_t vbucket) {
 }
 
 Request* Connection::acquireRequest() {
+    if (reqPool_.empty() &&
+        returned_.load(std::memory_order_relaxed) != nullptr) {
+        Request* r = returned_.exchange(nullptr, std::memory_order_acquire);
+        while (r) {
+            Request* next = r->hook.next;
+            r->hook.next = nullptr;
+            if (reqPool_.size() < kMaxPooledReqs) {
+                reqPool_.push_back(r);
+            } else {
+                delete r;
+            }
+            r = next;
+        }
+    }
     if (!reqPool_.empty()) {
         auto* r = reqPool_.back();
         reqPool_.pop_back();
@@ -218,6 +241,12 @@ void Connection::destroy() {
         owner_->Remove(this);
         owner_ = nullptr;
     }
+    {
+        // Readers must not write to a closed, possibly reused, fd.
+        std::lock_guard<std::recursive_mutex> g(sendMu_);
+        sendClosed_ = true;
+        spill_.clear();
+    }
     socket_->setReadCB(nullptr);
     socket_->close();
     // Defer delete to next event loop iteration to avoid use-after-free
@@ -234,6 +263,10 @@ bool Connection::migrateTo(IOThread* target) {
         return false;
     }
     migrating_ = true;
+    {
+        std::lock_guard<std::recursive_mutex> g(sendMu_);
+        drainWatch_ = true;
+    }
     migrateTarget_ = target;
     migrateStart_ = std::chrono::steady_clock::now();
     gDispStats.migrationsStarted.fetch_add(1, std::memory_order_relaxed);
@@ -275,6 +308,10 @@ void Connection::tryFinishMigrate() {
     }
     if (closing_) {
         migrating_ = false;
+        {
+            std::lock_guard<std::recursive_mutex> g(sendMu_);
+            drainWatch_ = false;
+        }
         if (migrateTarget_) {
             migrateTarget_->Unreserve();
             migrateTarget_ = nullptr;
@@ -336,6 +373,10 @@ void Connection::finishAttach(IOThread* target) {
     owner_ = target;
     owner_->Add(this);
     migrating_ = false;
+    {
+        std::lock_guard<std::recursive_mutex> g(sendMu_);
+        drainWatch_ = false;
+    }
     gDispStats.migrationsDone.fetch_add(1, std::memory_order_relaxed);
     gDispStats.migTotalUs.fetch_add(
             std::chrono::duration_cast<std::chrono::microseconds>(
@@ -401,21 +442,57 @@ void Connection::readDataAvailable(size_t len) noexcept {
 }
 
 void Connection::flushPending() {
-    if (pendingWriteBuf_.empty() || closing_) {
+    if (closing_) {
+        return;
+    }
+    std::unique_lock<std::recursive_mutex> g(sendMu_, std::defer_lock);
+    if (gDirectSend) {
+        g.lock();
+        // May finish a frame a reader half-wrote, so it goes first.
+        spillPosted_ = false;
+        if (!spill_.empty()) {
+            writeOwned(spill_);
+        }
+    }
+    if (pendingWriteBuf_.empty()) {
         return;
     }
     gRespPendingBytes.fetch_sub(pendingWriteBuf_.size(), std::memory_order_relaxed);
+    writeOwned(pendingWriteBuf_);
+    if (pendingWriteBuf_.capacity() < 64 * 1024) {
+        pendingWriteBuf_.reserve(64 * 1024);
+    }
+}
+
+void Connection::writeOwned(std::vector<uint8_t>& src) {
     if (spareBufs_.empty()) {
         spareBufs_.emplace_back();
     }
     inflightBufs_.splice(
             inflightBufs_.end(), spareBufs_, spareBufs_.begin());
     auto& buf = inflightBufs_.back();
-    buf.swap(pendingWriteBuf_);
-    if (pendingWriteBuf_.capacity() < 64 * 1024) {
-        pendingWriteBuf_.reserve(64 * 1024);
-    }
+    buf.swap(src);
+    src.clear();
+    follyWrites_.fetch_add(1, std::memory_order_relaxed);
     socket_->write(this, buf.data(), buf.size());
+}
+
+void Connection::writeChainLocked(std::unique_ptr<folly::IOBuf> buf) {
+    std::unique_lock<std::recursive_mutex> g(sendMu_, std::defer_lock);
+    if (gDirectSend) {
+        g.lock();
+        if (!spill_.empty()) {
+            writeOwned(spill_);
+        }
+    }
+    // Empty entry: writeSuccess pops one per write.
+    if (spareBufs_.empty()) {
+        spareBufs_.emplace_back();
+    }
+    inflightBufs_.splice(
+            inflightBufs_.end(), spareBufs_, spareBufs_.begin());
+    follyWrites_.fetch_add(1, std::memory_order_relaxed);
+    socket_->writeChain(this, std::move(buf));
 }
 
 // Detach from the socket and re-check shortly. The kernel receive buffer
@@ -527,6 +604,10 @@ void Connection::readErr(const folly::AsyncSocketException& ex) noexcept {
 
 void Connection::writeErr(size_t /*bytesWritten*/,
                           const folly::AsyncSocketException& /*ex*/) noexcept {
+    follyWrites_.fetch_sub(1, std::memory_order_release);
+    if (!inflightBufs_.empty()) {
+        inflightBufs_.pop_front();
+    }
     destroy();
 }
 
@@ -786,7 +867,7 @@ void Connection::handleHello(const McbpHeader& hdr, const folly::IOBuf* body) {
                              0,
                              supported.data(),
                              supported.size() * sizeof(uint16_t));
-    socket_->writeChain(this, std::move(buf));
+    writeChainLocked(std::move(buf));
 }
 
 void Connection::handleSaslListMechs(const McbpHeader& hdr) {
@@ -801,7 +882,7 @@ void Connection::handleSaslListMechs(const McbpHeader& hdr) {
                              0,
                              mechs,
                              strlen(mechs));
-    socket_->writeChain(this, std::move(buf));
+    writeChainLocked(std::move(buf));
 }
 
 // Pre-computed PBKDF2 salted passwords — computed once, reused for all
@@ -855,7 +936,7 @@ void Connection::handleSaslAuth(const McbpHeader& hdr,
     if (mech == "PLAIN") {
         auto buf =
                 buildEmptyResponse(hdr.opcode, McbpStatus::Success, hdr.opaque);
-        socket_->writeChain(this, std::move(buf));
+        writeChainLocked(std::move(buf));
         return;
     }
 
@@ -907,7 +988,7 @@ void Connection::handleSaslAuth(const McbpHeader& hdr,
                              0,
                              serverFirst.data(),
                              serverFirst.size());
-    socket_->writeChain(this, std::move(buf));
+    writeChainLocked(std::move(buf));
 }
 
 void Connection::handleSaslStep(const McbpHeader& hdr,
@@ -951,12 +1032,12 @@ void Connection::handleSaslStep(const McbpHeader& hdr,
                              0,
                              serverFinal.data(),
                              serverFinal.size());
-    socket_->writeChain(this, std::move(buf));
+    writeChainLocked(std::move(buf));
 }
 
 void Connection::handleSelectBucket(const McbpHeader& hdr) {
     auto buf = buildEmptyResponse(hdr.opcode, McbpStatus::Success, hdr.opaque);
-    socket_->writeChain(this, std::move(buf));
+    writeChainLocked(std::move(buf));
 }
 
 void Connection::handleGetClusterConfig(const McbpHeader& hdr) {
@@ -970,7 +1051,7 @@ void Connection::handleGetClusterConfig(const McbpHeader& hdr) {
                              0,
                              clusterConfig_.data(),
                              clusterConfig_.size());
-    socket_->writeChain(this, std::move(buf));
+    writeChainLocked(std::move(buf));
 }
 
 void Connection::handleGetErrorMap(const McbpHeader& hdr) {
@@ -984,12 +1065,12 @@ void Connection::handleGetErrorMap(const McbpHeader& hdr) {
                              0,
                              errorMap_.data(),
                              errorMap_.size());
-    socket_->writeChain(this, std::move(buf));
+    writeChainLocked(std::move(buf));
 }
 
 void Connection::handleNoop(const McbpHeader& hdr) {
     auto buf = buildEmptyResponse(hdr.opcode, McbpStatus::Success, hdr.opaque);
-    socket_->writeChain(this, std::move(buf));
+    writeChainLocked(std::move(buf));
 }
 
 // ---- Data op handlers ----
@@ -1259,7 +1340,7 @@ void Connection::handleGet(McbpHeader& hdr,
 void Connection::sendUnknownCommand(const McbpHeader& hdr) {
     auto buf = buildEmptyResponse(
             hdr.opcode, McbpStatus::UnknownCommand, hdr.opaque);
-    socket_->writeChain(this, std::move(buf));
+    writeChainLocked(std::move(buf));
 }
 
 // ---- Response senders called from engine threads via EventBase ----
@@ -1311,7 +1392,7 @@ void Connection::sendWriteResponse(Request* req) {
     }
 }
 
-void Connection::sendGetResponse(Request* req) {
+void Connection::traceRead(Request* req) {
     if (gTraceLatency && req->tReadEnqueue &&
         req->tReadDispatch >= req->tReadEnqueue &&
         req->tReadDone >= req->tReadDispatch) {
@@ -1351,6 +1432,10 @@ void Connection::sendGetResponse(Request* req) {
             gReadStages.record(ReadStageTimers::WriteResp, writeResp);
         }
     }
+}
+
+void Connection::sendGetResponse(Request* req) {
+    traceRead(req);
     if (!closing_) {
         if (!req->resultStatus.IsOK()) {
             appendEmptyResponse(pendingWriteBuf_,
@@ -1375,6 +1460,163 @@ void Connection::sendGetResponse(Request* req) {
     releaseRequest(req);
     if (outstandingRequests_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         onDrained();
+    }
+}
+
+void Connection::sendDirect(Request* const* reqs, size_t n) {
+    // Header + flags per response; values go out from each responseBuf.
+    thread_local std::vector<std::array<uint8_t, kHeaderSize + 4>> hdrs;
+    thread_local std::vector<iovec> iov;
+    if (hdrs.size() < n) {
+        hdrs.resize(n);
+    }
+    iov.clear();
+    size_t total = 0;
+    const uint64_t now = gTraceLatency ? steadyNowNs() : 0;
+    for (size_t i = 0; i < n; i++) {
+        Request* r = reqs[i];
+        if (gTraceLatency) {
+            r->tReadPosted = r->tReadPickedUp = now;
+            traceRead(r);
+        }
+        // Same bytes as appendGetResponse / appendEmptyResponse.
+        const bool ok = r->resultStatus.IsOK();
+        McbpHeader h{};
+        h.magic = kResponseMagic;
+        h.opaque = r->opaque;
+        size_t len = kHeaderSize;
+        if (ok) {
+            h.opcode = static_cast<uint8_t>(Opcode::Get);
+            h.extrasLen = 4;
+            h.datatype = r->resultDatatype;
+            h.specific = static_cast<uint16_t>(McbpStatus::Success);
+            h.bodyLen = static_cast<uint32_t>(4 + r->responseBuf.size());
+            h.cas = r->resultSeqno;
+            len += 4;
+        } else {
+            h.opcode = r->opcode;
+            h.specific = static_cast<uint16_t>(McbpStatus::KeyNotFound);
+        }
+        h.hton();
+        memcpy(hdrs[i].data(), &h, kHeaderSize);
+        if (ok) {
+            const uint32_t f = htonl(r->resultFlags);
+            memcpy(hdrs[i].data() + kHeaderSize, &f, 4);
+        }
+        iov.push_back({hdrs[i].data(), len});
+        total += len;
+        if (ok && !r->responseBuf.empty()) {
+            iov.push_back({r->responseBuf.data(), r->responseBuf.size()});
+            total += r->responseBuf.size();
+        }
+    }
+    folly::EventBase* evb = reqs[0]->evb;
+    bool post = false;
+    {
+        std::lock_guard<std::recursive_mutex> g(sendMu_);
+        if (!sendClosed_) {
+            size_t sent = 0;
+            if (spill_.empty() &&
+                follyWrites_.load(std::memory_order_acquire) == 0) {
+                msghdr m{};
+                m.msg_iov = iov.data();
+                m.msg_iovlen = iov.size();
+                ssize_t rc;
+                do {
+                    rc = ::sendmsg(fd_, &m, MSG_DONTWAIT | MSG_NOSIGNAL);
+                } while (rc < 0 && errno == EINTR);
+                if (rc >= 0) {
+                    sent = static_cast<size_t>(rc);
+                } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    sent = total; // broken; the loop sees it on read
+                }
+            }
+            if (sent < total) {
+                size_t skip = sent;
+                for (const auto& v : iov) {
+                    if (skip >= v.iov_len) {
+                        skip -= v.iov_len;
+                        continue;
+                    }
+                    const auto* b =
+                            static_cast<const uint8_t*>(v.iov_base) + skip;
+                    spill_.insert(spill_.end(), b, b + (v.iov_len - skip));
+                    skip = 0;
+                }
+                gDirectSpills.fetch_add(1, std::memory_order_relaxed);
+                if (!spillPosted_) {
+                    spillPosted_ = true;
+                    post = true;
+                }
+            }
+        }
+    }
+    gDirectSends.fetch_add(1, std::memory_order_relaxed);
+    if (post) {
+        // These requests keep the connection on this loop until the
+        // spill is handed to folly.
+        gDirectHandoffs.fetch_add(1, std::memory_order_relaxed);
+        std::vector<Request*> batch(reqs, reqs + n);
+        evb->runInEventBaseThread([this, batch = std::move(batch)]() {
+            flushPending();
+            for (auto* r : batch) {
+                releaseRequest(r);
+            }
+            const int k = static_cast<int>(batch.size());
+            if (outstandingRequests_.fetch_sub(k, std::memory_order_acq_rel) ==
+                k) {
+                onDrained();
+            }
+        });
+        return;
+    }
+    finishDirect(reqs, n);
+}
+
+void Connection::finishDirect(Request* const* reqs, size_t n) {
+    folly::EventBase* evb = reqs[0]->evb;
+    Request* head = nullptr;
+    for (size_t i = 0; i < n; i++) {
+        reqs[i]->reset();
+        reqs[i]->hook.next = head;
+        head = reqs[i];
+    }
+    Request* tail = reqs[0];
+    Request* old = returned_.load(std::memory_order_relaxed);
+    do {
+        tail->hook.next = old;
+    } while (!returned_.compare_exchange_weak(
+            old, head, std::memory_order_release, std::memory_order_relaxed));
+    {
+        std::lock_guard<std::recursive_mutex> g(sendMu_);
+        if (!sendClosed_ && !drainWatch_) {
+            // Nothing waits for zero; destroy() and migrateTo() set
+            // these under this lock before they read the count.
+            outstandingRequests_.fetch_sub(static_cast<int>(n),
+                                           std::memory_order_acq_rel);
+            return;
+        }
+    }
+    // Never take the count to zero here: onDrained runs on the loop and
+    // may delete the connection.
+    int k = static_cast<int>(n);
+    int v = outstandingRequests_.load(std::memory_order_relaxed);
+    while (k > 0 && v > 1) {
+        const int d = std::min(k, v - 1);
+        if (outstandingRequests_.compare_exchange_weak(
+                    v, v - d, std::memory_order_acq_rel)) {
+            k -= d;
+            v -= d;
+        }
+    }
+    if (k > 0) {
+        gDirectHandoffs.fetch_add(1, std::memory_order_relaxed);
+        evb->runInEventBaseThread([this, k]() {
+            if (outstandingRequests_.fetch_sub(k, std::memory_order_acq_rel) ==
+                k) {
+                onDrained();
+            }
+        });
     }
 }
 
