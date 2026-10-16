@@ -59,6 +59,7 @@ struct DocCacheStats {
     uint64_t pendingItems{0}; // items pinned by an unapplied write
     uint64_t maxBytes{0};
     uint64_t seqnoIndexItems{0}; // keys with a known seqno (EnableSeqnoIndex)
+    uint64_t fillsDeferred{0}; // first-miss fills the doorkeeper only recorded
 };
 
 class DocCache {
@@ -132,6 +133,20 @@ public:
     // Keep each key's latest applied seqno after its value is evicted, so a
     // read miss can go to the store by seqno (SeqnoHint).
     virtual void EnableSeqnoIndex() {}
+
+    // Read fills store a value only for a key that missed recently.
+    virtual void EnableFillDoorkeeper() {}
+
+    // Record a key's seqno found on disk (seqno index warmup).
+    virtual void NoteSeqno(uint16_t vbid,
+                           std::string_view key,
+                           uint64_t seqno,
+                           bool deleted) {
+        (void)vbid;
+        (void)key;
+        (void)seqno;
+        (void)deleted;
+    }
 
     // The key's latest applied seqno, or 0 if unknown or deleted. A hint
     // only: the store checks it and falls back to a key lookup.

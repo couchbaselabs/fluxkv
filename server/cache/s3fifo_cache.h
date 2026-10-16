@@ -65,6 +65,13 @@ public:
         seqnoIndex_ = true;
     }
     uint64_t SeqnoHint(uint16_t vbid, std::string_view key) override;
+    void NoteSeqno(uint16_t vbid,
+                   std::string_view key,
+                   uint64_t seqno,
+                   bool deleted) override;
+    void EnableFillDoorkeeper() override {
+        fillDoorkeeper_ = true;
+    }
     const char* Policy() const override {
         return "s3fifo";
     }
@@ -82,6 +89,7 @@ private:
     size_t shardMask_;
     std::unique_ptr<Shard[]> shards_;
     bool seqnoIndex_{false};
+    bool fillDoorkeeper_{false};
 };
 
 } // namespace kvserver

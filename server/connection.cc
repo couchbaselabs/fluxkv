@@ -405,9 +405,16 @@ void Connection::flushPending() {
         return;
     }
     gRespPendingBytes.fetch_sub(pendingWriteBuf_.size(), std::memory_order_relaxed);
-    inflightBufs_.emplace_back(std::move(pendingWriteBuf_));
-    pendingWriteBuf_.clear();
+    if (spareBufs_.empty()) {
+        spareBufs_.emplace_back();
+    }
+    inflightBufs_.splice(
+            inflightBufs_.end(), spareBufs_, spareBufs_.begin());
     auto& buf = inflightBufs_.back();
+    buf.swap(pendingWriteBuf_);
+    if (pendingWriteBuf_.capacity() < 64 * 1024) {
+        pendingWriteBuf_.reserve(64 * 1024);
+    }
     socket_->write(this, buf.data(), buf.size());
 }
 

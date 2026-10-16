@@ -133,6 +133,7 @@ struct Config {
     size_t cacheShards = 256;
     std::string cachePolicy = "s3fifo";
     bool cacheSeqnoIndex = false;
+    bool cacheFillDoorkeeper = false;
     // Size IO threads and readers from load at run time. --io-threads and
     // --readers become the starting points; these are the ceilings.
     bool autoTune = false;
@@ -339,6 +340,8 @@ static void printUsage(const char* prog) {
               << "  --cache-policy NAME   eviction policy: s3fifo (default)\n"
               << "  --cache-seqno-index   keep every key's seqno in the cache after its "
                  "value is evicted; read misses go to magma by seqno (needs --cache-size)\n"
+              << "  --cache-fill-doorkeeper  a read miss stores the value only if the "
+                 "key missed recently (needs --cache-size)\n"
               << "  --auto-tune           size IO threads and readers from "
                  "load; --io-threads/--readers are the starting points\n"
               << "  --max-io-threads N    ceiling for --auto-tune (default: "
@@ -496,6 +499,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"cache-shards", required_argument, nullptr, 1021},
             {"cache-policy", required_argument, nullptr, 1022},
             {"cache-seqno-index", no_argument, nullptr, 1301},
+            {"cache-fill-doorkeeper", no_argument, nullptr, 1302},
             {"auto-tune", no_argument, nullptr, 1030},
             {"max-io-threads", required_argument, nullptr, 1031},
             {"max-readers", required_argument, nullptr, 1032},
@@ -694,6 +698,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1301:
             cfg.cacheSeqnoIndex = true;
+            break;
+        case 1302:
+            cfg.cacheFillDoorkeeper = true;
             break;
         case 1030:
             cfg.autoTune = true;
@@ -1248,6 +1255,10 @@ int main(int argc, char* argv[]) {
             cache->EnableSeqnoIndex();
             gCacheSeqnoIndex = true;
             spdlog::info("  cache: seqno index on (read misses go to magma by seqno)");
+        }
+        if (cfg.cacheFillDoorkeeper) {
+            cache->EnableFillDoorkeeper();
+            spdlog::info("  cache: fill doorkeeper on");
         }
         bucket.SetCache(std::move(cache));
     }

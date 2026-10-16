@@ -283,6 +283,8 @@ std::string DispatcherStats::toJson() const {
         j["cache_fills_rejected"] = c.fillsRejected;
         j["cache_evictions"] = c.evictions;
         j["cache_ghost_hits"] = c.ghostHits;
+        j["cache_fills_deferred"] = c.fillsDeferred;
+        j["cache_seqno_index_items"] = c.seqnoIndexItems;
         j["cache_bytes"] = c.bytes;
         j["cache_max_bytes"] = c.maxBytes;
         j["cache_items"] = c.items;
@@ -1897,6 +1899,46 @@ Status Bucket::Open() {
     spdlog::info("Pre-created {} kvstores across {} shards",
                  numVBuckets_,
                  numShards_);
+    // A restart would otherwise start without hints: reads take the
+    // keyIndex path until each key is read once. noteSeqno only raises, so
+    // this is safe to race with writes; it runs before the listener opens.
+    if (gCacheSeqnoIndex && cache_) {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::atomic<uint16_t> next{0};
+        std::atomic<uint64_t> keys{0};
+        std::vector<std::thread> ts;
+        const size_t n = std::max<size_t>(
+                1, std::min<size_t>(std::thread::hardware_concurrency(), 16));
+        for (size_t i = 0; i < n; i++) {
+            ts.emplace_back([&]() {
+                uint16_t vb;
+                while ((vb = next.fetch_add(1)) < numVBuckets_) {
+                    auto it = GetShard(vb).GetMagma()->NewKeyIterator(vb);
+                    if (!it) {
+                        continue;
+                    }
+                    uint64_t k = 0;
+                    for (it->Seek(Slice()); it->Valid(); it->Next()) {
+                        auto key = it->GetKey();
+                        cache_->NoteSeqno(vb,
+                                          std::string_view(key.Data(), key.Len()),
+                                          it->GetSeqno(),
+                                          MetaIsTombstone(it->GetMeta()));
+                        k++;
+                    }
+                    keys.fetch_add(k);
+                }
+            });
+        }
+        for (auto& t : ts) {
+            t.join();
+        }
+        spdlog::info("seqno index warmed: {} keys in {} ms",
+                     keys.load(),
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count());
+    }
     if (gAsyncDurable && durable_ && !durableNotifier_) {
         std::vector<Magma*> magmas;
         for (auto& shard : shards_) {

@@ -1,4 +1,5 @@
 #include "protocol.h"
+#include <algorithm>
 #include <sstream>
 
 namespace magma {
@@ -80,9 +81,18 @@ void appendResponse(std::vector<uint8_t>& out,
                     size_t valueLen) {
     size_t bodyLen = extrasLen + keyLen + valueLen;
     size_t total = kHeaderSize + bodyLen;
-    size_t off = out.size();
-    out.resize(off + total);
-    auto* p = out.data() + off;
+    // insert, not resize: resize zero-fills the bytes the copies overwrite.
+    if (out.capacity() < out.size() + total) {
+        out.reserve(std::max(out.size() + total, 2 * out.capacity()));
+    }
+    auto put = [&out](const void* src, size_t n) {
+        auto* b = static_cast<const uint8_t*>(src);
+        if (b) {
+            out.insert(out.end(), b, b + n);
+        } else {
+            out.resize(out.size() + n);
+        }
+    };
 
     McbpHeader hdr{};
     hdr.magic = kResponseMagic;
@@ -96,19 +106,10 @@ void appendResponse(std::vector<uint8_t>& out,
     hdr.cas = cas;
     hdr.hton();
 
-    memcpy(p, &hdr, kHeaderSize);
-    p += kHeaderSize;
-    if (extrasLen > 0 && extras) {
-        memcpy(p, extras, extrasLen);
-        p += extrasLen;
-    }
-    if (keyLen > 0 && key) {
-        memcpy(p, key, keyLen);
-        p += keyLen;
-    }
-    if (valueLen > 0 && value) {
-        memcpy(p, value, valueLen);
-    }
+    put(&hdr, kHeaderSize);
+    put(extras, extrasLen);
+    put(key, keyLen);
+    put(value, valueLen);
 }
 
 void appendGetResponse(std::vector<uint8_t>& out,

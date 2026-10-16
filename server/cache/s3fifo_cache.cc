@@ -328,6 +328,7 @@ struct S3FifoCache::Shard {
     uint64_t fills{0};
     uint64_t evictions{0};
     uint64_t ghostHits{0};
+    uint64_t fillsDeferred{0};
     // Touched under the shared lock, hence atomic.
     std::atomic<uint64_t> hits{0};
     std::atomic<uint64_t> misses{0};
@@ -647,6 +648,16 @@ void S3FifoCache::PutIfAbsent(uint16_t vbid,
             return;
         }
     }
+    if (fillDoorkeeper_) {
+        // A key read over a set much larger than the cache is rarely read
+        // again before eviction: remember it, store it on the next miss.
+        std::unique_lock lock(s.mu);
+        if (!s.ghostSet.count(h)) {
+            s.ghostAdd(h);
+            s.fillsDeferred++;
+            return;
+        }
+    }
     Entry* e = Entry::create(
             vbid, key, value, seqno, flags, expiry, datatype, false);
     std::unique_lock lock(s.mu);
@@ -705,6 +716,17 @@ void S3FifoCache::Erase(uint16_t vbid, std::string_view key) {
     s.free(e);
 }
 
+void S3FifoCache::NoteSeqno(uint16_t vbid,
+                            std::string_view key,
+                            uint64_t seqno,
+                            bool deleted) {
+    if (!seqnoIndex_ || seqno == 0) {
+        return;
+    }
+    uint64_t h = hashKey(vbid, key);
+    shardFor(h).noteSeqno(h, seqno, deleted);
+}
+
 uint64_t S3FifoCache::SeqnoHint(uint16_t vbid, std::string_view key) {
     if (!seqnoIndex_) {
         return 0;
@@ -740,6 +762,7 @@ DocCacheStats S3FifoCache::GetStats() const {
         st.fills += s.fills;
         st.evictions += s.evictions;
         st.ghostHits += s.ghostHits;
+        st.fillsDeferred += s.fillsDeferred;
         st.bytes += s.bytes();
         st.items += s.small.count + s.main.count;
     }

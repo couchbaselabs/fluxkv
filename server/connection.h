@@ -52,7 +52,14 @@ private:
     // folly::AsyncSocket::WriteCallback
     void writeSuccess() noexcept override {
         if (!inflightBufs_.empty()) {
-            inflightBufs_.pop_front();
+            if (spareBufs_.size() < 2) {
+                inflightBufs_.front().clear();
+                spareBufs_.splice(spareBufs_.end(),
+                                  inflightBufs_,
+                                  inflightBufs_.begin());
+            } else {
+                inflightBufs_.pop_front();
+            }
         }
         if (migrating_ && inflightBufs_.empty()) {
             scheduleMigrateCheck();
@@ -135,6 +142,8 @@ private:
     // In-flight send buffers awaiting writeSuccess. AsyncSocket::write() does
     // not own the data; we keep it alive here until the callback fires.
     std::list<std::vector<uint8_t>> inflightBufs_;
+    // Sent buffers kept with their capacity for the next flush.
+    std::list<std::vector<uint8_t>> spareBufs_;
 
     // LoopCallback to flush pendingWriteBuf_ at end of current EventBase loop
     // iteration. Engine threads post sendXxxResponse via runInEventBaseThread;
