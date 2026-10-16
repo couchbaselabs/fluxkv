@@ -158,7 +158,7 @@ struct Config {
     size_t sharedWalFlushers = 2;
     size_t sharedWalChunks = 8;
     size_t sharedWalChunkSize = 8u << 20;
-    size_t sharedWalFlushUs = 0; // shwal MinFlushIntervalUs
+    size_t sharedWalFlushUs = 200; // shwal MinFlushIntervalUs
     // Wait for the shared log to be durable inside every WriteDocs.
     // -1 follows --durable: an async server acknowledges before persistence,
     // so making each writer sleep through a group-commit flush buys nothing.
@@ -375,7 +375,7 @@ static void printUsage(const char* prog) {
               << "  --shared-wal-chunk-size N bytes per chunk (default 8MB)\n"
               << "  --shared-wal-flush-us N   idle backoff for the log's "
                  "flusher threads; they flush on arrival when busy (default "
-                 "0, which floors at the log's own 10 us)\n"
+                 "200; 0 floors at the log's own 10 us)\n"
               << "  --shared-wal-segment-size N  log segment bytes (default "
                  "256MB). Smaller segments recycle sooner and make "
                  "--shared-wal-prewrite cheap\n"
