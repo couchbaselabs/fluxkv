@@ -134,6 +134,7 @@ struct Config {
     std::string cachePolicy = "s3fifo";
     bool cacheSeqnoIndex = false;
     bool cacheFillDoorkeeper = false;
+    bool cacheValuePtr = false;
     // Size IO threads and readers from load at run time. --io-threads and
     // --readers become the starting points; these are the ceilings.
     bool autoTune = false;
@@ -342,6 +343,8 @@ static void printUsage(const char* prog) {
                  "value is evicted; read misses go to magma by seqno (needs --cache-size)\n"
               << "  --cache-fill-doorkeeper  a read miss stores the value only if the "
                  "key missed recently (needs --cache-size)\n"
+              << "  --cache-value-ptr     the seqno index also keeps each doc's last known "
+                 "block, so reads skip magma's block locate (needs --cache-seqno-index)\n"
               << "  --auto-tune           size IO threads and readers from "
                  "load; --io-threads/--readers are the starting points\n"
               << "  --max-io-threads N    ceiling for --auto-tune (default: "
@@ -500,6 +503,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"cache-policy", required_argument, nullptr, 1022},
             {"cache-seqno-index", no_argument, nullptr, 1301},
             {"cache-fill-doorkeeper", no_argument, nullptr, 1302},
+            {"cache-value-ptr", no_argument, nullptr, 1303},
             {"auto-tune", no_argument, nullptr, 1030},
             {"max-io-threads", required_argument, nullptr, 1031},
             {"max-readers", required_argument, nullptr, 1032},
@@ -701,6 +705,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1302:
             cfg.cacheFillDoorkeeper = true;
+            break;
+        case 1303:
+            cfg.cacheValuePtr = true;
             break;
         case 1030:
             cfg.autoTune = true;
@@ -1254,6 +1261,7 @@ int main(int argc, char* argv[]) {
         if (cfg.cacheSeqnoIndex) {
             cache->EnableSeqnoIndex();
             gCacheSeqnoIndex = true;
+            gCacheValuePtr = cfg.cacheValuePtr;
             spdlog::info("  cache: seqno index on (read misses go to magma by seqno)");
         }
         if (cfg.cacheFillDoorkeeper) {

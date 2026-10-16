@@ -141,18 +141,39 @@ public:
     virtual void NoteSeqno(uint16_t vbid,
                            std::string_view key,
                            uint64_t seqno,
-                           bool deleted) {
+                           bool deleted,
+                           uint64_t valuePtr = 0) {
         (void)vbid;
         (void)key;
         (void)seqno;
         (void)deleted;
+        (void)valuePtr;
+    }
+
+    // Where the doc at seqno was found; kept only while seqno is the
+    // key's latest.
+    virtual void NoteValuePtr(uint16_t vbid,
+                              std::string_view key,
+                              uint64_t seqno,
+                              uint64_t valuePtr) {
+        (void)vbid;
+        (void)key;
+        (void)seqno;
+        (void)valuePtr;
     }
 
     // The key's latest applied seqno, or 0 if unknown or deleted. A hint
     // only: the store checks it and falls back to a key lookup.
-    virtual uint64_t SeqnoHint(uint16_t vbid, std::string_view key) {
+    // valuePtr, if given, receives the doc's last known location (0 if
+    // unknown).
+    virtual uint64_t SeqnoHint(uint16_t vbid,
+                               std::string_view key,
+                               uint64_t* valuePtr = nullptr) {
         (void)vbid;
         (void)key;
+        if (valuePtr) {
+            *valuePtr = 0;
+        }
         return 0;
     }
 

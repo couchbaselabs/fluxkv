@@ -64,11 +64,18 @@ public:
     void EnableSeqnoIndex() override {
         seqnoIndex_ = true;
     }
-    uint64_t SeqnoHint(uint16_t vbid, std::string_view key) override;
+    uint64_t SeqnoHint(uint16_t vbid,
+                       std::string_view key,
+                       uint64_t* valuePtr = nullptr) override;
     void NoteSeqno(uint16_t vbid,
                    std::string_view key,
                    uint64_t seqno,
-                   bool deleted) override;
+                   bool deleted,
+                   uint64_t valuePtr = 0) override;
+    void NoteValuePtr(uint16_t vbid,
+                      std::string_view key,
+                      uint64_t seqno,
+                      uint64_t valuePtr) override;
     void EnableFillDoorkeeper() override {
         fillDoorkeeper_ = true;
     }

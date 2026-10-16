@@ -117,6 +117,8 @@ extern Bucket* gStatsBucket;
 extern DocCache* gDocCache;
 // Readers send the doc cache's seqno hints to magma (--cache-seqno-index).
 extern bool gCacheSeqnoIndex;
+// Readers also pass the doc's last known block (--cache-value-ptr).
+extern bool gCacheValuePtr;
 // Runtime read-batch cap (set from main via --max-read-batch).
 extern size_t gMaxReadBatch;
 // Max concurrent owners one vbucket's reads can have (--max-read-owners).

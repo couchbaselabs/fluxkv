@@ -339,15 +339,28 @@ struct S3FifoCache::Shard {
     // hash(vbid, key) -> latest applied seqno, kept across value eviction.
     // Only ever raised, so a read fill that lands after a newer write (or a
     // delete) cannot make the hint stale. Locked after mu when both are held.
+    // valuePtr: where the doc at seqno was found, 0 if unknown; a newer
+    // seqno resets it, so it never names an older version's block.
+    struct SeqEntry {
+        uint64_t seqno{0};
+        uint64_t valuePtr{0};
+    };
     std::mutex seqMu;
-    folly::F14FastMap<uint64_t, uint64_t> seqIdx;
+    folly::F14FastMap<uint64_t, SeqEntry> seqIdx;
 
-    void noteSeqno(uint64_t h, uint64_t seqno, bool deleted) {
+    void noteSeqno(uint64_t h,
+                   uint64_t seqno,
+                   bool deleted,
+                   uint64_t valuePtr = 0) {
         std::lock_guard g(seqMu);
         auto& v = seqIdx[h];
-        const uint64_t cur = v & ~kSeqnoDeleted;
+        const uint64_t cur = v.seqno & ~kSeqnoDeleted;
         if (seqno > cur || (seqno == cur && deleted)) {
-            v = deleted ? (seqno | kSeqnoDeleted) : seqno;
+            v.seqno = deleted ? (seqno | kSeqnoDeleted) : seqno;
+            v.valuePtr = deleted ? 0 : valuePtr;
+        } else if (seqno == cur && valuePtr != 0 &&
+                   !(v.seqno & kSeqnoDeleted)) {
+            v.valuePtr = valuePtr;
         }
     }
 
@@ -719,15 +732,37 @@ void S3FifoCache::Erase(uint16_t vbid, std::string_view key) {
 void S3FifoCache::NoteSeqno(uint16_t vbid,
                             std::string_view key,
                             uint64_t seqno,
-                            bool deleted) {
+                            bool deleted,
+                            uint64_t valuePtr) {
     if (!seqnoIndex_ || seqno == 0) {
         return;
     }
     uint64_t h = hashKey(vbid, key);
-    shardFor(h).noteSeqno(h, seqno, deleted);
+    shardFor(h).noteSeqno(h, seqno, deleted, valuePtr);
 }
 
-uint64_t S3FifoCache::SeqnoHint(uint16_t vbid, std::string_view key) {
+void S3FifoCache::NoteValuePtr(uint16_t vbid,
+                               std::string_view key,
+                               uint64_t seqno,
+                               uint64_t valuePtr) {
+    if (!seqnoIndex_ || seqno == 0 || valuePtr == 0) {
+        return;
+    }
+    uint64_t h = hashKey(vbid, key);
+    auto& s = shardFor(h);
+    std::lock_guard g(s.seqMu);
+    auto it = s.seqIdx.find(h);
+    if (it != s.seqIdx.end() && it->second.seqno == seqno) {
+        it->second.valuePtr = valuePtr;
+    }
+}
+
+uint64_t S3FifoCache::SeqnoHint(uint16_t vbid,
+                                std::string_view key,
+                                uint64_t* valuePtr) {
+    if (valuePtr) {
+        *valuePtr = 0;
+    }
     if (!seqnoIndex_) {
         return 0;
     }
@@ -735,10 +770,13 @@ uint64_t S3FifoCache::SeqnoHint(uint16_t vbid, std::string_view key) {
     auto& s = shardFor(h);
     std::lock_guard g(s.seqMu);
     auto it = s.seqIdx.find(h);
-    if (it == s.seqIdx.end() || (it->second & kSeqnoDeleted)) {
+    if (it == s.seqIdx.end() || (it->second.seqno & kSeqnoDeleted)) {
         return 0;
     }
-    return it->second;
+    if (valuePtr) {
+        *valuePtr = it->second.valuePtr;
+    }
+    return it->second.seqno;
 }
 
 DocCacheStats S3FifoCache::GetStats() const {

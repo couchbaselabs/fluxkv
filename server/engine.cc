@@ -42,6 +42,7 @@ Bucket* gStatsBucket{nullptr};
 
 DocCache* gDocCache = nullptr;
 bool gCacheSeqnoIndex = false;
+bool gCacheValuePtr = false;
 // Runtime-tunable read-batch cap (--max-read-batch). 128 matches the
 // libaio + IOQueueDepth=16 sweet spot; lower (8-16) is better for sync
 // QD=1 multi-thread parallelism.
@@ -1285,6 +1286,22 @@ size_t WriterPool::executePersist(PersistTask& task) {
 // ---- ReaderPool ----
 
 namespace {
+// A read that had to locate its doc's block reports where; the next read
+// of the key goes straight there.
+inline void learnValuePtr(uint16_t vbid,
+                          const Magma::GetOperation& op,
+                          const Status& s,
+                          const Slice& meta) {
+    if (!gCacheValuePtr || op.ValuePtrOut == 0 || !s.IsOK() ||
+        s.IsOkDocNotFound()) {
+        return;
+    }
+    gDocCache->NoteValuePtr(vbid,
+                            std::string_view(op.Key.Data(), op.Key.Len()),
+                            DocMeta::decode(meta).seqno,
+                            op.ValuePtrOut);
+}
+
 // Read-miss fill. PutIfAbsent, never Put: a key with a queued write is pinned
 // in the cache, so a fill can only land for keys whose disk version is
 // current (see kvcache.h).
@@ -1654,7 +1671,10 @@ size_t ReaderPool::executeRead(ReadTask& task) {
         for (auto& [key, reqs] : byKey) {
             Magma::GetOperation op(reqs.front()->key, &reqs);
             if (gCacheSeqnoIndex) {
-                op.SeqnoHint = gDocCache->SeqnoHint(task.vbid, key);
+                op.SeqnoHint = gDocCache->SeqnoHint(
+                        task.vbid,
+                        key,
+                        gCacheValuePtr ? &op.ValuePtrHint : nullptr);
             }
             getOps.Add(op);
         }
@@ -1666,6 +1686,7 @@ size_t ReaderPool::executeRead(ReadTask& task) {
                    const Magma::GetOperation& op,
                    const Slice& meta,
                    const Slice& value) {
+                    learnValuePtr(task.vbid, op, s, meta);
                     completeGets(bucket_,
                                  task.vbid,
                                  *static_cast<std::vector<Request*>*>(op.UserContext),
@@ -1713,7 +1734,8 @@ size_t ReaderPool::executeReadMulti(std::vector<ReadTask>& tasks) {
                 if (gCacheSeqnoIndex) {
                     op.SeqnoHint = gDocCache->SeqnoHint(
                             tasks[i].vbid,
-                            std::string_view(req->key.Data(), req->key.Len()));
+                            std::string_view(req->key.Data(), req->key.Len()),
+                            gCacheValuePtr ? &op.ValuePtrHint : nullptr);
                 }
                 getOps[i].Add(op);
             }
@@ -1730,6 +1752,7 @@ size_t ReaderPool::executeReadMulti(std::vector<ReadTask>& tasks) {
                                const Slice& meta,
                                const Slice& value) {
                     auto* kr = static_cast<KeyReqs*>(op.UserContext);
+                    learnValuePtr(kr->vbid, op, s, meta);
                     completeGets(bucket_, kr->vbid, kr->reqs, s, meta, value, accum);
                 });
         accum.FlushAll();
@@ -1923,7 +1946,9 @@ Status Bucket::Open() {
                         cache_->NoteSeqno(vb,
                                           std::string_view(key.Data(), key.Len()),
                                           it->GetSeqno(),
-                                          MetaIsTombstone(it->GetMeta()));
+                                          MetaIsTombstone(it->GetMeta()),
+                                          gCacheValuePtr ? it->GetValuePtrHint()
+                                                         : 0);
                         k++;
                     }
                     keys.fetch_add(k);
