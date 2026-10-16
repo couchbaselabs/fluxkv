@@ -61,15 +61,15 @@ Connection::Connection(folly::AsyncSocket::UniquePtr socket,
     // that up front instead of reallocating on the hot path.
     pendingWriteBuf_.reserve(64 * 1024);
 
-    // SO_BUSY_POLL: kernel busy-polls the socket for arriving data instead
-    // of going through the softirq scheduler when packets land in the NIC
-    // ring. Eliminates a major source of p99 wake-up jitter at moderate
-    // request rates. Set MAGMA_BUSY_POLL_US to override (default 50µs).
+    // SO_BUSY_POLL (MAGMA_BUSY_POLL_US, default off): an empty recv spins
+    // in the kernel for that long. An IO thread serving several sockets
+    // spins while the others wait: 190K ops/s open loop, p99 162-1341 ms
+    // with 50 us, 14 ms without, and 22% less CPU.
     {
         int fd = socket_->getNetworkSocket().toFd();
         if (fd >= 0) {
             const char* env = std::getenv("MAGMA_BUSY_POLL_US");
-            int us = env ? std::atoi(env) : 50;
+            int us = env ? std::atoi(env) : 0;
             if (us > 0) {
                 int v = us;
                 ::setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &v, sizeof(v));
