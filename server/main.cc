@@ -135,6 +135,7 @@ struct Config {
     bool cacheSeqnoIndex = false;
     bool cacheFillDoorkeeper = false;
     bool cacheValuePtr = false;
+    bool streamReaders = false;
     // Size IO threads and readers from load at run time. --io-threads and
     // --readers become the starting points; these are the ceilings.
     bool autoTune = false;
@@ -343,6 +344,8 @@ static void printUsage(const char* prog) {
                  "value is evicted; read misses go to magma by seqno (needs --cache-size)\n"
               << "  --cache-fill-doorkeeper  a read miss stores the value only if the "
                  "key missed recently (needs --cache-size)\n"
+              << "  --stream-readers      readers keep reads in flight as a stream, not "
+                 "one blocking batch at a time (needs MAGMA_ASYNC_IO=uring)\n"
               << "  --cache-value-ptr     the seqno index also keeps each doc's last known "
                  "block, so reads skip magma's block locate (needs --cache-seqno-index)\n"
               << "  --auto-tune           size IO threads and readers from "
@@ -504,6 +507,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"cache-seqno-index", no_argument, nullptr, 1301},
             {"cache-fill-doorkeeper", no_argument, nullptr, 1302},
             {"cache-value-ptr", no_argument, nullptr, 1303},
+            {"stream-readers", no_argument, nullptr, 1307},
             {"auto-tune", no_argument, nullptr, 1030},
             {"max-io-threads", required_argument, nullptr, 1031},
             {"max-readers", required_argument, nullptr, 1032},
@@ -705,6 +709,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1302:
             cfg.cacheFillDoorkeeper = true;
+            break;
+        case 1307:
+            cfg.streamReaders = true;
             break;
         case 1303:
             cfg.cacheValuePtr = true;
@@ -1229,6 +1236,17 @@ int main(int argc, char* argv[]) {
         return std::make_unique<SimpleCompactionCB>();
     };
 
+    // Reader threads pick their loop as they start, inside the Bucket
+    // constructor.
+    if (cfg.streamReaders) {
+        const char* aio = std::getenv("MAGMA_ASYNC_IO");
+        if (!aio || std::string(aio) != "uring") {
+            spdlog::error("--stream-readers needs MAGMA_ASYNC_IO=uring");
+            return 1;
+        }
+        gStreamReaders = true;
+        spdlog::info("  readers: streaming");
+    }
     // Create and open bucket
     Bucket bucket(cfg.bucket,
                   cfg.dataDir,

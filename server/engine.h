@@ -180,6 +180,8 @@ extern bool gCompactMeta;
 // clock reads per request. Sums and counts only - the shape of the mean is
 // enough to say which hop to remove.
 extern bool gTraceLatency;
+// Readers stream their reads instead of blocking per batch (--stream-readers).
+extern bool gStreamReaders;
 struct StageTimers {
     // arrival -> writer picks the batch up
     std::atomic<uint64_t> toWriterNs{0};
@@ -776,6 +778,7 @@ private:
 
     void spawn();
     void workerLoop(Worker* self);
+    void streamLoop(Worker* self);
     // Returns the number of requests served.
     size_t executeRead(ReadTask& task);
     void collectRead(ReadTask& task, std::vector<Request*>& batch);
@@ -787,6 +790,8 @@ private:
     std::vector<std::unique_ptr<Worker>> workers_;
     std::atomic<size_t> live_{0};
     folly::MPMCQueue<ReadTask> taskQueue_;
+    // Ring eventfd of a streaming reader parked in ppoll, else -1.
+    std::atomic<int> sleeperEfd_{-1};
     std::atomic<bool> shutdown_{false};
     Bucket* bucket_;
     Acct acct_[kStatShards];
