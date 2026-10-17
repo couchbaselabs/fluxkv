@@ -177,6 +177,9 @@ struct Config {
     // mode, where SETs are answered before the write, else 0 (a durable SET
     // would wait out the window).
     int64_t writeCoalesceUs = -1;
+    // magma's write-cache slowdown; < 0: magma's default.
+    int writeSlowdownAtPct = -1;
+    double writeSlowdownUsPerMB = -1;
     size_t minWriteBatch = 64;
     // Sorted batches feed the skiplist's sequential-insert path even with no
     // repeated keys: -2.5% CPU on uniform 5 KB inserts.
@@ -406,6 +409,12 @@ static void printUsage(const char* prog) {
                  "queued (default 20000 without --durable, where SETs are "
                  "answered before the write; 0 with --durable)\n"
               << "  --min-write-batch N   (default 64)\n"
+              << "  --write-slowdown-at PCT  write-cache fill where magma "
+                 "starts slowing writers per byte written (magma default 50)\n"
+              << "  --write-slowdown-us-per-mb N  that slowdown's sleep per "
+                 "MB at a full write cache, scaled by the square of the fill "
+                 "past --write-slowdown-at; 0 turns it off (magma default "
+                 "8000)\n"
               << "  --batch-sort MODE     sort write batches by key: auto "
                  "(when a sample says the batch repeats keys), always, never "
                  "(default always)\n"
@@ -585,6 +594,8 @@ static Config parseArgs(int argc, char* argv[]) {
             {"data-cache-max-write-rate", required_argument, nullptr, 1213},
             {"disk-gc-band", required_argument, nullptr, 1214},
             {"disk-pace-at", required_argument, nullptr, 1215},
+            {"write-slowdown-at", required_argument, nullptr, 1217},
+            {"write-slowdown-us-per-mb", required_argument, nullptr, 1218},
             {"async-durable", no_argument, nullptr, 1059},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0}};
@@ -864,6 +875,12 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1216:
             cfg.compactionRatePerSet = strtoull(optarg, nullptr, 10);
+            break;
+        case 1217:
+            cfg.writeSlowdownAtPct = atoi(optarg);
+            break;
+        case 1218:
+            cfg.writeSlowdownUsPerMB = std::stod(optarg);
             break;
         case 1067:
             cfg.keyLevelMultiplier = atoi(optarg);
@@ -1188,6 +1205,12 @@ int main(int argc, char* argv[]) {
     }
     if (cfg.writeCacheRatio > 0) {
         magmaCfg.WriteCacheRatio = cfg.writeCacheRatio;
+    }
+    if (cfg.writeSlowdownAtPct >= 0) {
+        magmaCfg.WriteCacheSlowdownStartPct = cfg.writeSlowdownAtPct;
+    }
+    if (cfg.writeSlowdownUsPerMB >= 0) {
+        magmaCfg.WriteCacheSlowdownUsPerMB = cfg.writeSlowdownUsPerMB;
     }
     if (cfg.memLwmRatio > 0) {
         magmaCfg.MemoryQuotaLowWaterMarkRatio = cfg.memLwmRatio;
