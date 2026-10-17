@@ -2237,6 +2237,32 @@ void Bucket::CompactAll(Magma::StoreType type) {
     }
 }
 
+// Counts, bytes and rates add up across shards; the other floats are ratios
+// (WriteAmp, hit ratios, FPRs) and are averaged - summed, 8 shards writing
+// ~1.0x read as WriteAmp 8.1. Nested store stats merge the same way.
+static void sumStats(nlohmann::json& into, const nlohmann::json& from) {
+    for (auto& [key, val] : from.items()) {
+        auto& dst = into[key];
+        if (val.is_object()) {
+            sumStats(dst, val);
+        } else if (val.is_number_integer()) {
+            dst = dst.get<int64_t>() + val.get<int64_t>();
+        } else if (val.is_number_float()) {
+            dst = dst.get<double>() + val.get<double>();
+        }
+    }
+}
+
+static void averageRatios(nlohmann::json& j, size_t n) {
+    for (auto& [key, val] : j.items()) {
+        if (val.is_object()) {
+            averageRatios(val, n);
+        } else if (val.is_number_float() && !key.ends_with("PerSec")) {
+            val = val.get<double>() / n;
+        }
+    }
+}
+
 std::string Bucket::GetStatsJson() {
     nlohmann::json merged;
     bool first = true;
@@ -2248,16 +2274,10 @@ std::string Bucket::GetStatsJson() {
             merged = j;
             first = false;
         } else {
-            for (auto& [key, val] : j.items()) {
-                if (val.is_number_integer()) {
-                    merged[key] =
-                            merged[key].get<int64_t>() + val.get<int64_t>();
-                } else if (val.is_number_float()) {
-                    merged[key] = merged[key].get<double>() + val.get<double>();
-                }
-            }
+            sumStats(merged, j);
         }
     }
+    averageRatios(merged, shards_.size());
     merged["bucket"] = name_;
     merged["numShards"] = numShards_;
     return merged.dump(2);
