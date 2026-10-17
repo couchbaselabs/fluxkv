@@ -76,8 +76,8 @@ du=subprocess.run(["du","-sm",os.environ["GOLD_DATA"]],capture_output=True,text=
 print(sys.argv[1], sys.argv[2], s.get("cmd_set_resp",0), s.get("cmd_get_resp",0), s.get("cmd_get_resp_miss",0),
       s.get("tmp_fails",0), s.get("cache_hits",0), s.get("cache_misses",0), m.get("BytesIncoming",0),
       dw, dr, du[0] if du else 0, cpu[3]+cpu[4], sum(cpu[:8]), tk, nd, "%.3f" % time.time(), ri, wi,
-      m.get("TotalIndexBlocksSize",0), ks.get("ActiveDataBlocksSize",0)*8, m.get("BlockCacheMemUsed",0), m.get("BlockCacheQuota",0), m.get("BlockCacheHits",0), m.get("BlockCacheMisses",0),
-      ks.get("ActiveDataBlocksCompressedSize",0)*8, ss.get("BlockLocatorMemUsed",0)*8, ss.get("NBlockLocatorFinds",0)*8, ss.get("NBlockLocatorFallbacks",0)*8, m.get("NValuePtrHits",0), m.get("NValuePtrMisses",0), *rss(), m.get("TotalMemUsed",0))
+      m.get("TotalIndexBlocksSize",0), ks.get("ActiveDataBlocksSize",0), m.get("BlockCacheMemUsed",0), m.get("BlockCacheQuota",0), m.get("BlockCacheHits",0), m.get("BlockCacheMisses",0),
+      ks.get("ActiveDataBlocksCompressedSize",0), ss.get("BlockLocatorMemUsed",0), ss.get("NBlockLocatorFinds",0), ss.get("NBlockLocatorFallbacks",0), m.get("NValuePtrHits",0), m.get("NValuePtrMisses",0), *rss(), m.get("TotalMemUsed",0))
 PY
 }
 alive() { pgrep -f "port 1400[2]" >/dev/null; }
