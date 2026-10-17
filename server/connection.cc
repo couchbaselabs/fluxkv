@@ -1125,7 +1125,18 @@ void Connection::handleSet(McbpHeader& hdr,
     // Write-through: cache before queueing so the entry is pinned by the time
     // any reader could fill over it (see cache/doccache.h).
     auto* cache = bucket_->GetCache();
-    if (cache) {
+    if (cache && req->dataBuf) {
+        // Share the body buffer instead of copying the value a second time
+        // (ownBody already copied it out of the read buffer).
+        cache->PutShared(req->vbucket,
+                         std::string_view(req->key.Data(), req->key.Len()),
+                         std::string_view(req->value.Data(), req->value.Len()),
+                         req->dataBuf->cloneOne(),
+                         req->flags,
+                         req->expiry,
+                         req->datatype,
+                         false);
+    } else if (cache) {
         cache->Put(req->vbucket,
                    std::string_view(req->key.Data(), req->key.Len()),
                    std::string_view(req->value.Data(), req->value.Len()),

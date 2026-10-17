@@ -46,7 +46,8 @@ inline size_t readStatSlot() {
 }
 } // namespace
 
-// One allocation holds the header, the map key (vbid || key) and the value.
+// One allocation holds the header, the map key (vbid || key) and the value,
+// or the value stays in a buffer shared with the request that wrote it.
 struct S3FifoCache::Entry {
     Entry* prev{nullptr};
     Entry* next{nullptr};
@@ -62,6 +63,9 @@ struct S3FifoCache::Entry {
     uint8_t deleted{0};
     std::atomic<uint8_t> freq{0};
     uint8_t queue{kSmall};
+    // Shared value buffer (PutShared); null when the value is inline.
+    folly::IOBuf* ext{nullptr};
+    const char* extVal{nullptr};
 
     char* data() {
         return reinterpret_cast<char*>(this + 1);
@@ -75,11 +79,16 @@ struct S3FifoCache::Entry {
         return {data(), sizeof(uint16_t) + keyLen};
     }
     std::string_view value() const {
+        if (ext) {
+            return {extVal, valLen};
+        }
         return {data() + sizeof(uint16_t) + keyLen, valLen};
     }
+    // A shared buffer is charged at its capacity: once the request is done
+    // the cache holds the whole buffer.
     size_t charge() const {
-        return sizeof(Entry) + sizeof(uint16_t) + keyLen + valLen +
-               kMapSlotOverhead;
+        return sizeof(Entry) + sizeof(uint16_t) + keyLen +
+               (ext ? ext->capacity() : valLen) + kMapSlotOverhead;
     }
 
     static Entry* create(uint16_t vbid,
@@ -108,7 +117,32 @@ struct S3FifoCache::Entry {
                     value.size());
         return e;
     }
+    // value must lie in owner's buffer, which the entry keeps alive.
+    static Entry* createShared(uint16_t vbid,
+                               std::string_view key,
+                               std::string_view value,
+                               std::unique_ptr<folly::IOBuf> owner,
+                               uint32_t flags,
+                               uint32_t expiry,
+                               uint8_t datatype,
+                               bool deleted) {
+        void* mem = ::operator new(sizeof(Entry) + sizeof(uint16_t) + key.size());
+        auto* e = new (mem) Entry();
+        e->flags = flags;
+        e->expiry = expiry;
+        e->keyLen = static_cast<uint32_t>(key.size());
+        e->valLen = static_cast<uint32_t>(value.size());
+        e->vbid = vbid;
+        e->datatype = datatype;
+        e->deleted = deleted ? 1 : 0;
+        std::memcpy(e->data(), &vbid, sizeof(uint16_t));
+        std::memcpy(e->data() + sizeof(uint16_t), key.data(), key.size());
+        e->ext = owner.release();
+        e->extVal = value.data();
+        return e;
+    }
     static void destroy(Entry* e) {
+        delete e->ext;
         e->~Entry();
         ::operator delete(static_cast<void*>(e));
     }
@@ -615,11 +649,31 @@ void S3FifoCache::Put(uint16_t vbid,
                   uint32_t expiry,
                   uint8_t datatype,
                   bool deleted) {
-    uint64_t h = hashKey(vbid, key);
-    auto& s = shardFor(h);
-    Entry* e = Entry::create(
-            vbid, key, value, 0, flags, expiry, datatype, deleted);
+    putEntry(hashKey(vbid, key),
+             Entry::create(vbid, key, value, 0, flags, expiry, datatype, deleted));
+}
 
+void S3FifoCache::PutShared(uint16_t vbid,
+                            std::string_view key,
+                            std::string_view value,
+                            std::unique_ptr<folly::IOBuf> owner,
+                            uint32_t flags,
+                            uint32_t expiry,
+                            uint8_t datatype,
+                            bool deleted) {
+    putEntry(hashKey(vbid, key),
+             Entry::createShared(vbid,
+                                 key,
+                                 value,
+                                 std::move(owner),
+                                 flags,
+                                 expiry,
+                                 datatype,
+                                 deleted));
+}
+
+void S3FifoCache::putEntry(uint64_t h, Entry* e) {
+    auto& s = shardFor(h);
     std::unique_lock lock(s.mu);
     uint32_t carry = 0;
     if (Entry* old = s.find(h, e->mapKey())) {

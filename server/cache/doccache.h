@@ -25,6 +25,8 @@
 //  * Budgets are in bytes of real memory (header + key + value + index slot),
 //    not item counts.
 
+#include <folly/io/IOBuf.h>
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -109,6 +111,19 @@ public:
                      uint32_t expiry,
                      uint8_t datatype,
                      bool deleted) = 0;
+
+    // Put whose value stays in owner's buffer (shared with the request,
+    // not copied). The default copies.
+    virtual void PutShared(uint16_t vbid,
+                           std::string_view key,
+                           std::string_view value,
+                           std::unique_ptr<folly::IOBuf> owner,
+                           uint32_t flags,
+                           uint32_t expiry,
+                           uint8_t datatype,
+                           bool deleted) {
+        Put(vbid, key, value, flags, expiry, datatype, deleted);
+    }
 
     // Read-fill; inserts only when the key is absent. Never pins.
     virtual void PutIfAbsent(uint16_t vbid,

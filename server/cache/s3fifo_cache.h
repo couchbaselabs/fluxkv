@@ -49,6 +49,14 @@ public:
              uint32_t expiry,
              uint8_t datatype,
              bool deleted) override;
+    void PutShared(uint16_t vbid,
+                   std::string_view key,
+                   std::string_view value,
+                   std::unique_ptr<folly::IOBuf> owner,
+                   uint32_t flags,
+                   uint32_t expiry,
+                   uint8_t datatype,
+                   bool deleted) override;
     void PutIfAbsent(uint16_t vbid,
                      std::string_view key,
                      std::string_view value,
@@ -90,6 +98,9 @@ private:
 
     Shard& shardFor(uint64_t hash) const;
     static uint64_t hashKey(uint16_t vbid, std::string_view key);
+    // Write-through insert of a built entry: replaces any older version,
+    // pins, evicts.
+    void putEntry(uint64_t hash, Entry* e);
 
     size_t maxBytes_;
     size_t numShards_;
