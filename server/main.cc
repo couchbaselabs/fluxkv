@@ -93,14 +93,17 @@ struct Config {
     // Flushers/compactors don't measurably affect cold-read throughput —
     // they sleep on futex when there's nothing to do, so the scheduler
     // skips them. Defaults sized for write/compaction workloads:
-    //   flushers=4   — one per ~8 shards is plenty for memtable→L0 flushes
+    //   flushers=16  — 4 left writers in the write-cache throttle with the
+    //                  disk ~75% busy under 5 KB inserts (303K -> ~400K/s)
     //   compactors=16 — leveled compaction can run many in parallel
-    uint16_t flushers = 4;
+    uint16_t flushers = 16;
     uint16_t compactors = 16;
     uint16_t vbuckets = 16;
     uint16_t statsPort = 80;
     bool durable = false;
-    size_t writeQueueMem = 256ULL * 1024 * 1024; // 256MB
+    // At 256 MB a short writer stall filled the queue and paused every
+    // connection; TCP then took 200 ms+ to resume.
+    size_t writeQueueMem = 1024ULL * 1024 * 1024; // 1GB
     size_t echoGetSize = 0; // 0 = disabled; >0 = echo fixed-size value on GET
     size_t ioQueueDepth = 16; // magma per-batch coroutine read parallelism
     size_t maxReadBatch = 256; // per-reader-thread sweep cap
@@ -123,7 +126,10 @@ struct Config {
     // Compact DocMeta is 14 B instead of 30 for a typical document; readers
     // decode either form. -1 = on when magma's storage format allows it.
     int compactMeta = -1;
-    double bottomBloomAccuracy = -1; // < 0: magma default
+    // Lookup-on-set searches the bottom level for every new key unless its
+    // filter rules the key out: 0.99 (magma's 0.95) -9% CPU on inserts, ~1 MB
+    // per million keys. < 0: magma default.
+    double bottomBloomAccuracy = 0.99;
     double blockWritesRatio = 32; // magma's default is 8
     // Sets SeqTreeBlockSize ONLY -- the data blocks holding document values.
     // KeyTreeBlockSize stays at magma's 4096 default: shrinking it too adds
@@ -167,10 +173,14 @@ struct Config {
     // cannot report insert-vs-update per document (nothing here consumes
     // that) and leaves the old seqIndex entry to compaction GC.
     bool blindWrites = false;
-    // Write coalescing, see gWriteCoalesceNs in engine.h.
-    size_t writeCoalesceUs = 0;
+    // Write coalescing, see gWriteCoalesceNs in engine.h. -1: 20 ms in async
+    // mode, where SETs are answered before the write, else 0 (a durable SET
+    // would wait out the window).
+    int64_t writeCoalesceUs = -1;
     size_t minWriteBatch = 64;
-    std::string batchSort = "auto"; // auto | always | never
+    // Sorted batches feed the skiplist's sequential-insert path even with no
+    // repeated keys: -2.5% CPU on uniform 5 KB inserts.
+    std::string batchSort = "always"; // auto | always | never
     double sortDupThreshold = 0.05;
     // LSM shape. 0 = magma's default. Compaction CPU is set by how often
     // sstables are rewritten, so table size, base level size and the L0
@@ -187,7 +197,10 @@ struct Config {
     // serve rollback; crash safety comes from the WAL. 0 = magma's.
     double checkpointThreshold = 0;
     int maxCheckpoints = -1; // -1 = magma's (5)
-    size_t lsmBaseLevelSize = 0;
+    // 32 MB holds a kvstore's whole key index at 100M x 128 kvstores (~27 MB),
+    // so key-index compaction nearly stops: key write amp 7.6 -> 2.4. magma's
+    // 4 MB otherwise. 0 = magma's.
+    size_t lsmBaseLevelSize = 32ULL * 1024 * 1024;
     // Fraction of the seqIndex data level that delta levels may reach before
     // they are merged down. magma's own default is 0.25; Couchbase ships 0.5
     // (magma_fragmentation_percentage=50). Design write amp is 1/ratio, so
@@ -197,7 +210,7 @@ struct Config {
     // Level size multiplier for the key index only. On small documents the
     // key index dominates write amplification; a leveled tree costs about
     // T*ln(R)/ln(T), so a smaller T trades levels for writes. 0 = magma's.
-    int keyLevelMultiplier = 0;
+    int keyLevelMultiplier = 3;
 
     // Warm each new key-index table into the block cache on creation, so
     // lookup-on-set does not pay a device read on freshly written blocks.
@@ -302,13 +315,13 @@ static void printUsage(const char* prog) {
                  "matches measured aqu-sz peak — adding more regresses)\n"
               << "  --mem-quota N     Total memory quota in bytes (default: "
                  "1GB)\n"
-              << "  --flushers N      Magma flusher threads (default: 4)\n"
+              << "  --flushers N      Magma flusher threads (default: 16)\n"
               << "  --compactors N    Magma compactor threads (default: 16)\n"
               << "  --vbuckets N      Number of vbuckets (default: 16)\n"
               << "  --stats-port N    HTTP stats port (default: 80)\n"
               << "  --durable         Wait for WriteDocs before responding\n"
               << "  --write-queue-mem N  Write queue memory limit bytes "
-                 "(default: 256MB)\n"
+                 "(default: 1GB)\n"
               << "  --echo-get N      Return preallocated N-byte value on "
                  "GET (bypass magma, measure network throughput)\n"
               << "  --io-queue-depth N   magma GetDocs coroutine fanout per "
@@ -333,7 +346,8 @@ static void printUsage(const char* prog) {
               << "  --block-writes-ratio R  L0 size ratio at which a writer waits for "
                  "L0 compaction (default 32; magma's own default is 8)\n"
               << "  --bottom-bloom-accuracy F  bloom filter accuracy of the "
-                 "key index's bottom level, 0 for none (magma default 0.95)\n"
+                 "key index's bottom level, 0 for none (default 0.99; magma's "
+                 "0.95)\n"
               << "  --no-compact-meta     write document metadata in the "
                  "legacy 30-byte form (default: compact when magma's storage "
                  "format is 2 or newer)\n"
@@ -389,12 +403,12 @@ static void printUsage(const char* prog) {
                  "of a document on set\n"
               << "  --write-coalesce-us N wait up to N us before writing a "
                  "vbucket again when fewer than --min-write-batch items are "
-                 "queued (default 0, disabled: it costs latency at low rate "
-                 "and measures as noise at high rate)\n"
+                 "queued (default 20000 without --durable, where SETs are "
+                 "answered before the write; 0 with --durable)\n"
               << "  --min-write-batch N   (default 64)\n"
               << "  --batch-sort MODE     sort write batches by key: auto "
                  "(when a sample says the batch repeats keys), always, never "
-                 "(default auto)\n"
+                 "(default always)\n"
               << "  --sort-dup-threshold F  duplicate fraction at which auto "
                  "sorts (default 0.05)\n"
               << "  --lsm-sstable-size N     max sstable bytes (magma "
@@ -439,14 +453,14 @@ static void printUsage(const char* prog) {
               << "  --key-warm-new-tables  read each new key-index table "
                  "into the block cache on creation\n"
               << "  --key-level-multiplier N  key index level size "
-                 "multiplier (default 0, meaning magma's 10). Smaller trades "
+                 "multiplier (default 3; 0 means magma's 10). Smaller trades "
                  "levels for write amplification\n"
               << "  --lsd-frag-ratio F   seqIndex delta level size as a "
                  "fraction of the data level (default 0.5, matching "
                  "Couchbase; magma's own default is 0.25). Design write amp "
                  "is 1/F\n"
               << "  --lsm-base-level-size N  max bytes in the base level "
-                 "(default 4MB)\n"
+                 "(default 32MB; 0 means magma's 4MB)\n"
               << "  --lsm-level0-tables N    L0 tables before compacting "
                  "(default 16)\n"
               << "  --lsm-min-compact-size N bytes a compaction tries to "
@@ -779,7 +793,7 @@ static Config parseArgs(int argc, char* argv[]) {
             cfg.blindWrites = true;
             break;
         case 1048:
-            cfg.writeCoalesceUs = strtoull(optarg, nullptr, 10);
+            cfg.writeCoalesceUs = strtoll(optarg, nullptr, 10);
             break;
         case 1049:
             cfg.minWriteBatch = strtoull(optarg, nullptr, 10);
@@ -967,7 +981,10 @@ int main(int argc, char* argv[]) {
             std::max<size_t>(64, 4 * cfg.readers);
     kvserver::gMaxReadBatch = cfg.maxReadBatch;
     kvserver::gMaxReadOwners = std::max<uint32_t>(1, cfg.maxReadOwners);
-    kvserver::gWriteCoalesceNs = cfg.writeCoalesceUs * 1000;
+    if (cfg.writeCoalesceUs < 0) {
+        cfg.writeCoalesceUs = cfg.durable ? 0 : 20000;
+    }
+    kvserver::gWriteCoalesceNs = static_cast<uint64_t>(cfg.writeCoalesceUs) * 1000;
     kvserver::gMinWriteBatch = cfg.minWriteBatch;
     kvserver::gSortDupThreshold = cfg.sortDupThreshold;
     if (cfg.asyncDurable) {
