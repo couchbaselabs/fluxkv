@@ -63,9 +63,21 @@ struct S3FifoCache::Entry {
     uint8_t deleted{0};
     std::atomic<uint8_t> freq{0};
     uint8_t queue{kSmall};
-    // Shared value buffer (PutShared); null when the value is inline.
-    folly::IOBuf* ext{nullptr};
-    const char* extVal{nullptr};
+    // The value is in a buffer shared with the request (PutShared), whose
+    // address follows the key. Kept out of the header: a GET prefetches two
+    // lines from the entry start, and 16 more header bytes push a small inline
+    // entry's value onto a third line.
+    uint8_t shared{0};
+
+    // A shared entry's buffer and the value's place in it.
+    struct Ext {
+        folly::IOBuf* buf;
+        const char* val;
+    };
+    static size_t extOffset(size_t keyLen) {
+        const size_t end = sizeof(uint16_t) + keyLen;
+        return (end + alignof(Ext) - 1) & ~(alignof(Ext) - 1);
+    }
 
     char* data() {
         return reinterpret_cast<char*>(this + 1);
@@ -73,14 +85,17 @@ struct S3FifoCache::Entry {
     const char* data() const {
         return reinterpret_cast<const char*>(this + 1);
     }
+    const Ext* ext() const {
+        return reinterpret_cast<const Ext*>(data() + extOffset(keyLen));
+    }
     // The map is keyed by vbid || key so one shard can hold the same key for
     // different vbuckets.
     std::string_view mapKey() const {
         return {data(), sizeof(uint16_t) + keyLen};
     }
     std::string_view value() const {
-        if (ext) {
-            return {extVal, valLen};
+        if (shared) {
+            return {ext()->val, valLen};
         }
         return {data() + sizeof(uint16_t) + keyLen, valLen};
     }
@@ -88,7 +103,8 @@ struct S3FifoCache::Entry {
     // the cache holds the whole buffer.
     size_t charge() const {
         return sizeof(Entry) + sizeof(uint16_t) + keyLen +
-               (ext ? ext->capacity() : valLen) + kMapSlotOverhead;
+               (shared ? sizeof(Ext) + ext()->buf->capacity() : valLen) +
+               kMapSlotOverhead;
     }
 
     static Entry* create(uint16_t vbid,
@@ -99,6 +115,8 @@ struct S3FifoCache::Entry {
                          uint32_t expiry,
                          uint8_t datatype,
                          bool deleted) {
+        static_assert(sizeof(Entry) == 56,
+                      "an 8 B doc with a 12 B key must fit the two lines GETs prefetch");
         void* mem = ::operator new(sizeof(Entry) + sizeof(uint16_t) +
                                    key.size() + value.size());
         auto* e = new (mem) Entry();
@@ -126,7 +144,7 @@ struct S3FifoCache::Entry {
                                uint32_t expiry,
                                uint8_t datatype,
                                bool deleted) {
-        void* mem = ::operator new(sizeof(Entry) + sizeof(uint16_t) + key.size());
+        void* mem = ::operator new(sizeof(Entry) + extOffset(key.size()) + sizeof(Ext));
         auto* e = new (mem) Entry();
         e->flags = flags;
         e->expiry = expiry;
@@ -135,14 +153,16 @@ struct S3FifoCache::Entry {
         e->vbid = vbid;
         e->datatype = datatype;
         e->deleted = deleted ? 1 : 0;
+        e->shared = 1;
         std::memcpy(e->data(), &vbid, sizeof(uint16_t));
         std::memcpy(e->data() + sizeof(uint16_t), key.data(), key.size());
-        e->ext = owner.release();
-        e->extVal = value.data();
+        new (e->data() + extOffset(key.size())) Ext{owner.release(), value.data()};
         return e;
     }
     static void destroy(Entry* e) {
-        delete e->ext;
+        if (e->shared) {
+            delete e->ext()->buf;
+        }
         e->~Entry();
         ::operator delete(static_cast<void*>(e));
     }

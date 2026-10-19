@@ -293,6 +293,42 @@ void testConcurrentHammer() {
                 (unsigned long long)st.misses);
 }
 
+// A value kept in the writing request's buffer reads like an inline one,
+// through both read paths, and goes when the entry is replaced or erased.
+void testSharedValue() {
+    auto c = make(1 << 20);
+    for (const std::string key : {"k", "a-key-longer-than-sixteen-bytes"}) {
+        auto buf = folly::IOBuf::copyBuffer(std::string("hdr:shared-value"));
+        std::string_view v(reinterpret_cast<const char*>(buf->data()) + 4, 12);
+        c->PutShared(2, key, v, std::move(buf), 7, 9, 1, false);
+        CHECK(get(*c, 2, key) == "shared-value");
+
+        CachedDoc d;
+        char out[64];
+        size_t len = 0;
+        CHECK(c->GetCopy(2, key, &d, out, sizeof(out), &len) ==
+              DocCache::GetResult::Hit);
+        CHECK(std::string(out, len) == "shared-value");
+        CHECK(d.flags == 7 && d.expiry == 9 && d.datatype == 1);
+        c->MarkPersisted(2, key, 1);
+
+        // An inline write replaces it, and a shared one replaces that.
+        putClean(*c, 2, key, "inline");
+        CHECK(get(*c, 2, key) == "inline");
+        auto b2 = folly::IOBuf::copyBuffer(std::string("v2"));
+        std::string_view v2(reinterpret_cast<const char*>(b2->data()), 2);
+        c->PutShared(2, key, v2, std::move(b2), 0, 0, 0, false);
+        CHECK(get(*c, 2, key) == "v2");
+        c->MarkPersisted(2, key, 2);
+        c->Erase(2, key);
+        CHECK(get(*c, 2, key) == "<miss>");
+    }
+    auto st = c->GetStats();
+    CHECK(st.items == 0);
+    CHECK(st.bytes == 0);
+    std::puts("shared value: ok");
+}
+
 void testUnknownPolicy() {
     std::string err;
     auto c = CreateDocCache("lru-please", 1024, 1, &err);
@@ -310,6 +346,7 @@ int main() {
     testPendingPinsAgainstEviction();
     testScanResistance();
     testConcurrentHammer();
+    testSharedValue();
     testUnknownPolicy();
     std::puts("PASS");
     return 0;
