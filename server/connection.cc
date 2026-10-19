@@ -688,54 +688,17 @@ bool Connection::parseAndDispatch() {
         return true;
     }
 
-    // Fast path: a cached GET sitting contiguously in the front buffer is
+    // Fast path: cached GETs sitting contiguously in the front buffer are
     // answered with no allocation. The generic path below splits an IOBuf per
     // request just to read the key, which dominates at high GET rates.
     // Pipelined reads make the contiguous case the common one.
     if (op == Opcode::Get) {
         if (auto* cache = bucket_->GetCache()) {
-            const folly::IOBuf* front = readBuf_.front();
-            if (front != nullptr && front->length() >= totalLen) {
-                const char* p = reinterpret_cast<const char*>(front->data());
-                std::string_view key(p + kHeaderSize + hdr.extrasLen,
-                                     hdr.keyLen);
-                prefetchAhead(cache, front, totalLen);
-                CachedDoc doc;
-                size_t valueLen = 0;
-                const auto res = cache->GetCopy(hdr.specific,
-                                                key,
-                                                &doc,
-                                                valueScratch_,
-                                                sizeof(valueScratch_),
-                                                &valueLen);
-                if (res == DocCache::GetResult::Hit) {
-                    hotStatAdd(gDispStats.cmdGet);
-                    hotStatAdd(gDispStats.cmdGetResp);
-                    appendGetResponse(pendingWriteBuf_,
-                                      hdr.opaque,
-                                      doc.seqno,
-                                      doc.flags,
-                                      valueScratch_,
-                                      valueLen,
-                                      doc.datatype);
-                    readBuf_.trimStart(totalLen);
-                    scheduleFlush();
-                    return true;
-                }
-                if (res == DocCache::GetResult::Tombstone) {
-                    hotStatAdd(gDispStats.cmdGet);
-                    hotStatAdd(gDispStats.cmdGetRespMiss);
-                    appendEmptyResponse(pendingWriteBuf_,
-                                        hdr.opcode,
-                                        McbpStatus::KeyNotFound,
-                                        hdr.opaque);
-                    readBuf_.trimStart(totalLen);
-                    scheduleFlush();
-                    return true;
-                }
-                // Miss, or a value too large for the scratch buffer: fall
-                // through to the generic path.
+            if (serveCachedGets(cache) > 0) {
+                return true;
             }
+            // Miss, or a value too large for the scratch buffer: the generic
+            // path below.
         }
     }
 
@@ -752,13 +715,75 @@ bool Connection::parseAndDispatch() {
     return true;
 }
 
+// The run leaves readBuf_ in one trimStart: per request, IOBufQueue's
+// bookkeeping cost ~5% of a resident 8 B GET.
+size_t Connection::serveCachedGets(DocCache* cache) {
+    const folly::IOBuf* front = readBuf_.front();
+    if (front == nullptr) {
+        return 0;
+    }
+    const uint8_t* const base = front->data();
+    const size_t avail = front->length();
+    size_t off = 0;
+    while (avail - off >= kHeaderSize) {
+        McbpHeader hdr;
+        std::memcpy(&hdr, base + off, kHeaderSize);
+        if (hdr.magic != kRequestMagic ||
+            static_cast<Opcode>(hdr.opcode) != Opcode::Get) {
+            break;
+        }
+        hdr.ntoh();
+        const size_t len = kHeaderSize + hdr.bodyLen;
+        if (avail - off < len || hdr.extrasLen + hdr.keyLen > hdr.bodyLen) {
+            break;
+        }
+        const char* p = reinterpret_cast<const char*>(base + off);
+        std::string_view key(p + kHeaderSize + hdr.extrasLen, hdr.keyLen);
+        prefetchAhead(cache, front, base + off, len);
+        CachedDoc doc;
+        size_t valueLen = 0;
+        const auto res = cache->GetCopy(hdr.specific,
+                                        key,
+                                        &doc,
+                                        valueScratch_,
+                                        sizeof(valueScratch_),
+                                        &valueLen);
+        if (res == DocCache::GetResult::Hit) {
+            hotStatAdd(gDispStats.cmdGet);
+            hotStatAdd(gDispStats.cmdGetResp);
+            appendGetResponse(pendingWriteBuf_,
+                              hdr.opaque,
+                              doc.seqno,
+                              doc.flags,
+                              valueScratch_,
+                              valueLen,
+                              doc.datatype);
+        } else if (res == DocCache::GetResult::Tombstone) {
+            hotStatAdd(gDispStats.cmdGet);
+            hotStatAdd(gDispStats.cmdGetRespMiss);
+            appendEmptyResponse(pendingWriteBuf_,
+                                hdr.opcode,
+                                McbpStatus::KeyNotFound,
+                                hdr.opaque);
+        } else {
+            break;
+        }
+        off += len;
+    }
+    if (off > 0) {
+        readBuf_.trimStart(off);
+        scheduleFlush();
+    }
+    return off;
+}
+
 // Index lines are prefetched kGetPrefetchDepth requests ahead and entries
 // half that: deep enough to cover a miss at our per-GET cost, shallow enough
 // that the lines are still in L1/L2 when their GET runs.
 void Connection::prefetchAhead(DocCache* cache,
                                const folly::IOBuf* front,
+                               const uint8_t* cur,
                                size_t curLen) {
-    const uint8_t* cur = front->data();
     const uint8_t* end = front->tail();
     if (front != pfBuf_ || pfNext_ <= cur || pfNext_ > end) {
         pfBuf_ = front;

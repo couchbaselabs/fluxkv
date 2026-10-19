@@ -172,11 +172,17 @@ private:
     // Cache fast path copies the value here under the cache lock; larger
     // values take the generic path.
     uint8_t valueScratch_[4096];
-    // Cached-GET lookahead: requests in [front data, pfNext_) of pfBuf_ have
-    // had their index line prefetched; pfAhead_ counts those not yet served.
+    // Serves the run of cached GETs at the front of readBuf_; returns the
+    // bytes consumed (0 if the first request is not a cached GET).
+    size_t serveCachedGets(DocCache* cache);
+    // Cached-GET lookahead: requests in [cur, pfNext_) of pfBuf_ have had
+    // their index line prefetched; pfAhead_ counts those not yet served.
     // pfTok_ holds their tokens for the second-stage entry prefetch.
     static constexpr int kGetPrefetchDepth = 8;
-    void prefetchAhead(DocCache* cache, const folly::IOBuf* front, size_t curLen);
+    void prefetchAhead(DocCache* cache,
+                       const folly::IOBuf* front,
+                       const uint8_t* cur,
+                       size_t curLen);
     const folly::IOBuf* pfBuf_{nullptr};
     const uint8_t* pfNext_{nullptr};
     int pfAhead_{0};
