@@ -769,6 +769,14 @@ size_t Connection::serveCachedGets(DocCache* cache) {
             break;
         }
         off += len;
+        if (!flushScheduled_) {
+            scheduleFlush(); // arms the response timer; never writes here
+        }
+        if (pendingWriteBuf_.size() >= flushBytes()) {
+            // Send now, as per-GET scheduling did: holding a run's 1 KB
+            // responses to its end cost T1 15%.
+            break;
+        }
     }
     if (off > 0) {
         readBuf_.trimStart(off);
