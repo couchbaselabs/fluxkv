@@ -26,6 +26,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -39,6 +40,9 @@ namespace {
 
 constexpr uint8_t kRequestMagic = 0x80;
 constexpr uint8_t kResponseMagic = 0x81;
+// Requests with framing extras (durability) and their replies.
+constexpr uint8_t kAltRequestMagic = 0x08;
+constexpr uint8_t kAltResponseMagic = 0x18;
 constexpr size_t kHeaderSize = 24;
 constexpr uint8_t kOpGet = 0x00;
 constexpr uint8_t kOpSet = 0x01;
@@ -98,6 +102,9 @@ struct Options {
     // Leave UnorderedExecution unnegotiated, so a kv_engine-compatible
     // server keeps each connection's responses in request order.
     bool ordered = false;
+    // SET durability level sent as a framing extra: 0 none, 1 majority,
+    // 2 majorityAndPersistActive, 3 persistToMajority.
+    uint8_t durability = 0;
 };
 
 Options gOpts;
@@ -279,13 +286,22 @@ void appendRequest(std::vector<uint8_t>& out,
                    const std::string* value,
                    size_t valueLen = 0) {
     const size_t extrasLen = (opcode == kOpSet) ? 8 : 0;
+    const bool durable = opcode == kOpSet && gOpts.durability != 0;
+    // Framing extra: id 1 (durability) << 4 | length 1, then the level.
+    const uint8_t frame[2] = {0x11, gOpts.durability};
+    const size_t frameLen = durable ? sizeof(frame) : 0;
     valueLen = value ? (valueLen ? valueLen : value->size()) : 0;
-    const size_t bodyLen = extrasLen + key.size() + valueLen;
+    const size_t bodyLen = frameLen + extrasLen + key.size() + valueLen;
 
     uint8_t h[kHeaderSize] = {};
-    h[0] = kRequestMagic;
+    h[0] = durable ? kAltRequestMagic : kRequestMagic;
     h[1] = opcode;
-    putU16(h + 2, static_cast<uint16_t>(key.size()));
+    if (durable) {
+        h[2] = static_cast<uint8_t>(frameLen);
+        h[3] = static_cast<uint8_t>(key.size());
+    } else {
+        putU16(h + 2, static_cast<uint16_t>(key.size()));
+    }
     h[4] = static_cast<uint8_t>(extrasLen);
     h[5] = 0; // datatype
     putU16(h + 6, vbucket);
@@ -294,6 +310,7 @@ void appendRequest(std::vector<uint8_t>& out,
     // cas stays zero
 
     out.insert(out.end(), h, h + kHeaderSize);
+    out.insert(out.end(), frame, frame + frameLen);
     if (extrasLen) {
         uint8_t extras[8] = {}; // flags=0, expiry=0
         out.insert(out.end(), extras, extras + 8);
@@ -302,6 +319,10 @@ void appendRequest(std::vector<uint8_t>& out,
     if (value) {
         out.insert(out.end(), value->begin(), value->begin() + valueLen);
     }
+}
+
+bool isResponse(uint8_t magic) {
+    return magic == kResponseMagic || magic == kAltResponseMagic;
 }
 
 bool writeFully(int fd, const uint8_t* data, size_t len) {
@@ -358,11 +379,18 @@ bool simpleCmd(int fd,
     return (static_cast<uint16_t>(rh[6] << 8 | rh[7])) == 0;
 }
 
-// HELLO asking for UnorderedExecution, as SDKs do (unless -ordered), then
-// SASL PLAIN and SELECT_BUCKET for servers that want them (-user).
+// HELLO asking for UnorderedExecution, as SDKs do (unless -ordered), and for
+// AltRequest + SyncReplication with -durability, then SASL PLAIN and
+// SELECT_BUCKET for servers that want them (-user).
 bool handshake(int fd) {
-    if (!gOpts.ordered &&
-        !simpleCmd(fd, kOpHello, "fluxbench", std::string("\x00\x0e", 2))) {
+    std::string features;
+    if (!gOpts.ordered) {
+        features.append("\x00\x0e", 2);
+    }
+    if (gOpts.durability) {
+        features.append("\x00\x10\x00\x11", 4);
+    }
+    if (!features.empty() && !simpleCmd(fd, kOpHello, "fluxbench", features)) {
         return false;
     }
     if (gOpts.user.empty()) {
@@ -411,7 +439,7 @@ int connectTo(const std::string& host, uint16_t port) {
 // simply too heavy for the disk, while KeyNotFound means a read missed.
 constexpr uint16_t kStatusTmpFail = 0x0086;
 
-const char* statusName(uint16_t status) {
+std::string statusName(uint16_t status) {
     switch (status) {
     case 0x0000:
         return "Success";
@@ -425,12 +453,19 @@ const char* statusName(uint16_t status) {
         return "AuthError";
     case 0x0081:
         return "UnknownCommand";
+    case 0x0082:
+        return "NoMemory";
     case 0x0084:
         return "InternalError";
+    case 0x0085:
+        return "Busy";
     case 0x0086:
         return "TmpFail";
-    default:
-        return "Other";
+    default: {
+        char hex[8];
+        snprintf(hex, sizeof(hex), "0x%04x", status);
+        return hex;
+    }
     }
 }
 
@@ -543,7 +578,7 @@ public:
                 return true;
             }
             haveHeader_ = 0;
-            if (header_[0] != kResponseMagic) {
+            if (!isResponse(header_[0])) {
                 return false;
             }
             const uint16_t status = getU16(header_ + 6);
@@ -803,7 +838,7 @@ void runConnectionWindow(const Options& opts,
             if (have - p < kHeaderSize + bodyLen) {
                 break;
             }
-            if (h[0] != kResponseMagic) {
+            if (!isResponse(h[0])) {
                 result.errors++;
                 ::close(fd);
                 return;
@@ -943,7 +978,7 @@ void runConnection(const Options& opts,
                 broken = true;
                 break;
             }
-            if (header[0] != kResponseMagic) {
+            if (!isResponse(header[0])) {
                 result.errors++;
                 broken = true;
                 break;
@@ -1015,6 +1050,8 @@ void usage(const char* prog) {
                "handshake entirely (default: unset)\n"
             << "  -pass P           SASL PLAIN password\n"
             << "  -ordered          do not negotiate UnorderedExecution in HELLO\n"
+            << "  -durability L     SET durability: majority, majorityAndPersistActive or\n"
+               "                    persistToMajority (Couchbase SyncWrites)\n"
             << "  -bucket B         bucket to select after authenticating\n"
             << "  -randvals         random, incompressible values\n"
             << "  -zipf THETA       Zipf key selection (e.g. 0.99); default "
@@ -1101,6 +1138,19 @@ int main(int argc, char** argv) {
             opts.mode = next();
         } else if (arg == "-zipf") {
             opts.zipf = std::stod(next());
+        } else if (arg == "-durability") {
+            const std::string l = next();
+            if (l == "majority") {
+                opts.durability = 1;
+            } else if (l == "majorityAndPersistActive") {
+                opts.durability = 2;
+            } else if (l == "persistToMajority") {
+                opts.durability = 3;
+            } else {
+                std::cerr << "-durability: majority, majorityAndPersistActive or "
+                             "persistToMajority\n";
+                return 1;
+            }
         } else if (arg == "-ordered") {
             opts.ordered = true;
         } else if (arg == "-randvals") {
