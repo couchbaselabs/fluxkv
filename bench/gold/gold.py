@@ -2,15 +2,16 @@
 """Run the golden benchmark across N machines and build its report.
 
   gold.py deploy  --hosts h1,h2 --server BIN --client BIN [--lib DIR] [--magma-sha SHA]
-  gold.py run     --hosts h1,h2 --name NAME [--extra FLAGS] [--groups ..] [--rows ..] [--smoke] [--out DIR]
+  gold.py run     --hosts h1,h2 --name NAME [--extra FLAGS] [--groups ..] [--rows ..] [--smoke] [--couchbase] [--out DIR]
   gold.py status  --hosts h1,h2 --name NAME
   gold.py collect --hosts h1,h2 --name NAME --out DIR
-  gold.py report  DIR [-o report.html]
-  gold.py plan    --hosts h1,h2
+  gold.py report  DIR [-o report.html] [--couchbase]
+  gold.py plan    --hosts h1,h2 [--couchbase]
 
 `run` is a dispatcher: it hands the longest pending group (suite.py) to whichever box is idle
 and keeps polling until every row has a result or has failed twice. All state lives on the
-boxes, so a restarted `run` resumes where it left off. SSH uses your keys; if SSHPASS is set,
+boxes, so a restarted `run` resumes where it left off. --couchbase runs suite.couchbase() against
+each box's Couchbase Server instead of fluxkv. SSH uses your keys; if SSHPASS is set,
 it goes through `sshpass -e` instead.
 """
 import argparse, concurrent.futures as cf, datetime, io, json, os, re, shlex, subprocess, sys, tarfile, tempfile, time
@@ -137,7 +138,13 @@ GOLD_HOME=%(root)s GOLD_DIR=%(d)s nohup setsid bash %(root)s/gold_sweep.sh >> sw
 def run(a):
     groups = suite.select(a.groups, a.rows)
     extra_env = {"GOLD_SMOKE": "1"} if a.smoke else {}
-    spec = {"extra": a.extra, "smoke": a.smoke, "groups": groups}
+    if a.couchbase:
+        # The login travels with each row's settings to the boxes; it never goes in a file here.
+        login = {k: os.environ.get(k) for k in ("GOLD_CB_USER", "GOLD_CB_PASS")}
+        if not all(login.values()):
+            raise SystemExit("--couchbase needs the cluster login in GOLD_CB_USER and GOLD_CB_PASS")
+        extra_env.update(GOLD_SERVER="couchbase", **login)
+    spec = {"extra": a.extra, "smoke": a.smoke, "couchbase": a.couchbase, "groups": groups}
     started = {}  # host -> time of our last launch (a sweep takes a moment to take its lock)
     while True:
         st = each(a.hosts, lambda h: state(a, h))
@@ -178,7 +185,7 @@ def run(a):
     if a.out:
         collect(a)
         if set(groups) == set(suite.GROUPS) and not a.smoke:
-            report(argparse.Namespace(dir=a.out, o=os.path.join(a.out, "report.html"), run=None))
+            report(argparse.Namespace(dir=a.out, o=os.path.join(a.out, "report.html"), run=None, couchbase=a.couchbase))
         else:
             print("partial or smoke run: no report (it needs all %d rows)" % len(names(suite.GROUPS)))
 
@@ -258,7 +265,8 @@ def collect(a):
 
 
 def report(a):
-    cmd = [sys.executable, os.path.join(HERE, "report", "build_report.py"), a.dir, "-o", a.o or os.path.join(a.dir, "report.html")]
+    builder = "build_report_couchbase.py" if getattr(a, "couchbase", False) else "build_report.py"
+    cmd = [sys.executable, os.path.join(HERE, "report", builder), a.dir, "-o", a.o or os.path.join(a.dir, "report.html")]
     if getattr(a, "run", None):
         cmd += ["--run", a.run]
     subprocess.check_call(cmd)
@@ -291,6 +299,7 @@ def main():
         sp = sub.add_parser(c); common(sp, name=(c == "run"))
         sp.add_argument("--groups", type=lambda s: s.split(","), help="suite groups (default: all)")
         sp.add_argument("--rows", type=lambda s: s.split(","), help="only groups holding these rows")
+        sp.add_argument("--couchbase", action="store_true", help="the Couchbase suite, run against each box's Couchbase Server")
         if c == "run":
             sp.add_argument("--extra", default="", help="server flags for every row; pass as --extra='--block-writes-ratio 16 ...'")
             sp.add_argument("--smoke", action="store_true", help="1%% of the keys, 120 s phases")
@@ -300,7 +309,10 @@ def main():
     sp = sub.add_parser("status"); common(sp)
     sp = sub.add_parser("collect"); common(sp); sp.add_argument("--out", required=True); sp.add_argument("--hardware")
     sp = sub.add_parser("report"); sp.add_argument("dir"); sp.add_argument("-o"); sp.add_argument("--run")
+    sp.add_argument("--couchbase", action="store_true")
     a = p.parse_args()
+    if getattr(a, "couchbase", False):
+        suite.GROUPS = suite.couchbase()
     {"deploy": deploy, "run": run, "status": status, "collect": collect, "report": report, "plan": plan}[a.cmd](a)
 
 

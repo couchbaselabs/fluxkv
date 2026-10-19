@@ -63,6 +63,34 @@ GROUPS = {
 }
 
 
+# Couchbase Server E rungs: the bucket quota after the load (gold_run.sh GOLD_CB_BUCKET_MB), as a share of the
+# 16 GiB quota; magma's minimum bucket is 100 MB. Couchbase has no knob that shrinks only a block cache.
+CB_E_READ = [("_c100", 16384, "100%"), ("_c50", 8192, "50%"), ("_c10", 1638, "10%"), ("_c4", 655, "~4%"),
+             ("_c14", 229, "~1.4%"), ("_c06", 100, "~0.6%")]
+CB_E_WRITE = [("_c100", 16384, "100%"), ("_c10", 1638, "10%"), ("_c5", 819, "5%")]
+
+
+def couchbase():
+    """The suite as gold.py --couchbase runs it, with minutes measured on Couchbase Server 8.5.
+
+    Couchbase loads 1B 8 B keys in ~70 min, so each 8 B write group splits into its T/L pairs (an L row
+    stays on the box of the T row it paces from) and its durable/non-durable pairs may meet different boxes.
+    """
+    g = {"read-1k": tl(2, 40, 45), "mem-1k": tl(1, 15, 20, MEM_1K), "insert-1k": GROUPS["insert-1k"],
+         "overwrite-1k": GROUPS["overwrite-1k"], "mem-8b": tl(11, 25, 35, MEM_8B), "read-8b": tl(12, 185, 175),
+         "sustain": GROUPS["sustain"]}
+    for name, pair in (("insert-8b-nonblind", (13, 15)), ("insert-8b-blind", (14, 16)),
+                       ("overwrite-8b-nonblind", (17, 19)), ("overwrite-8b-blind", (18, 20))):
+        for n in pair:
+            g["%s-T%d" % (name, n)] = tl(n, 85, 90)
+    for tag, mb, _ in CB_E_READ:
+        g["e-read" + tag] = tl(2, 45, 55, {"GOLD_CB_BUCKET_MB": mb}, tag)
+    for n in (7, 8):
+        for tag, mb, _ in CB_E_WRITE:
+            g["e-overwrite-T%d%s" % (n, tag)] = tl(n, 25, 40, {"GOLD_CB_BUCKET_MB": mb}, tag)
+    return g
+
+
 def minutes(group):
     return sum(r.minutes for r in GROUPS[group])
 

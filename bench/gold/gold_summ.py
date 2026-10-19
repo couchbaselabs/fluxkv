@@ -3,7 +3,7 @@
 import sys, json, re, os
 ID, OP, VS, KEYS, RES, TM, SPIN = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5] == "1", int(sys.argv[6]), sys.argv[7]
 O = os.environ["GOLD_DIR"] + "/out/" + os.environ.get("GOLD_RID", ID)
-F = "set get miss tmpf chit cmiss bin devw devr du idle tot ticks nd ts rios wios idxb kleaf bcused bcquota bchit bcmiss kleafc locmem locfind locfb vphit vpmiss rss hwm magmamem".split()
+F = "set get miss tmpf chit cmiss bin devw devr du idle tot ticks nd ts rios wios idxb kleaf bcused bcquota bchit bcmiss kleafc locmem locfind locfb vphit vpmiss rss hwm magmamem ires".split()
 rows = []
 for l in open(O + ".samples"):
     f = l.split()
@@ -55,6 +55,8 @@ def span(a, b):
             out["value_ptr_served"] = round(h / max(1, g), 4)
             out["seq_search_share"] = round(1 - h / max(1, g), 4)
         out["index_residency"] = round(min(1.0, b["bcquota"] / max(1, need)), 3)
+        if not need:  # Couchbase: no key-tree sizes to divide by, but magma's own ratio
+            out["index_residency"] = round(b.get("ires", 0), 4)
         h, m = d(a, b, "bchit"), d(a, b, "bcmiss"); out["block_cache_hit"] = round(h / max(1, h + m), 4)
     return out
 load = next(x for x in rows if x["tag"] == "load"); end = rows[-1]

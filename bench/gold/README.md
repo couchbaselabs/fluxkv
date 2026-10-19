@@ -24,6 +24,8 @@ writes `res/<row>.json`. See `gold_run.sh` for the exact server flags and client
 | `gold_summ.py` | Turns a row's samples and client output into its result JSON |
 | `report/build_report.py`, `report/template.html` | The HTML report |
 | `report/test_report.sh` | Rebuilds a report from saved results and compares it byte for byte |
+| `report/build_report_couchbase.py` | The report for a Couchbase Server run |
+| `report/compare_couchbase.py` | A fluxkv run against a Couchbase Server run, row by row |
 
 ## Machines
 
@@ -68,6 +70,31 @@ Other commands:
 `--groups` or `--rows` limit a run to part of the suite. `--smoke` runs 1% of the keys with
 120 s phases, to check a setup end to end in well under an hour. A partial run can be
 collected, but the report needs all 64 rows.
+
+## Couchbase Server
+
+`--couchbase` (on `run`, `plan` and `report`) runs the same rows against each box's Couchbase Server
+instead of fluxkv, with the suite from `suite.couchbase()`. Each box needs Couchbase Server
+initialised with a data path at `/data/cbgold/data` and the data service only; export the cluster
+login as `GOLD_CB_USER` and `GOLD_CB_PASS` before `run`, which passes it to the boxes with each row's
+settings. Each row creates a fresh magma bucket `gold` (0 replicas) after
+`fstrim`, and caps the `couchbase-server` service with a systemd `MemoryMax`, which holds memcached and
+its page cache: a 16 GiB bucket in 32 GiB, or 48 GiB in 64 GiB for the in-memory rows.
+
+| fluxkv row setting | Couchbase |
+|---|---|
+| durable | SyncWrite at persistToMajority (`fluxbench -durability`) |
+| blind | bucket setting `magma_enable_upsert=true` |
+| E rungs | the bucket quota shrinks after the load (`GOLD_CB_BUCKET_MB`), with the cgroup 4 GiB above it |
+
+The 8 B write groups split into their T/L pairs because Couchbase loads 1B 8 B keys in about 70
+minutes; the full suite takes about 16 hours on four boxes. SET rates count applied mutations, since
+Couchbase rejects many SETs with TMPFAIL at full rate.
+
+```bash
+nohup ./gold.py run --hosts ... --name cb-2026-10-18 --couchbase --out results/cb-2026-10-18 > gold-cb.log 2>&1 &
+report/compare_couchbase.py results/2026-10-17 results/cb-2026-10-18 -o compare.html --notes notes.html
+```
 
 ## The report
 
