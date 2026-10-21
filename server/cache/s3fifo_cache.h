@@ -16,6 +16,7 @@
 
 #include "doccache.h"
 
+#include <atomic>
 #include <memory>
 
 namespace magma {
@@ -72,6 +73,8 @@ public:
     void EnableSeqnoIndex() override {
         seqnoIndex_ = true;
     }
+    void SetSeqnoIndexCap(size_t maxBytes) override;
+    void SetBudget(size_t maxBytes) override;
     uint64_t SeqnoHint(uint16_t vbid,
                        std::string_view key,
                        uint64_t* valuePtr = nullptr) override;
@@ -102,7 +105,7 @@ private:
     // pins, evicts.
     void putEntry(uint64_t hash, Entry* e);
 
-    size_t maxBytes_;
+    std::atomic<size_t> maxBytes_;
     size_t numShards_;
     size_t shardMask_;
     std::unique_ptr<Shard[]> shards_;

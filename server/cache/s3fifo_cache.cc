@@ -401,13 +401,37 @@ struct S3FifoCache::Shard {
     };
     std::mutex seqMu;
     folly::F14FastMap<uint64_t, SeqEntry> seqIdx;
+    size_t seqCap{0}; // 0: unbounded
+    size_t seqBytes{0}; // seqIdx's allocation
+    uint64_t seqRejected{0};
+
+    // A key without an entry gets no hint, which is always safe, so past the
+    // cap new keys are left out rather than old ones evicted. A full table
+    // doubles on insert with both allocations live while it moves, so the
+    // check is on that peak, not the current size.
+    bool admitSeq() const {
+        if (seqCap == 0) {
+            return true;
+        }
+        const bool grows = seqIdx.size() >= seqIdx.bucket_count();
+        return (grows ? 3 * seqBytes : seqBytes) <= seqCap;
+    }
 
     void noteSeqno(uint64_t h,
                    uint64_t seqno,
                    bool deleted,
                    uint64_t valuePtr = 0) {
         std::lock_guard g(seqMu);
-        auto& v = seqIdx[h];
+        auto it = seqIdx.find(h);
+        if (it == seqIdx.end()) {
+            if (!admitSeq()) {
+                seqRejected++;
+                return;
+            }
+            it = seqIdx.emplace(h, SeqEntry{}).first;
+            seqBytes = seqIdx.getAllocatedMemorySize();
+        }
+        auto& v = it->second;
         const uint64_t cur = v.seqno & ~kSeqnoDeleted;
         if (seqno > cur || (seqno == cur && deleted)) {
             v.seqno = deleted ? (seqno | kSeqnoDeleted) : seqno;
@@ -529,6 +553,25 @@ S3FifoCache::S3FifoCache(size_t maxBytes, size_t numShards) : maxBytes_(maxBytes
     for (size_t i = 0; i < numShards_; i++) {
         shards_[i].budget = perShard;
         shards_[i].smallBudget = perShard * kSmallPercent / 100;
+    }
+}
+
+void S3FifoCache::SetBudget(size_t maxBytes) {
+    maxBytes_.store(maxBytes, std::memory_order_relaxed);
+    const size_t perShard = maxBytes / numShards_;
+    for (size_t i = 0; i < numShards_; i++) {
+        auto& s = shards_[i];
+        std::unique_lock lock(s.mu);
+        s.budget = perShard;
+        s.smallBudget = perShard * kSmallPercent / 100;
+        s.evict();
+    }
+}
+
+void S3FifoCache::SetSeqnoIndexCap(size_t maxBytes) {
+    for (size_t i = 0; i < numShards_; i++) {
+        std::lock_guard g(shards_[i].seqMu);
+        shards_[i].seqCap = maxBytes / numShards_;
     }
 }
 
@@ -855,7 +898,7 @@ uint64_t S3FifoCache::SeqnoHint(uint16_t vbid,
 
 DocCacheStats S3FifoCache::GetStats() const {
     DocCacheStats st;
-    st.maxBytes = maxBytes_;
+    st.maxBytes = maxBytes_.load(std::memory_order_relaxed);
     for (const auto& slot : gReadStats) {
         st.hits += slot.hits.load(std::memory_order_relaxed);
         st.misses += slot.misses.load(std::memory_order_relaxed);
@@ -868,6 +911,8 @@ DocCacheStats S3FifoCache::GetStats() const {
         {
             std::lock_guard g(s.seqMu);
             st.seqnoIndexItems += s.seqIdx.size();
+            st.seqnoIndexBytes += s.seqBytes;
+            st.seqnoIndexRejected += s.seqRejected;
         }
         std::shared_lock lock(s.mu);
         st.puts += s.puts;

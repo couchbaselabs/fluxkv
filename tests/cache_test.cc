@@ -329,6 +329,53 @@ void testSharedValue() {
     std::puts("shared value: ok");
 }
 
+void testSeqnoIndexCap() {
+    auto c = make(1 << 20, 4);
+    c->EnableSeqnoIndex();
+    const size_t cap = 256 * 1024;
+    c->SetSeqnoIndexCap(cap);
+    const int n = 200000;
+    for (int i = 0; i < n; i++) {
+        c->NoteSeqno(0, "k" + std::to_string(i), 10, false);
+    }
+    auto st = c->GetStats();
+    CHECK(st.seqnoIndexBytes > 0 && st.seqnoIndexBytes <= cap);
+    CHECK(st.seqnoIndexRejected > 0);
+    CHECK(st.seqnoIndexItems + st.seqnoIndexRejected == uint64_t(n));
+
+    // Indexed keys stay current; a key left out gets no hint.
+    CHECK(c->SeqnoHint(0, "k0") == 10);
+    c->NoteSeqno(0, "k0", 11, false);
+    CHECK(c->SeqnoHint(0, "k0") == 11);
+    c->NoteSeqno(0, "k0", 12, true);
+    CHECK(c->SeqnoHint(0, "k0") == 0);
+    int unhinted = 0;
+    for (int i = 0; i < n; i++) {
+        unhinted += c->SeqnoHint(0, "k" + std::to_string(i)) == 0;
+    }
+    CHECK(uint64_t(unhinted) == st.seqnoIndexRejected + 1);
+    CHECK(c->GetStats().seqnoIndexBytes == st.seqnoIndexBytes);
+    std::puts("seqno index cap: ok");
+}
+
+void testSetBudget() {
+    auto c = make(1 << 20, 4);
+    for (int i = 0; i < 2000; i++) {
+        putClean(*c, 0, "k" + std::to_string(i), std::string(200, 'v'));
+    }
+    CHECK(c->GetStats().bytes > (1 << 18));
+    c->SetBudget(1 << 18);
+    auto st = c->GetStats();
+    CHECK(st.maxBytes == (1 << 18));
+    CHECK(st.bytes <= (1 << 18));
+    c->SetBudget(1 << 20);
+    for (int i = 0; i < 2000; i++) {
+        putClean(*c, 0, "k" + std::to_string(i), std::string(200, 'v'));
+    }
+    CHECK(c->GetStats().bytes > (1 << 18));
+    std::puts("set budget: ok");
+}
+
 void testUnknownPolicy() {
     std::string err;
     auto c = CreateDocCache("lru-please", 1024, 1, &err);
@@ -347,6 +394,8 @@ int main() {
     testScanResistance();
     testConcurrentHammer();
     testSharedValue();
+    testSeqnoIndexCap();
+    testSetBudget();
     testUnknownPolicy();
     std::puts("PASS");
     return 0;

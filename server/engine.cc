@@ -298,6 +298,8 @@ std::string DispatcherStats::toJson() const {
         j["cache_ghost_hits"] = c.ghostHits;
         j["cache_fills_deferred"] = c.fillsDeferred;
         j["cache_seqno_index_items"] = c.seqnoIndexItems;
+        j["cache_seqno_index_bytes"] = c.seqnoIndexBytes;
+        j["cache_seqno_index_rejected"] = c.seqnoIndexRejected;
         j["cache_bytes"] = c.bytes;
         j["cache_max_bytes"] = c.maxBytes;
         j["cache_items"] = c.items;

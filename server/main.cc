@@ -140,6 +140,7 @@ struct Config {
     size_t cacheShards = 256;
     std::string cachePolicy = "s3fifo";
     bool cacheSeqnoIndex = false;
+    size_t cacheSeqnoIndexMax = 0; // 0: (mem-quota + cache-size) / 4
     bool cacheFillDoorkeeper = false;
     bool cacheValuePtr = false;
     bool streamReaders = false;
@@ -360,7 +361,11 @@ static void printUsage(const char* prog) {
                  "256)\n"
               << "  --cache-policy NAME   eviction policy: s3fifo (default)\n"
               << "  --cache-seqno-index   keep every key's seqno in the cache after its "
-                 "value is evicted; read misses go to magma by seqno (needs --cache-size)\n"
+                 "value is evicted; read misses go to magma by seqno (needs --cache-size).\n"
+                 "                        Its memory comes out of the doc cache budget (down to "
+                 "1/8), then magma's quota\n"
+              << "  --cache-seqno-index-max N  bytes the seqno index may hold; past it new keys "
+                 "are not indexed (default (mem-quota + cache-size) / 4)\n"
               << "  --cache-fill-doorkeeper  a read miss stores the value only if the "
                  "key missed recently (needs --cache-size)\n"
               << "  --direct-send         readers write GET responses to the socket "
@@ -534,6 +539,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"cache-seqno-index", no_argument, nullptr, 1301},
             {"cache-fill-doorkeeper", no_argument, nullptr, 1302},
             {"cache-value-ptr", no_argument, nullptr, 1303},
+            {"cache-seqno-index-max", required_argument, nullptr, 1309},
             {"stream-readers", no_argument, nullptr, 1307},
             {"direct-send", no_argument, nullptr, 1308},
             {"auto-tune", no_argument, nullptr, 1030},
@@ -748,6 +754,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1303:
             cfg.cacheValuePtr = true;
+            break;
+        case 1309:
+            cfg.cacheSeqnoIndexMax = strtoull(optarg, nullptr, 10);
             break;
         case 1030:
             cfg.autoTune = true;
@@ -1348,9 +1357,15 @@ int main(int argc, char* argv[]) {
                      cfg.cacheShards);
         if (cfg.cacheSeqnoIndex) {
             cache->EnableSeqnoIndex();
+            if (cfg.cacheSeqnoIndexMax == 0) {
+                cfg.cacheSeqnoIndexMax = (cfg.memQuota + cfg.cacheSize) / 4;
+            }
+            cache->SetSeqnoIndexCap(cfg.cacheSeqnoIndexMax);
             gCacheSeqnoIndex = true;
             gCacheValuePtr = cfg.cacheValuePtr;
-            spdlog::info("  cache: seqno index on (read misses go to magma by seqno)");
+            spdlog::info("  cache: seqno index on (read misses go to magma by seqno), "
+                         "max {}MB",
+                         cfg.cacheSeqnoIndexMax / (1024 * 1024));
         }
         if (cfg.cacheFillDoorkeeper) {
             cache->EnableFillDoorkeeper();
@@ -1460,6 +1475,64 @@ int main(int argc, char* argv[]) {
         spdlog::info("  sync-interval: every kvstore within {} ms", cfg.syncIntervalMs);
     }
 
+    // Magma's quota per shard is --mem-quota's share, plus the memory
+    // governor's boost, minus what the seqno index holds beyond the doc
+    // cache's share. Both governors set it through here.
+    const int64_t baseQuota = int64_t(cfg.memQuota / cfg.shards);
+    std::atomic<int64_t> quotaExtra{0};
+    std::atomic<int64_t> quotaCharge{0};
+    std::mutex quotaMu;
+    auto setMagmaQuota = [&](bool shrink) {
+        std::lock_guard g(quotaMu);
+        const int64_t q = std::max(baseQuota / 4,
+                                   baseQuota + quotaExtra.load() - quotaCharge.load());
+        for (size_t i = 0; i < cfg.shards; i++) {
+            bucket.GetShard(uint16_t(i)).GetMagma()->SetMemoryQuota(size_t(q), shrink);
+        }
+        if (shrink) {
+            // Evicted blocks stay resident in jemalloc dirty pages for its
+            // decay time unless purged.
+            je_mallctl("arena.4096.purge", nullptr, nullptr, nullptr, 0);
+        }
+    };
+
+    std::thread seqIdxThread;
+    if (cfg.cacheSeqnoIndex && bucket.GetCache()) {
+        seqIdxThread = std::thread([&] {
+            // The seqno index never evicts and grows with the key count
+            // (~37 B a key with F14's headroom: 1B keys OOM-killed a 100 GiB
+            // cgroup). It is charged to the memory budget: first the doc
+            // cache's budget, down to an eighth of --cache-size, then magma's
+            // quota, which shrinks the block cache first. The doc cache keeps
+            // at least the write queue's size: queued writes are pinned in it,
+            // and below that every insert scanned them for a victim (a load
+            // fell from 3.5M to 10K SETs/s at 128 MB under a 1 GB queue).
+            auto* cache = bucket.GetCache();
+            const int64_t cacheSize = int64_t(cfg.cacheSize);
+            const int64_t docFloor = std::min(
+                    cacheSize, std::max(cacheSize / 8, int64_t(cfg.writeQueueMem)));
+            const int64_t step = 64 * 1024 * 1024;
+            int64_t docBudget = cacheSize;
+            int64_t charged = 0;
+            while (!syncStop.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                const int64_t idx = int64_t(cache->GetStats().seqnoIndexBytes);
+                const int64_t fromCache = std::min(idx, cacheSize - docFloor);
+                const int64_t doc = cacheSize - fromCache;
+                if (docBudget - doc >= step || (doc == docFloor && docBudget != doc)) {
+                    docBudget = doc;
+                    cache->SetBudget(size_t(doc));
+                }
+                const int64_t over = idx - fromCache;
+                if (over - charged >= step) {
+                    charged = over;
+                    quotaCharge.store(over / int64_t(cfg.shards));
+                    setMagmaQuota(true);
+                }
+            }
+        });
+    }
+
     std::thread boostThread;
     if (cfg.readBoostMB > 0) {
         boostThread = std::thread([&] {
@@ -1470,7 +1543,7 @@ int main(int argc, char* argv[]) {
             // blocks cached, a full block cache plus overwrite memtables
             // outgrew the cgroup at the base quota itself.
             const int64_t mb = 1024 * 1024;
-            const int64_t base = int64_t(cfg.memQuota / cfg.shards);
+            const int64_t base = baseQuota;
             const int64_t maxExtra = int64_t(cfg.readBoostMB) * mb / int64_t(cfg.shards);
             const int64_t minExtra = -base / 2;
             const int64_t step = std::max<int64_t>(maxExtra / 16, mb);
@@ -1494,15 +1567,8 @@ int main(int argc, char* argv[]) {
             int64_t extra = 0;
             auto apply = [&](int64_t e, bool shrink) {
                 extra = e;
-                for (size_t i = 0; i < cfg.shards; i++) {
-                    bucket.GetShard(uint16_t(i)).GetMagma()->SetMemoryQuota(
-                            size_t(base + extra), shrink);
-                }
-                if (shrink) {
-                    // Evicted blocks stay resident in jemalloc dirty pages
-                    // for its decay time unless purged.
-                    je_mallctl("arena.4096.purge", nullptr, nullptr, nullptr, 0);
-                }
+                quotaExtra.store(e);
+                setMagmaQuota(shrink);
             };
             uint64_t last = 0;
             auto lastWrite = std::chrono::steady_clock::now();
@@ -1789,6 +1855,9 @@ int main(int argc, char* argv[]) {
     syncStop = true;
     if (syncThread.joinable()) {
         syncThread.join();
+    }
+    if (seqIdxThread.joinable()) {
+        seqIdxThread.join();
     }
     if (boostThread.joinable()) {
         boostThread.join();
