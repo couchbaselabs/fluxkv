@@ -62,7 +62,8 @@ struct DocCacheStats {
     uint64_t maxBytes{0};
     uint64_t seqnoIndexItems{0}; // keys with a known seqno (EnableSeqnoIndex)
     uint64_t seqnoIndexBytes{0}; // memory the seqno index holds (capacity, not size)
-    uint64_t seqnoIndexRejected{0}; // new keys left out at the index cap
+    uint64_t seqnoIndexEvictions{0}; // entries evicted at the index cap
+    uint64_t seqnoIndexRejected{0}; // read fills not indexed once evicting
     uint64_t fillsDeferred{0}; // first-miss fills the doorkeeper only recorded
 };
 
@@ -151,9 +152,9 @@ public:
     // read miss can go to the store by seqno (SeqnoHint).
     virtual void EnableSeqnoIndex() {}
 
-    // The index never evicts. Past maxBytes it records no new keys (their
-    // reads use the store's key lookup); keys already in it stay current.
-    // 0: unbounded.
+    // Past maxBytes the index evicts the least recently read keys (CLOCK);
+    // their reads use the store's key lookup until a write indexes them
+    // again. 0: unbounded.
     virtual void SetSeqnoIndexCap(size_t maxBytes) {
         (void)maxBytes;
     }

@@ -28,6 +28,9 @@ constexpr uint8_t kMaxFreq = 3;
 enum Queue : uint8_t { kSmall = 0, kMain = 1 };
 // Set on a seqno-index value whose latest write was a delete.
 constexpr uint64_t kSeqnoDeleted = uint64_t(1) << 63;
+// Set on a seqno-index value read since the eviction hand last passed it.
+constexpr uint64_t kSeqnoUsed = uint64_t(1) << 62;
+constexpr uint64_t kSeqnoFlags = kSeqnoDeleted | kSeqnoUsed;
 
 // Read-path counters, one cache-line-aligned slot per thread. A single atomic
 // per shard is still a contended RMW on every lookup; giving each thread its
@@ -403,13 +406,14 @@ struct S3FifoCache::Shard {
     folly::F14FastMap<uint64_t, SeqEntry> seqIdx;
     size_t seqCap{0}; // 0: unbounded
     size_t seqBytes{0}; // seqIdx's allocation
+    uint64_t seqEvictions{0};
     uint64_t seqRejected{0};
+    uint64_t seqHand{0}; // CLOCK position: the key to resume from
+    bool seqHandSet{false};
 
-    // A key without an entry gets no hint, which is always safe, so past the
-    // cap new keys are left out rather than old ones evicted. A full table
-    // doubles on insert with both allocations live while it moves, so the
-    // check is on that peak, not the current size.
-    bool admitSeq() const {
+    // A full table doubles on insert with both allocations live while it
+    // moves, so the cap is checked against that peak.
+    bool seqFits() const {
         if (seqCap == 0) {
             return true;
         }
@@ -417,24 +421,64 @@ struct S3FifoCache::Shard {
         return (grows ? 3 * seqBytes : seqBytes) <= seqCap;
     }
 
+    // CLOCK: a used entry loses its bit and is passed over once; the scan is
+    // bounded, so a table of hot keys still yields a victim.
+    void evictSeq() {
+        auto it = seqHandSet ? seqIdx.find(seqHand) : seqIdx.end();
+        for (int n = 0; n < 64; n++) {
+            if (it == seqIdx.end()) {
+                it = seqIdx.begin();
+            }
+            if (!(it->second.seqno & kSeqnoUsed)) {
+                break;
+            }
+            it->second.seqno &= ~kSeqnoUsed;
+            ++it;
+        }
+        if (it == seqIdx.end()) {
+            it = seqIdx.begin();
+        }
+        auto next = std::next(it);
+        seqHandSet = next != seqIdx.end();
+        if (seqHandSet) {
+            seqHand = next->first;
+        }
+        seqIdx.erase(it);
+        seqEvictions++;
+    }
+
+    // admit: whether a key without an entry may get one. A read fill's
+    // seqno can predate a write applied while the read was in flight; with
+    // the key's entry still present that write's higher seqno wins, but once
+    // entries are evicted it may be gone, and magma serves whatever doc the
+    // hint names. So read fills only add keys to a shard that never evicted.
     void noteSeqno(uint64_t h,
                    uint64_t seqno,
                    bool deleted,
-                   uint64_t valuePtr = 0) {
+                   uint64_t valuePtr = 0,
+                   bool admit = true) {
         std::lock_guard g(seqMu);
         auto it = seqIdx.find(h);
         if (it == seqIdx.end()) {
-            if (!admitSeq()) {
+            if (!admit && seqEvictions > 0) {
                 seqRejected++;
                 return;
+            }
+            if (!seqFits()) {
+                if (seqIdx.empty()) {
+                    seqRejected++;
+                    return;
+                }
+                evictSeq();
             }
             it = seqIdx.emplace(h, SeqEntry{}).first;
             seqBytes = seqIdx.getAllocatedMemorySize();
         }
         auto& v = it->second;
-        const uint64_t cur = v.seqno & ~kSeqnoDeleted;
+        const uint64_t cur = v.seqno & ~kSeqnoFlags;
         if (seqno > cur || (seqno == cur && deleted)) {
-            v.seqno = deleted ? (seqno | kSeqnoDeleted) : seqno;
+            v.seqno = (deleted ? (seqno | kSeqnoDeleted) : seqno) |
+                      (v.seqno & kSeqnoUsed);
             v.valuePtr = deleted ? 0 : valuePtr;
         } else if (seqno == cur && valuePtr != 0 &&
                    !(v.seqno & kSeqnoDeleted)) {
@@ -767,7 +811,7 @@ void S3FifoCache::PutIfAbsent(uint16_t vbid,
     auto& s = shardFor(h);
     MapKeyBuf mk(vbid, key);
     if (seqnoIndex_ && seqno != 0) {
-        s.noteSeqno(h, seqno, false);
+        s.noteSeqno(h, seqno, false, 0, /*admit=*/false);
     }
     {
         // Cheap reject under the shared lock; the common case after a burst
@@ -869,7 +913,7 @@ void S3FifoCache::NoteValuePtr(uint16_t vbid,
     auto& s = shardFor(h);
     std::lock_guard g(s.seqMu);
     auto it = s.seqIdx.find(h);
-    if (it != s.seqIdx.end() && it->second.seqno == seqno) {
+    if (it != s.seqIdx.end() && (it->second.seqno & ~kSeqnoUsed) == seqno) {
         it->second.valuePtr = valuePtr;
     }
 }
@@ -893,7 +937,8 @@ uint64_t S3FifoCache::SeqnoHint(uint16_t vbid,
     if (valuePtr) {
         *valuePtr = it->second.valuePtr;
     }
-    return it->second.seqno;
+    it->second.seqno |= kSeqnoUsed;
+    return it->second.seqno & ~kSeqnoFlags;
 }
 
 DocCacheStats S3FifoCache::GetStats() const {
@@ -913,6 +958,7 @@ DocCacheStats S3FifoCache::GetStats() const {
             st.seqnoIndexItems += s.seqIdx.size();
             st.seqnoIndexBytes += s.seqBytes;
             st.seqnoIndexRejected += s.seqRejected;
+            st.seqnoIndexEvictions += s.seqEvictions;
         }
         std::shared_lock lock(s.mu);
         st.puts += s.puts;

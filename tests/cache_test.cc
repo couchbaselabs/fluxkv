@@ -334,26 +334,33 @@ void testSeqnoIndexCap() {
     c->EnableSeqnoIndex();
     const size_t cap = 256 * 1024;
     c->SetSeqnoIndexCap(cap);
+    // k0 is read after every write, so the eviction hand keeps passing it.
     const int n = 200000;
     for (int i = 0; i < n; i++) {
         c->NoteSeqno(0, "k" + std::to_string(i), 10, false);
+        CHECK(c->SeqnoHint(0, "k0") == 10);
     }
     auto st = c->GetStats();
     CHECK(st.seqnoIndexBytes > 0 && st.seqnoIndexBytes <= cap);
-    CHECK(st.seqnoIndexRejected > 0);
-    CHECK(st.seqnoIndexItems + st.seqnoIndexRejected == uint64_t(n));
+    CHECK(st.seqnoIndexEvictions > 0);
+    CHECK(st.seqnoIndexItems + st.seqnoIndexEvictions == uint64_t(n));
+    CHECK(c->SeqnoHint(0, "k" + std::to_string(n - 1)) == 10);
+    CHECK(c->SeqnoHint(0, "k1") == 0);
 
-    // Indexed keys stay current; a key left out gets no hint.
-    CHECK(c->SeqnoHint(0, "k0") == 10);
+    // Indexed keys stay current, deletes included.
     c->NoteSeqno(0, "k0", 11, false);
     CHECK(c->SeqnoHint(0, "k0") == 11);
     c->NoteSeqno(0, "k0", 12, true);
     CHECK(c->SeqnoHint(0, "k0") == 0);
-    int unhinted = 0;
-    for (int i = 0; i < n; i++) {
-        unhinted += c->SeqnoHint(0, "k" + std::to_string(i)) == 0;
-    }
-    CHECK(uint64_t(unhinted) == st.seqnoIndexRejected + 1);
+
+    // Once evicting, a read fill may carry a seqno older than an evicted
+    // write's, so it does not index a new key; it still raises a present one.
+    c->PutIfAbsent(0, "k1", "old", 5, 0, 0, 0);
+    CHECK(c->SeqnoHint(0, "k1") == 0);
+    CHECK(c->GetStats().seqnoIndexRejected == st.seqnoIndexRejected + 1);
+    const std::string last = "k" + std::to_string(n - 1);
+    c->PutIfAbsent(0, last, "new", 20, 0, 0, 0);
+    CHECK(c->SeqnoHint(0, last) == 20);
     CHECK(c->GetStats().seqnoIndexBytes == st.seqnoIndexBytes);
     std::puts("seqno index cap: ok");
 }

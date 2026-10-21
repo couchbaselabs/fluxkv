@@ -140,7 +140,7 @@ struct Config {
     size_t cacheShards = 256;
     std::string cachePolicy = "s3fifo";
     bool cacheSeqnoIndex = false;
-    size_t cacheSeqnoIndexMax = 0; // 0: (mem-quota + cache-size) / 4
+    size_t cacheSeqnoIndexMax = 0; // 0: (mem-quota + cache-size) / 2
     bool cacheFillDoorkeeper = false;
     bool cacheValuePtr = false;
     bool streamReaders = false;
@@ -364,8 +364,8 @@ static void printUsage(const char* prog) {
                  "value is evicted; read misses go to magma by seqno (needs --cache-size).\n"
                  "                        Its memory comes out of the doc cache budget (down to "
                  "1/8), then magma's quota\n"
-              << "  --cache-seqno-index-max N  bytes the seqno index may hold; past it new keys "
-                 "are not indexed (default (mem-quota + cache-size) / 4)\n"
+              << "  --cache-seqno-index-max N  bytes the seqno index may hold; past it the least "
+                 "recently read keys are evicted (default (mem-quota + cache-size) / 2)\n"
               << "  --cache-fill-doorkeeper  a read miss stores the value only if the "
                  "key missed recently (needs --cache-size)\n"
               << "  --direct-send         readers write GET responses to the socket "
@@ -1358,7 +1358,7 @@ int main(int argc, char* argv[]) {
         if (cfg.cacheSeqnoIndex) {
             cache->EnableSeqnoIndex();
             if (cfg.cacheSeqnoIndexMax == 0) {
-                cfg.cacheSeqnoIndexMax = (cfg.memQuota + cfg.cacheSize) / 4;
+                cfg.cacheSeqnoIndexMax = (cfg.memQuota + cfg.cacheSize) / 2;
             }
             cache->SetSeqnoIndexCap(cfg.cacheSeqnoIndexMax);
             gCacheSeqnoIndex = true;
