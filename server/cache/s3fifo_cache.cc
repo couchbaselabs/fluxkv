@@ -7,6 +7,7 @@
 #include <folly/hash/SpookyHashV2.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <deque>
@@ -402,32 +403,45 @@ struct S3FifoCache::Shard {
         uint64_t seqno{0};
         uint64_t valuePtr{0};
     };
+    // A table doubles when full, so one table per shard could only fill
+    // half its cap (1B keys stopped at 20.4 GB under a 50.5 GiB cap). Split
+    // by hash, each part doubles alone, a 1/(parts x shards) step.
+    static constexpr size_t kSeqParts = 64;
+    struct SeqPart {
+        folly::F14FastMap<uint64_t, SeqEntry> map;
+        size_t bytes{0}; // map's allocation
+        uint64_t hand{0}; // CLOCK position: the key to resume from
+        bool handSet{false};
+    };
     std::mutex seqMu;
-    folly::F14FastMap<uint64_t, SeqEntry> seqIdx;
+    std::array<SeqPart, kSeqParts> seqParts;
     size_t seqCap{0}; // 0: unbounded
-    size_t seqBytes{0}; // seqIdx's allocation
+    size_t seqBytes{0}; // all parts' allocations
     uint64_t seqEvictions{0};
     uint64_t seqRejected{0};
-    uint64_t seqHand{0}; // CLOCK position: the key to resume from
-    bool seqHandSet{false};
 
-    // A full table doubles on insert with both allocations live while it
+    SeqPart& seqPart(uint64_t h) {
+        return seqParts[(h >> 40) % kSeqParts];
+    }
+
+    // A full part doubles on insert with both allocations live while it
     // moves, so the cap is checked against that peak.
-    bool seqFits() const {
+    bool seqFits(const SeqPart& p) const {
         if (seqCap == 0) {
             return true;
         }
-        const bool grows = seqIdx.size() >= seqIdx.bucket_count();
-        return (grows ? 3 * seqBytes : seqBytes) <= seqCap;
+        const bool grows = p.map.size() >= p.map.bucket_count();
+        return seqBytes + (grows ? 2 * p.bytes : 0) <= seqCap;
     }
 
     // CLOCK: a used entry loses its bit and is passed over once; the scan is
-    // bounded, so a table of hot keys still yields a victim.
-    void evictSeq() {
-        auto it = seqHandSet ? seqIdx.find(seqHand) : seqIdx.end();
+    // bounded, so a part of hot keys still yields a victim.
+    void evictSeq(SeqPart& p) {
+        auto& m = p.map;
+        auto it = p.handSet ? m.find(p.hand) : m.end();
         for (int n = 0; n < 64; n++) {
-            if (it == seqIdx.end()) {
-                it = seqIdx.begin();
+            if (it == m.end()) {
+                it = m.begin();
             }
             if (!(it->second.seqno & kSeqnoUsed)) {
                 break;
@@ -435,15 +449,15 @@ struct S3FifoCache::Shard {
             it->second.seqno &= ~kSeqnoUsed;
             ++it;
         }
-        if (it == seqIdx.end()) {
-            it = seqIdx.begin();
+        if (it == m.end()) {
+            it = m.begin();
         }
         auto next = std::next(it);
-        seqHandSet = next != seqIdx.end();
-        if (seqHandSet) {
-            seqHand = next->first;
+        p.handSet = next != m.end();
+        if (p.handSet) {
+            p.hand = next->first;
         }
-        seqIdx.erase(it);
+        m.erase(it);
         seqEvictions++;
     }
 
@@ -458,21 +472,24 @@ struct S3FifoCache::Shard {
                    uint64_t valuePtr = 0,
                    bool admit = true) {
         std::lock_guard g(seqMu);
-        auto it = seqIdx.find(h);
-        if (it == seqIdx.end()) {
+        auto& p = seqPart(h);
+        auto it = p.map.find(h);
+        if (it == p.map.end()) {
             if (!admit && seqEvictions > 0) {
                 seqRejected++;
                 return;
             }
-            if (!seqFits()) {
-                if (seqIdx.empty()) {
+            if (!seqFits(p)) {
+                if (p.map.empty()) {
                     seqRejected++;
                     return;
                 }
-                evictSeq();
+                evictSeq(p);
             }
-            it = seqIdx.emplace(h, SeqEntry{}).first;
-            seqBytes = seqIdx.getAllocatedMemorySize();
+            it = p.map.emplace(h, SeqEntry{}).first;
+            const size_t b = p.map.getAllocatedMemorySize();
+            seqBytes += b - p.bytes;
+            p.bytes = b;
         }
         auto& v = it->second;
         const uint64_t cur = v.seqno & ~kSeqnoFlags;
@@ -912,8 +929,9 @@ void S3FifoCache::NoteValuePtr(uint16_t vbid,
     uint64_t h = hashKey(vbid, key);
     auto& s = shardFor(h);
     std::lock_guard g(s.seqMu);
-    auto it = s.seqIdx.find(h);
-    if (it != s.seqIdx.end() && (it->second.seqno & ~kSeqnoUsed) == seqno) {
+    auto& m = s.seqPart(h).map;
+    auto it = m.find(h);
+    if (it != m.end() && (it->second.seqno & ~kSeqnoUsed) == seqno) {
         it->second.valuePtr = valuePtr;
     }
 }
@@ -930,8 +948,9 @@ uint64_t S3FifoCache::SeqnoHint(uint16_t vbid,
     uint64_t h = hashKey(vbid, key);
     auto& s = shardFor(h);
     std::lock_guard g(s.seqMu);
-    auto it = s.seqIdx.find(h);
-    if (it == s.seqIdx.end() || (it->second.seqno & kSeqnoDeleted)) {
+    auto& m = s.seqPart(h).map;
+    auto it = m.find(h);
+    if (it == m.end() || (it->second.seqno & kSeqnoDeleted)) {
         return 0;
     }
     if (valuePtr) {
@@ -955,7 +974,9 @@ DocCacheStats S3FifoCache::GetStats() const {
         st.pendingItems += s.pendingItems.load(std::memory_order_relaxed);
         {
             std::lock_guard g(s.seqMu);
-            st.seqnoIndexItems += s.seqIdx.size();
+            for (const auto& p : s.seqParts) {
+                st.seqnoIndexItems += p.map.size();
+            }
             st.seqnoIndexBytes += s.seqBytes;
             st.seqnoIndexRejected += s.seqRejected;
             st.seqnoIndexEvictions += s.seqEvictions;

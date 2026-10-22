@@ -332,16 +332,17 @@ void testSharedValue() {
 void testSeqnoIndexCap() {
     auto c = make(1 << 20, 4);
     c->EnableSeqnoIndex();
-    const size_t cap = 256 * 1024;
+    const size_t cap = 4 << 20;
     c->SetSeqnoIndexCap(cap);
     // k0 is read after every write, so the eviction hand keeps passing it.
-    const int n = 200000;
+    const int n = 400000;
     for (int i = 0; i < n; i++) {
         c->NoteSeqno(0, "k" + std::to_string(i), 10, false);
         CHECK(c->SeqnoHint(0, "k0") == 10);
     }
     auto st = c->GetStats();
-    CHECK(st.seqnoIndexBytes > 0 && st.seqnoIndexBytes <= cap);
+    // Fills the cap, not just the half a single doubling table would reach.
+    CHECK(st.seqnoIndexBytes > cap * 3 / 4 && st.seqnoIndexBytes <= cap);
     CHECK(st.seqnoIndexEvictions > 0);
     CHECK(st.seqnoIndexItems + st.seqnoIndexEvictions == uint64_t(n));
     CHECK(c->SeqnoHint(0, "k" + std::to_string(n - 1)) == 10);
