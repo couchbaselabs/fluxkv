@@ -1475,27 +1475,6 @@ int main(int argc, char* argv[]) {
         spdlog::info("  sync-interval: every kvstore within {} ms", cfg.syncIntervalMs);
     }
 
-    // Magma's quota per shard is --mem-quota's share, plus the memory
-    // governor's boost, minus what the seqno index holds beyond the doc
-    // cache's share. Both governors set it through here.
-    const int64_t baseQuota = int64_t(cfg.memQuota / cfg.shards);
-    std::atomic<int64_t> quotaExtra{0};
-    std::atomic<int64_t> quotaCharge{0};
-    std::mutex quotaMu;
-    auto setMagmaQuota = [&](bool shrink) {
-        std::lock_guard g(quotaMu);
-        const int64_t q = std::max(baseQuota / 4,
-                                   baseQuota + quotaExtra.load() - quotaCharge.load());
-        for (size_t i = 0; i < cfg.shards; i++) {
-            bucket.GetShard(uint16_t(i)).GetMagma()->SetMemoryQuota(size_t(q), shrink);
-        }
-        if (shrink) {
-            // Evicted blocks stay resident in jemalloc dirty pages for its
-            // decay time unless purged.
-            je_mallctl("arena.4096.purge", nullptr, nullptr, nullptr, 0);
-        }
-    };
-
     std::thread seqIdxThread;
     if (cfg.cacheSeqnoIndex && bucket.GetCache()) {
         seqIdxThread = std::thread([&] {
@@ -1503,7 +1482,8 @@ int main(int argc, char* argv[]) {
             // (~37 B a key with F14's headroom: 1B keys OOM-killed a 100 GiB
             // cgroup). It is charged to the memory budget: first the doc
             // cache's budget, down to an eighth of --cache-size, then magma's
-            // quota, which shrinks the block cache first. The doc cache keeps
+            // block cache; the write cache and bloom filters keep their share
+            // (a smaller write cache slows loads). The doc cache keeps
             // at least the write queue's size: queued writes are pinned in it,
             // and below that every insert scanned them for a victim (a load
             // fell from 3.5M to 10K SETs/s at 128 MB under a 1 GB queue).
@@ -1526,8 +1506,13 @@ int main(int argc, char* argv[]) {
                 const int64_t over = idx - fromCache;
                 if (over - charged >= step) {
                     charged = over;
-                    quotaCharge.store(over / int64_t(cfg.shards));
-                    setMagmaQuota(true);
+                    for (size_t i = 0; i < cfg.shards; i++) {
+                        bucket.GetShard(uint16_t(i)).GetMagma()->SetBlockCacheReserve(
+                                size_t(over) / cfg.shards, true);
+                    }
+                    // Evicted blocks stay resident in jemalloc dirty pages
+                    // for its decay time unless purged.
+                    je_mallctl("arena.4096.purge", nullptr, nullptr, nullptr, 0);
                 }
             }
         });
@@ -1543,7 +1528,7 @@ int main(int argc, char* argv[]) {
             // blocks cached, a full block cache plus overwrite memtables
             // outgrew the cgroup at the base quota itself.
             const int64_t mb = 1024 * 1024;
-            const int64_t base = baseQuota;
+            const int64_t base = int64_t(cfg.memQuota / cfg.shards);
             const int64_t maxExtra = int64_t(cfg.readBoostMB) * mb / int64_t(cfg.shards);
             const int64_t minExtra = -base / 2;
             const int64_t step = std::max<int64_t>(maxExtra / 16, mb);
@@ -1567,8 +1552,15 @@ int main(int argc, char* argv[]) {
             int64_t extra = 0;
             auto apply = [&](int64_t e, bool shrink) {
                 extra = e;
-                quotaExtra.store(e);
-                setMagmaQuota(shrink);
+                for (size_t i = 0; i < cfg.shards; i++) {
+                    bucket.GetShard(uint16_t(i)).GetMagma()->SetMemoryQuota(
+                            size_t(base + extra), shrink);
+                }
+                if (shrink) {
+                    // Evicted blocks stay resident in jemalloc dirty pages
+                    // for its decay time unless purged.
+                    je_mallctl("arena.4096.purge", nullptr, nullptr, nullptr, 0);
+                }
             };
             uint64_t last = 0;
             auto lastWrite = std::chrono::steady_clock::now();
