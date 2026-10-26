@@ -2384,8 +2384,13 @@ void Bucket::FlushStaged() {
 
 void Bucket::EnqueueRead(Request* req) {
     hotStatAdd(gDispStats.queuedGets);
-    auto& shard = GetShard(req->vbucket);
-    auto& vbq = shard.GetVBReadQueue(req->vbucket);
+    // Read before the push: once req is in the list, the vbucket's owner can
+    // answer and recycle it before this thread arms a reader, and a vbid read
+    // from it then sends the task to another vbucket while this one keeps an
+    // owner slot no task holds.
+    const uint16_t vbid = req->vbucket;
+    auto& shard = GetShard(vbid);
+    auto& vbq = shard.GetVBReadQueue(vbid);
 
     if (gTraceLatency) {
         req->tReadEnqueue = steadyNowNs();
@@ -2415,7 +2420,7 @@ void Bucket::EnqueueRead(Request* req) {
         }
         if (vbq.readOwners.compare_exchange_weak(
                     owners, owners + 1, std::memory_order_seq_cst)) {
-            shard.GetReaderPool()->Submit({&shard, req->vbucket});
+            shard.GetReaderPool()->Submit({&shard, vbid});
             return;
         }
     }
