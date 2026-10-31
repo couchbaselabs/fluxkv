@@ -114,6 +114,7 @@ struct Config {
     bool indexBlockAutoTune = false; // keep physical index block ~= target
     bool align512 = false; // 512-byte block-padding (NVMe logical sector)
     bool noHotStats = false; // disable per-op stat atomics
+    bool asyncReads = false; // reads on magma's reader pool (GetDocsAsync)
     size_t magmaReaders = 0; // magma reader pool threads; 0 = magma default
     bool noBlockCache = false; // disable EnableDataBlockCaching entirely
     bool noCompression = false; // SSTables write & read uncompressed
@@ -346,6 +347,7 @@ static void printUsage(const char* prog) {
                  "fast path (forces a full seqIndex lookup per GET)\n"
               << "  --value-ptr-write     store value pointers in the key "
                  "index (default off; --no-value-ptr-write is the default)\n"
+              << "  --async-reads             read on magma's reader pool (GetDocsAsync)\n"
               << "  --magma-readers N         magma reader pool threads (default: one per CPU)\n"
               << "  --no-learned-seq-locator  locate seqIndex data blocks "
                  "through their index blocks (default: learned model)\n"
@@ -521,6 +523,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"enable-index-block-autotuning", no_argument, nullptr, 1011},
             {"align-512", no_argument, nullptr, 1004},
             {"no-hot-stats", no_argument, nullptr, 1005},
+            {"async-reads", no_argument, nullptr, 1400},
             {"magma-readers", required_argument, nullptr, 1401},
             {"no-block-cache", no_argument, nullptr, 1006},
             {"no-compression", no_argument, nullptr, 1007},
@@ -706,6 +709,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1100:
             cfg.learnedSeqLocator = true;
+            break;
+        case 1400:
+            cfg.asyncReads = true;
             break;
         case 1401:
             cfg.magmaReaders = strtoull(optarg, nullptr, 10);
@@ -1012,6 +1018,7 @@ int main(int argc, char* argv[]) {
     magmaCfg.BlockCacheNumPartitions =
             std::max<size_t>(64, 4 * cfg.readers);
     kvserver::gMaxReadBatch = cfg.maxReadBatch;
+    kvserver::gAsyncReads = cfg.asyncReads;
     if (cfg.magmaReaders) {
         magma::Magma::SetNumThreads(magma::Magma::ThreadType::Reader,
                                     cfg.magmaReaders);

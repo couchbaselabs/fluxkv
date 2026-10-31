@@ -121,6 +121,9 @@ extern bool gCacheSeqnoIndex;
 extern bool gCacheValuePtr;
 // Runtime read-batch cap (set from main via --max-read-batch).
 extern size_t gMaxReadBatch;
+// Reads go to magma's reader pool (GetDocsAsync) instead of blocking the
+// reader thread in GetDocs/GetDocsMulti (--async-reads).
+extern bool gAsyncReads;
 // Max concurrent owners one vbucket's reads can have (--max-read-owners).
 // 1 keeps the old single-owner behavior.
 extern uint32_t gMaxReadOwners;
@@ -792,6 +795,8 @@ private:
     // device reads are in flight together (a one-request batch otherwise
     // costs a reader thread per outstanding read).
     size_t executeReadMulti(std::vector<ReadTask>& tasks);
+    // --async-reads: submit the tasks' reads to magma's reader pool.
+    size_t submitReadsAsync(std::vector<ReadTask>& tasks);
 
     std::vector<std::unique_ptr<Worker>> workers_;
     std::atomic<size_t> live_{0};

@@ -1,5 +1,6 @@
 #include "engine.h"
 
+#include <thread>
 #include <pthread.h>
 
 #include <algorithm>
@@ -49,6 +50,7 @@ bool gCacheValuePtr = false;
 // libaio + IOQueueDepth=16 sweet spot; lower (8-16) is better for sync
 // QD=1 multi-thread parallelism.
 size_t gMaxReadBatch = 128;
+bool gAsyncReads = false;
 uint32_t gMaxReadOwners = 1;
 std::atomic<uint64_t> gMaxReadQueueAgeNs{0};
 std::atomic<uint32_t> gMaxReadRequeues{0};
@@ -1777,6 +1779,10 @@ void ReaderPool::collectRead(ReadTask& task, std::vector<Request*>& batch) {
 }
 
 size_t ReaderPool::executeRead(ReadTask& task) {
+    if (gAsyncReads) {
+        std::vector<ReadTask> tasks{task};
+        return submitReadsAsync(tasks);
+    }
     auto* shard = task.shard;
     auto& vbq = shard->GetVBReadQueue(task.vbid);
     Magma::FetchBuffer idxBuf, seqBuf;
@@ -1877,7 +1883,110 @@ size_t ReaderPool::executeRead(ReadTask& task) {
     return batch.size();
 }
 
+namespace {
+// One GetDocsAsync call: owns the operations and the requests waiting on each
+// key until magma calls OnDone. Responses go through the reader thread's
+// accumulator, flushed when the thread finishes its part of the call.
+class AsyncReadCall final : public Magma::GetDocsHandler {
+public:
+    struct KeyReqs {
+        uint16_t vbid;
+        std::vector<Request*> reqs;
+    };
+
+    AsyncReadCall(Bucket* bucket, size_t batches)
+        : bucket(bucket), getOps(batches) {
+    }
+
+    void OnDoc(const Status& s,
+               const Magma::GetOperation& op,
+               const Slice& meta,
+               const Slice& value) override {
+        auto* kr = static_cast<KeyReqs*>(op.UserContext);
+        completeGets(bucket, kr->vbid, kr->reqs, s, meta, value, accum());
+    }
+
+    void OnJobDone() override {
+        accum().FlushAll();
+    }
+
+    void OnDone() override {
+        delete this;
+    }
+
+    static DispatchAccum& accum() {
+        thread_local DispatchAccum a;
+        return a;
+    }
+
+    Bucket* bucket;
+    std::deque<KeyReqs> keyReqs; // stable addresses for UserContext
+    std::vector<OperationsList<Magma::GetOperation>> getOps;
+};
+} // namespace
+
+size_t ReaderPool::submitReadsAsync(std::vector<ReadTask>& tasks) {
+    auto* shard = tasks.front().shard;
+    auto* call = new AsyncReadCall(bucket_, tasks.size());
+    std::vector<Magma::AsyncGets> gets;
+    gets.reserve(tasks.size());
+    std::vector<Request*> batch;
+    size_t served = 0;
+    for (size_t i = 0; i < tasks.size(); i++) {
+        batch.clear();
+        batch.reserve(gMaxReadBatch);
+        collectRead(tasks[i], batch);
+        if (batch.empty()) {
+            continue;
+        }
+        served += batch.size();
+        // Deduped by key, as executeRead does.
+        folly::F14FastMap<std::string_view, AsyncReadCall::KeyReqs*> byKey;
+        for (auto* req : batch) {
+            std::string_view k(reinterpret_cast<const char*>(req->key.Data()),
+                               req->key.Len());
+            auto& slot = byKey[k];
+            if (!slot) {
+                call->keyReqs.push_back(AsyncReadCall::KeyReqs{tasks[i].vbid, {}});
+                slot = &call->keyReqs.back();
+                call->getOps[i].Add(Magma::GetOperation(req->key, slot));
+            }
+            slot->reqs.push_back(req);
+        }
+        gets.push_back({shard->GetMagma(), tasks[i].vbid, &call->getOps[i]});
+        // The call owns the requests now; the vbucket may take more reads.
+        releaseReadVBQueue(shard->GetVBReadQueue(tasks[i].vbid),
+                           taskQueue_,
+                           ReadTask{shard, tasks[i].vbid, nowNs()});
+    }
+    if (gets.empty()) {
+        delete call;
+        return served;
+    }
+    for (;;) {
+        auto status = Magma::GetDocsAsync(gets, *call);
+        if (status) {
+            break;
+        }
+        if (status.ErrorCode() != Status::RetryLater) {
+            // Shutting down: fail every read of the call.
+            for (auto& kr : call->keyReqs) {
+                completeGets(bucket_, kr.vbid, kr.reqs, status, {}, {},
+                             AsyncReadCall::accum());
+            }
+            AsyncReadCall::accum().FlushAll();
+            delete call;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    return served;
+}
+
 size_t ReaderPool::executeReadMulti(std::vector<ReadTask>& tasks) {
+    if (gAsyncReads) {
+        return submitReadsAsync(tasks);
+    }
     auto* shard = tasks.front().shard;
     struct KeyReqs {
         uint16_t vbid;
