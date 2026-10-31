@@ -63,7 +63,6 @@ BatchSort gBatchSort = BatchSort::Auto;
 bool gAsyncDurable = false;
 bool gCompactMeta = false;
 bool gTraceLatency = false;
-bool gStreamReaders = false;
 bool gDirectSend = false;
 std::atomic<uint64_t> gDirectSends{0};
 std::atomic<uint64_t> gDirectSpills{0};
@@ -1398,13 +1397,6 @@ ReaderPool::~ReaderPool() {
 void ReaderPool::Submit(ReadTask task) {
     task.enqueuedNs = nowNs();
     taskQueue_.blockingWrite(std::move(task));
-    if (sleeperEfd_.load(std::memory_order_seq_cst) >= 0) {
-        const int fd = sleeperEfd_.exchange(-1, std::memory_order_seq_cst);
-        if (fd >= 0) {
-            const uint64_t one = 1;
-            (void)::write(fd, &one, sizeof(one));
-        }
-    }
 }
 
 void ReaderPool::spawn() {
@@ -1412,11 +1404,7 @@ void ReaderPool::spawn() {
     auto* self = w.get();
     w->thread = std::thread([this, self]() {
         pthread_setname_np(pthread_self(), "fx:reader");
-        if (gStreamReaders) {
-            streamLoop(self);
-        } else {
-            workerLoop(self);
-        }
+        workerLoop(self);
     });
     workers_.push_back(std::move(w));
     live_.fetch_add(1, std::memory_order_relaxed);
@@ -1553,122 +1541,6 @@ static void completeGets(Bucket* bucket_,
                          const Slice& meta,
                          const Slice& value,
                          DispatchAccum& accum);
-
-void ReaderPool::streamLoop(Worker* self) {
-    static const size_t kMaxInflight = []() {
-        const char* e = std::getenv("FLUXKV_STREAM_INFLIGHT");
-        return e ? size_t(std::max(1, std::atoi(e))) : size_t(256);
-    }();
-    static const size_t kWaitMin = []() {
-        const char* e = std::getenv("FLUXKV_STREAM_WAIT_MIN");
-        return e ? size_t(std::max(1, std::atoi(e))) : size_t(8);
-    }();
-    static const uint64_t kWaitUs = []() {
-        const char* e = std::getenv("FLUXKV_STREAM_WAIT_US");
-        return e ? uint64_t(std::max(1, std::atoi(e))) : uint64_t(150);
-    }();
-    thread_local DispatchAccum accum;
-    thread_local std::vector<Request*> one(1);
-    Magma* magma = nullptr;
-    int efd = -1;
-    size_t inflight = 0;
-    bool stop = false;
-    auto& acct = acct_[statSlot()];
-    std::vector<Request*> batch;
-    while (!shutdown_.load(std::memory_order_relaxed)) {
-        const uint64_t tWake = nowNs();
-        bool took = false;
-        // Block on the queue only with nothing in flight.
-        while (!stop && inflight < kMaxInflight) {
-            ReadTask task;
-            if (inflight == 0 && !took) {
-                taskQueue_.blockingRead(task);
-            } else if (!taskQueue_.read(task)) {
-                break;
-            }
-            if (!task.shard) {
-                stop = true; // stop or retire, after what is in flight
-                break;
-            }
-            took = true;
-            auto* shard = task.shard;
-            if (magma == nullptr) {
-                magma = shard->GetMagma();
-                efd = magma->ReadEventFd();
-            }
-            const uint64_t t0 = nowNs();
-            batch.clear();
-            collectRead(task, batch);
-            if (batch.empty()) {
-                continue; // collectRead released the queue
-            }
-            const uint16_t vbid = task.vbid;
-            for (auto* req : batch) {
-                Magma::GetOperation op(req->key, req);
-                if (gCacheSeqnoIndex) {
-                    op.SeqnoHint = gDocCache->SeqnoHint(
-                            vbid,
-                            std::string_view(req->key.Data(), req->key.Len()),
-                            gCacheValuePtr ? &op.ValuePtrHint : nullptr);
-                }
-                auto st = shard->GetMagma()->GetDocAsync(
-                        vbid,
-                        op,
-                        [this, vbid](Status s,
-                                     const Magma::GetOperation& op,
-                                     const Slice& meta,
-                                     const Slice& value) {
-                            learnValuePtr(vbid, op, s, meta);
-                            one[0] = static_cast<Request*>(op.UserContext);
-                            completeGets(bucket_, vbid, one, s, meta, value, accum);
-                        });
-                if (st) {
-                    inflight++;
-                } else {
-                    one[0] = req;
-                    completeGets(bucket_, vbid, one, st, Slice(), Slice(), accum);
-                }
-            }
-            // The vbucket's next requests need not wait for these reads.
-            releaseReadVBQueue(shard->GetVBReadQueue(vbid),
-                               taskQueue_,
-                               ReadTask{shard, vbid, nowNs()});
-            acct.waitNs.fetch_add(t0 - task.enqueuedNs, std::memory_order_relaxed);
-            acct.tasks.fetch_add(1, std::memory_order_relaxed);
-            acct.items.fetch_add(batch.size(), std::memory_order_relaxed);
-        }
-        if (magma != nullptr) {
-            inflight = magma->PumpReads();
-            accum.FlushAll();
-        }
-        acct.busyNs.fetch_add(nowNs() - tWake, std::memory_order_relaxed);
-        if (stop && inflight == 0) {
-            break;
-        }
-        if (inflight > 0 && !took && kWaitMin > 1) {
-            // One wakeup for several completions; new work waits at most
-            // the timeout.
-            magma->WaitReads(static_cast<unsigned>(std::min(kWaitMin, inflight)),
-                             kWaitUs);
-        } else if (inflight > 0 && !took && efd >= 0) {
-            // Park until a completion or new work (Submit writes the same
-            // eventfd). Publish first, then re-check the queue: work
-            // queued before the publish would otherwise wait the timeout.
-            sleeperEfd_.store(efd, std::memory_order_seq_cst);
-            if (taskQueue_.isEmpty()) {
-                pollfd p{efd, POLLIN, 0};
-                const timespec ts{0, 1'000'000};
-                if (::ppoll(&p, 1, &ts, nullptr) > 0) {
-                    uint64_t v;
-                    (void)::read(efd, &v, sizeof(v));
-                }
-            }
-            int mine = efd;
-            sleeperEfd_.compare_exchange_strong(mine, -1, std::memory_order_seq_cst);
-        }
-    }
-    self->done.store(true, std::memory_order_release);
-}
 
 // Takes this vbucket's next batch (overflow first, then one sweep) and
 // accounts it. An empty batch has already released the queue.
@@ -1903,6 +1775,7 @@ public:
                const Slice& meta,
                const Slice& value) override {
         auto* kr = static_cast<KeyReqs*>(op.UserContext);
+        learnValuePtr(kr->vbid, op, s, meta);
         completeGets(bucket, kr->vbid, kr->reqs, s, meta, value, accum());
     }
 
@@ -1949,7 +1822,14 @@ size_t ReaderPool::submitReadsAsync(std::vector<ReadTask>& tasks) {
             if (!slot) {
                 call->keyReqs.push_back(AsyncReadCall::KeyReqs{tasks[i].vbid, {}});
                 slot = &call->keyReqs.back();
-                call->getOps[i].Add(Magma::GetOperation(req->key, slot));
+                Magma::GetOperation op(req->key, slot);
+                if (gCacheSeqnoIndex) {
+                    op.SeqnoHint = gDocCache->SeqnoHint(
+                            tasks[i].vbid,
+                            std::string_view(req->key.Data(), req->key.Len()),
+                            gCacheValuePtr ? &op.ValuePtrHint : nullptr);
+                }
+                call->getOps[i].Add(op);
             }
             slot->reqs.push_back(req);
         }

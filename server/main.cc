@@ -374,8 +374,8 @@ static void printUsage(const char* prog) {
                  "key missed recently (needs --cache-size)\n"
               << "  --direct-send         readers write GET responses to the socket "
                  "themselves, not via the IO thread\n"
-              << "  --stream-readers      readers keep reads in flight as a stream, not "
-                 "one blocking batch at a time (needs MAGMA_ASYNC_IO=uring)\n"
+              << "  --stream-readers      readers keep reads in flight on magma's "
+                 "reader pool (as --async-reads)\n"
               << "  --cache-value-ptr     the seqno index also keeps each doc's last known "
                  "block, so reads skip magma's block locate (needs --cache-seqno-index)\n"
               << "  --auto-tune           size IO threads and readers from "
@@ -1335,12 +1335,8 @@ int main(int argc, char* argv[]) {
     // Reader threads pick their loop as they start, inside the Bucket
     // constructor.
     if (cfg.streamReaders) {
-        const char* aio = std::getenv("MAGMA_ASYNC_IO");
-        if (!aio || std::string(aio) != "uring") {
-            spdlog::error("--stream-readers needs MAGMA_ASYNC_IO=uring");
-            return 1;
-        }
-        gStreamReaders = true;
+        // Reads in flight on magma's reader pool, as --async-reads.
+        gAsyncReads = true;
         spdlog::info("  readers: streaming");
     }
     // Create and open bucket
