@@ -126,6 +126,15 @@ if(EXISTS "${_deps}/double-conversion.exploded/lib/libdouble-conversion.a")
     list(APPEND CBMAGMA_INCLUDE_DIRS "${_deps}/double-conversion.exploded/include")
 endif()
 
+# magma links the AWS SDK's S3 client in trees where it reads and writes S3;
+# older trees have none.
+set(CBMAGMA_AWS_LIBS "")
+foreach(_aws aws-cpp-sdk-s3 aws-cpp-sdk-core)
+    if(EXISTS "${_deps}/AWSSDK.exploded/lib/lib${_aws}.so")
+        list(APPEND CBMAGMA_AWS_LIBS "${_deps}/AWSSDK.exploded/lib/lib${_aws}.so")
+    endif()
+endforeach()
+
 # Link order matters: these are mostly static archives.
 set(CBMAGMA_LIBRARIES
     "${_bld}/platform/cbcrypto/libcbcrypto.a"
@@ -153,6 +162,7 @@ set(CBMAGMA_LIBRARIES
     "${_inst}/lib/libevent_openssl.so"
     "${_bld}/kv_engine/libep-engine_magma_common.a"
     "${CBMAGMA_MAGMA_LIB}"
+    ${CBMAGMA_AWS_LIBS}
     "${CBMAGMA_LZ4_LIB}"
     "${_bld}/kv_engine/libep-engine_collections.a"
     "${_bld}/kv_engine/libmcd_util.a"
