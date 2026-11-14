@@ -1801,7 +1801,7 @@ public:
 size_t ReaderPool::submitReadsAsync(std::vector<ReadTask>& tasks) {
     auto* shard = tasks.front().shard;
     auto* call = new AsyncReadCall(bucket_, tasks.size());
-    std::vector<Magma::AsyncGets> gets;
+    std::vector<Magma::KVStoreGets> gets;
     gets.reserve(tasks.size());
     std::vector<Request*> batch;
     size_t served = 0;
@@ -1833,7 +1833,7 @@ size_t ReaderPool::submitReadsAsync(std::vector<ReadTask>& tasks) {
             }
             slot->reqs.push_back(req);
         }
-        gets.push_back({shard->GetMagma(), tasks[i].vbid, &call->getOps[i]});
+        gets.push_back({*shard->GetMagma(), tasks[i].vbid, call->getOps[i]});
         // The call owns the requests now; the vbucket may take more reads.
         releaseReadVBQueue(shard->GetVBReadQueue(tasks[i].vbid),
                            taskQueue_,
