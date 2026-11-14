@@ -111,6 +111,13 @@ set(CBMAGMA_DEFINITIONS
 file(GLOB _lz4_lib "${_deps}/lz4.exploded/lib/liblz4.so*")
 list(GET _lz4_lib 0 CBMAGMA_LZ4_LIB)
 
+# The logger is kv_engine's memcached_logger in older trees and platform's
+# cblogger in newer ones; link whichever this tree built.
+set(CBMAGMA_LOGGER_LIB "${_bld}/kv_engine/libmemcached_logger.a")
+if(NOT EXISTS "${CBMAGMA_LOGGER_LIB}" AND EXISTS "${_bld}/platform/cblogger/libcblogger.a")
+    set(CBMAGMA_LOGGER_LIB "${_bld}/platform/cblogger/libcblogger.a")
+endif()
+
 # Link order matters: these are mostly static archives.
 set(CBMAGMA_LIBRARIES
     "${_bld}/platform/cbcrypto/libcbcrypto.a"
@@ -141,7 +148,7 @@ set(CBMAGMA_LIBRARIES
     "${CBMAGMA_LZ4_LIB}"
     "${_bld}/kv_engine/libep-engine_collections.a"
     "${_bld}/kv_engine/libmcd_util.a"
-    "${_bld}/kv_engine/libmemcached_logger.a"
+    "${CBMAGMA_LOGGER_LIB}"
     "${_bld}/kv_engine/libmcd_dek.a"
     "${_bld}/third_party/HdrHistogram_c/src/libhdr_histogram_static.a"
     m
