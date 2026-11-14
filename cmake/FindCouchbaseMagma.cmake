@@ -77,7 +77,6 @@ set(CBMAGMA_INCLUDE_DIRS
     # Third-party dependencies (cbdeps)
     "${_deps}/boost.exploded/include"
     "${_deps}/breakpad.exploded/include/breakpad"
-    "${_deps}/double-conversion.exploded/include"
     "${_deps}/flatbuffers.exploded/include"
     "${_deps}/fmt.exploded/include"
     "${_deps}/folly.exploded/include"
@@ -116,6 +115,15 @@ list(GET _lz4_lib 0 CBMAGMA_LZ4_LIB)
 set(CBMAGMA_LOGGER_LIB "${_bld}/kv_engine/libmemcached_logger.a")
 if(NOT EXISTS "${CBMAGMA_LOGGER_LIB}" AND EXISTS "${_bld}/platform/cblogger/libcblogger.a")
     set(CBMAGMA_LOGGER_LIB "${_bld}/platform/cblogger/libcblogger.a")
+endif()
+
+# folly took double-conversion as a cbdep until it moved to fast_float, which
+# is header-only; trees after that have none.
+set(CBMAGMA_DOUBLE_CONVERSION_LIB "")
+if(EXISTS "${_deps}/double-conversion.exploded/lib/libdouble-conversion.a")
+    set(CBMAGMA_DOUBLE_CONVERSION_LIB
+        "${_deps}/double-conversion.exploded/lib/libdouble-conversion.a")
+    list(APPEND CBMAGMA_INCLUDE_DIRS "${_deps}/double-conversion.exploded/include")
 endif()
 
 # Link order matters: these are mostly static archives.
@@ -159,9 +167,9 @@ set(CBMAGMA_LIBRARIES
     "${_deps}/zlib.exploded/lib/libz.so"
     "${_deps}/jemalloc.exploded/lib/libjemalloc.so"
     "${_deps}/folly.exploded/lib/libfolly.a"
+    ${CBMAGMA_DOUBLE_CONVERSION_LIB}
     "${_deps}/openssl.exploded/lib/libssl.so"
     "${_deps}/openssl.exploded/lib/libcrypto.so"
-    "${_deps}/double-conversion.exploded/lib/libdouble-conversion.a"
     "${_deps}/gflags.exploded/lib/libgflags_nothreads.a"
     "${_deps}/glog.exploded/lib64/libglog.a"
     pthread
