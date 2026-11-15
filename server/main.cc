@@ -349,6 +349,7 @@ static void printUsage(const char* prog) {
                  "index (default off; --no-value-ptr-write is the default)\n"
               << "  --async-reads             read on magma's reader pool (GetDocsAsync)\n"
               << "  --magma-readers N         magma reader pool threads (default: one per CPU)\n"
+              << "  --reader-multi N          a reader takes up to N vbuckets' reads per magma call (FLUXKV_READER_MULTI)\n"
               << "  --no-learned-seq-locator  locate seqIndex data blocks "
                  "through their index blocks (default: learned model)\n"
               << "  --block-writes-ratio R  L0 size ratio at which a writer waits for "
@@ -525,6 +526,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"no-hot-stats", no_argument, nullptr, 1005},
             {"async-reads", no_argument, nullptr, 1400},
             {"magma-readers", required_argument, nullptr, 1401},
+            {"reader-multi", required_argument, nullptr, 1402},
             {"no-block-cache", no_argument, nullptr, 1006},
             {"no-compression", no_argument, nullptr, 1007},
             {"index-compression-lz4", no_argument, nullptr, 1012},
@@ -712,6 +714,10 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1400:
             cfg.asyncReads = true;
+            break;
+        case 1402:
+            // The reader loop reads FLUXKV_READER_MULTI once, as readers start.
+            ::setenv("FLUXKV_READER_MULTI", optarg, 1);
             break;
         case 1401:
             cfg.magmaReaders = strtoull(optarg, nullptr, 10);
