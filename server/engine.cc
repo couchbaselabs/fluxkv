@@ -1758,7 +1758,10 @@ size_t ReaderPool::executeRead(ReadTask& task) {
 namespace {
 // One GetDocsAsync call: owns the operations and the requests waiting on each
 // key until magma calls OnDone. Responses go through the reader thread's
-// accumulator, flushed when the thread finishes its part of the call.
+// accumulator, flushed when the thread finishes its part of the call. The
+// call holds its vbuckets' read queues until OnDone, as a sync read holds its
+// vbucket for the read: GETs that arrive meanwhile wait and leave as the next
+// batch instead of as a call each.
 class AsyncReadCall final : public Magma::GetDocsHandler {
 public:
     struct KeyReqs {
@@ -1784,7 +1787,16 @@ public:
     }
 
     void OnDone() override {
+        release();
         delete this;
+    }
+
+    // Releases the held vbucket read queues, re-queueing those with GETs.
+    void release() {
+        for (auto& [shard, vbid] : held) {
+            releaseVB(shard, vbid);
+        }
+        held.clear();
     }
 
     static DispatchAccum& accum() {
@@ -1795,12 +1807,19 @@ public:
     Bucket* bucket;
     std::deque<KeyReqs> keyReqs; // stable addresses for UserContext
     std::vector<OperationsList<Magma::GetOperation>> getOps;
+    std::vector<std::pair<Shard*, uint16_t>> held;
+    std::function<void(Shard*, uint16_t)> releaseVB;
 };
 } // namespace
 
 size_t ReaderPool::submitReadsAsync(std::vector<ReadTask>& tasks) {
     auto* shard = tasks.front().shard;
     auto* call = new AsyncReadCall(bucket_, tasks.size());
+    call->releaseVB = [this](Shard* shard, uint16_t vbid) {
+        releaseReadVBQueue(shard->GetVBReadQueue(vbid),
+                           taskQueue_,
+                           ReadTask{shard, vbid, nowNs()});
+    };
     std::vector<Magma::KVStoreGets> gets;
     gets.reserve(tasks.size());
     std::vector<Request*> batch;
@@ -1834,10 +1853,7 @@ size_t ReaderPool::submitReadsAsync(std::vector<ReadTask>& tasks) {
             slot->reqs.push_back(req);
         }
         gets.push_back({*shard->GetMagma(), tasks[i].vbid, call->getOps[i]});
-        // The call owns the requests now; the vbucket may take more reads.
-        releaseReadVBQueue(shard->GetVBReadQueue(tasks[i].vbid),
-                           taskQueue_,
-                           ReadTask{shard, tasks[i].vbid, nowNs()});
+        call->held.emplace_back(shard, tasks[i].vbid);
     }
     if (gets.empty()) {
         delete call;
@@ -1855,6 +1871,7 @@ size_t ReaderPool::submitReadsAsync(std::vector<ReadTask>& tasks) {
                              AsyncReadCall::accum());
             }
             AsyncReadCall::accum().FlushAll();
+            call->release();
             delete call;
             break;
         }
