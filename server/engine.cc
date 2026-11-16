@@ -53,6 +53,7 @@ size_t gMaxReadBatch = 128;
 bool gAsyncReads = false;
 bool gIoReads = false;
 size_t gIoInlineMax = 0;
+unsigned gIoInlineBudgetPct = 0;
 uint32_t gMaxReadOwners = 1;
 std::atomic<uint64_t> gMaxReadQueueAgeNs{0};
 std::atomic<uint32_t> gMaxReadRequeues{0};

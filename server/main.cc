@@ -352,6 +352,7 @@ static void printUsage(const char* prog) {
               << "  --reader-multi N          a reader takes up to N vbuckets' reads per magma call (FLUXKV_READER_MULTI)\n"
               << "  --io-reads                IO threads read each loop's GETs with one GetDocsAsync call, no reader hop\n"
               << "  --io-inline-max N         with --io-reads, a loop pass of at most N GETs is read on the IO thread itself\n"
+              << "  --io-inline-budget PCT    inline reads only while they took under PCT% of an IO thread's last 10 ms\n"
               << "  --no-learned-seq-locator  locate seqIndex data blocks "
                  "through their index blocks (default: learned model)\n"
               << "  --block-writes-ratio R  L0 size ratio at which a writer waits for "
@@ -531,6 +532,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"reader-multi", required_argument, nullptr, 1402},
             {"io-reads", no_argument, nullptr, 1403},
             {"io-inline-max", required_argument, nullptr, 1404},
+            {"io-inline-budget", required_argument, nullptr, 1405},
             {"no-block-cache", no_argument, nullptr, 1006},
             {"no-compression", no_argument, nullptr, 1007},
             {"index-compression-lz4", no_argument, nullptr, 1012},
@@ -718,6 +720,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1400:
             cfg.asyncReads = true;
+            break;
+        case 1405:
+            kvserver::gIoInlineBudgetPct = unsigned(strtoul(optarg, nullptr, 10));
             break;
         case 1404:
             kvserver::gIoInlineMax = strtoull(optarg, nullptr, 10);

@@ -130,6 +130,10 @@ extern bool gIoReads;
 // --io-inline-max N: an IO thread reads a loop pass of at most N GETs itself,
 // synchronously, and replies; larger passes go to magma's reader pool.
 extern size_t gIoInlineMax;
+// --io-inline-budget PCT: an IO thread reads inline only while its inline
+// reads took under PCT% of the last 10 ms; past that its passes go to the
+// pool, so blocking reads cannot starve its sockets at high rates. 0 = no cap.
+extern unsigned gIoInlineBudgetPct;
 // Max concurrent owners one vbucket's reads can have (--max-read-owners).
 // 1 keeps the old single-owner behavior.
 extern uint32_t gMaxReadOwners;

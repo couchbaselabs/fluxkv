@@ -161,16 +161,36 @@ thread_local RecycledRequests tlsRecycled;
 // socket read, each call carried the few GETs of one connection, each its
 // own reader pool job and wakeup.
 struct IoReadBatch final : folly::EventBase::LoopCallback {
+    static constexpr uint64_t kWindowNs = 10'000'000;
     std::vector<Request*> reqs;
     Bucket* bucket{nullptr};
+    // Inline read time in the current 10 ms window, for --io-inline-budget.
+    uint64_t windowStart{0};
+    uint64_t inlineNs{0};
+
+    bool inlineAllowed(uint64_t now) {
+        if (gIoInlineBudgetPct == 0) {
+            return true;
+        }
+        if (now - windowStart >= kWindowNs) {
+            windowStart = now;
+            inlineNs = 0;
+        }
+        return inlineNs * 100 < kWindowNs * gIoInlineBudgetPct;
+    }
+
     void runLoopCallback() noexcept override {
         // A pass this small costs less read here than handed to a pool
         // thread: no wakeup, and the response leaves from this thread.
         if (reqs.size() <= gIoInlineMax) {
-            bucket->ReadInlineNow(reqs);
-        } else {
-            bucket->ReadAsyncNow(reqs);
+            const uint64_t t0 = steadyNowNs();
+            if (inlineAllowed(t0)) {
+                bucket->ReadInlineNow(reqs);
+                inlineNs += steadyNowNs() - t0;
+                return;
+            }
         }
+        bucket->ReadAsyncNow(reqs);
     }
 };
 thread_local IoReadBatch tlsIoReads;
