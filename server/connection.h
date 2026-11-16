@@ -169,8 +169,6 @@ private:
     // emits one socket_->write per readDataAvailable wakeup or per LoopCallback
     // (engine-thread responses). Converts N tiny sendmsg syscalls into 1.
     std::vector<uint8_t> pendingWriteBuf_;
-    // --io-reads: GETs parsed in this read loop, read in one call at its end.
-    std::vector<Request*> ioReads_;
     // Cache fast path copies the value here under the cache lock; larger
     // values take the generic path.
     uint8_t valueScratch_[4096];
