@@ -350,6 +350,7 @@ static void printUsage(const char* prog) {
               << "  --async-reads             read on magma's reader pool (GetDocsAsync)\n"
               << "  --magma-readers N         magma reader pool threads (default: one per CPU)\n"
               << "  --reader-multi N          a reader takes up to N vbuckets' reads per magma call (FLUXKV_READER_MULTI)\n"
+              << "  --io-reads                IO threads read each loop's GETs with one GetDocsAsync call, no reader hop\n"
               << "  --no-learned-seq-locator  locate seqIndex data blocks "
                  "through their index blocks (default: learned model)\n"
               << "  --block-writes-ratio R  L0 size ratio at which a writer waits for "
@@ -527,6 +528,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"async-reads", no_argument, nullptr, 1400},
             {"magma-readers", required_argument, nullptr, 1401},
             {"reader-multi", required_argument, nullptr, 1402},
+            {"io-reads", no_argument, nullptr, 1403},
             {"no-block-cache", no_argument, nullptr, 1006},
             {"no-compression", no_argument, nullptr, 1007},
             {"index-compression-lz4", no_argument, nullptr, 1012},
@@ -714,6 +716,9 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 1400:
             cfg.asyncReads = true;
+            break;
+        case 1403:
+            kvserver::gIoReads = true;
             break;
         case 1402:
             // The reader loop reads FLUXKV_READER_MULTI once, as readers start.

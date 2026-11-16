@@ -51,6 +51,7 @@ bool gCacheValuePtr = false;
 // QD=1 multi-thread parallelism.
 size_t gMaxReadBatch = 128;
 bool gAsyncReads = false;
+bool gIoReads = false;
 uint32_t gMaxReadOwners = 1;
 std::atomic<uint64_t> gMaxReadQueueAgeNs{0};
 std::atomic<uint32_t> gMaxReadRequeues{0};
@@ -1878,6 +1879,68 @@ size_t ReaderPool::submitReadsAsync(std::vector<ReadTask>& tasks) {
         std::this_thread::yield();
     }
     return served;
+}
+
+void Bucket::ReadAsyncNow(std::vector<Request*>& reqs) {
+    if (reqs.empty()) {
+        return;
+    }
+    std::sort(reqs.begin(), reqs.end(), [](const Request* a, const Request* b) {
+        return a->vbucket < b->vbucket;
+    });
+    size_t groups = 0;
+    for (size_t i = 0; i < reqs.size(); i++) {
+        groups += i == 0 || reqs[i]->vbucket != reqs[i - 1]->vbucket;
+    }
+    auto* call = new AsyncReadCall(this, groups);
+    std::vector<Magma::KVStoreGets> gets;
+    gets.reserve(groups);
+    folly::F14FastMap<std::string_view, AsyncReadCall::KeyReqs*> byKey;
+    size_t g = 0;
+    for (size_t i = 0; i < reqs.size(); i++) {
+        auto* req = reqs[i];
+        const uint16_t vbid = req->vbucket;
+        if (i > 0 && vbid != reqs[i - 1]->vbucket) {
+            gets.push_back({*GetShard(reqs[i - 1]->vbucket).GetMagma(),
+                            reqs[i - 1]->vbucket,
+                            call->getOps[g]});
+            g++;
+            byKey.clear();
+        }
+        if (gTraceLatency) {
+            req->tReadEnqueue = steadyNowNs();
+        }
+        std::string_view k(reinterpret_cast<const char*>(req->key.Data()),
+                           req->key.Len());
+        auto& slot = byKey[k];
+        if (!slot) {
+            call->keyReqs.push_back(AsyncReadCall::KeyReqs{vbid, {}});
+            slot = &call->keyReqs.back();
+            Magma::GetOperation op(req->key, slot);
+            if (gCacheSeqnoIndex) {
+                op.SeqnoHint = gDocCache->SeqnoHint(
+                        vbid,
+                        std::string_view(req->key.Data(), req->key.Len()),
+                        gCacheValuePtr ? &op.ValuePtrHint : nullptr);
+            }
+            call->getOps[g].Add(op);
+        }
+        slot->reqs.push_back(req);
+    }
+    gets.push_back({*GetShard(reqs.back()->vbucket).GetMagma(),
+                    reqs.back()->vbucket,
+                    call->getOps[g]});
+    auto status = Magma::GetDocsAsync(gets, *call);
+    if (!status) {
+        // The pool's queue is full or magma is closing: the readers take them.
+        for (auto& kr : call->keyReqs) {
+            for (auto* req : kr.reqs) {
+                EnqueueRead(req);
+            }
+        }
+        delete call;
+    }
+    reqs.clear();
 }
 
 size_t ReaderPool::executeReadMulti(std::vector<ReadTask>& tasks) {

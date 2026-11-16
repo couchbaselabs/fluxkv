@@ -389,6 +389,8 @@ void Connection::finishAttach(IOThread* target) {
     // and the client may be waiting on them.
     while (!closing_ && !stageFull_ && parseAndDispatch()) {
     }
+    // --io-reads: one GetDocsAsync call for this loop's GETs.
+    bucket_->ReadAsyncNow(ioReads_);
     bucket_->FlushStaged();
     if (stageFull_) {
         pauseForQueue();
@@ -428,6 +430,8 @@ void Connection::readDataAvailable(size_t len) noexcept {
     readBuf_.postallocate(len);
     while (!closing_ && !stageFull_ && parseAndDispatch()) {
     }
+    // --io-reads: one GetDocsAsync call for this loop's GETs.
+    bucket_->ReadAsyncNow(ioReads_);
     bucket_->FlushStaged();
     if (stageFull_) {
         pauseForQueue();
@@ -549,6 +553,8 @@ void Connection::resumeAfterQueue() {
     // Bytes may already be buffered from before the pause.
     while (!closing_ && !stageFull_ && parseAndDispatch()) {
     }
+    // --io-reads: one GetDocsAsync call for this loop's GETs.
+    bucket_->ReadAsyncNow(ioReads_);
     bucket_->FlushStaged();
     if (stageFull_) {
         pauseForQueue();
@@ -1390,6 +1396,10 @@ void Connection::handleGet(McbpHeader& hdr,
         req->key = Slice(p + hdr.extrasLen, hdr.keyLen);
     }
 
+    if (gIoReads) {
+        ioReads_.push_back(req);
+        return;
+    }
     bucket_->EnqueueRead(req);
 }
 
