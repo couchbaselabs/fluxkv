@@ -7,6 +7,7 @@ add_test(NAME cpu_budget_unit COMMAND cpu_budget_test)
 
 if(FLUXKV_BUILD_SERVER)
     add_test(NAME cache_unit COMMAND cache_test)
+    add_test(NAME autosize_unit COMMAND autosize_test)
     set_tests_properties(cache_unit PROPERTIES TIMEOUT 120)
 
     add_test(NAME smoke

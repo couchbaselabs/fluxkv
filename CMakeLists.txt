@@ -81,6 +81,20 @@ if(FLUXKV_BUILD_SERVER)
     set_target_properties(cache_test PROPERTIES
                           BUILD_RPATH "${CBMAGMA_RPATH}")
 
+    # The sizing controller is pure; folly only for its JSON.
+    add_executable(autosize_test tests/autosize_test.cc server/autosize.cc)
+    target_include_directories(autosize_test PRIVATE
+                               "${CMAKE_CURRENT_SOURCE_DIR}/server"
+                               ${CBMAGMA_INCLUDE_DIRS})
+    target_compile_definitions(autosize_test PRIVATE ${CBMAGMA_DEFINITIONS})
+    target_compile_options(autosize_test PRIVATE ${FLUXKV_ARCH_FLAGS})
+    target_link_libraries(autosize_test PRIVATE
+                          -Wl,--start-group
+                          ${CBMAGMA_LIBRARIES}
+                          -Wl,--end-group)
+    set_target_properties(autosize_test PROPERTIES
+                          BUILD_RPATH "${CBMAGMA_RPATH}")
+
     # DocMeta's on-disk forms; header-only, so it needs only the includes.
     add_executable(metadata_test tests/metadata_test.cc)
     target_include_directories(metadata_test PRIVATE

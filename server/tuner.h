@@ -15,6 +15,15 @@
 namespace magma {
 namespace kvserver {
 
+// How a pool's busy figure relates to demand; decides which autosizing
+// regime may move it.
+enum class BusyKind : uint8_t {
+    // Per-thread CPU minus spin: below 1.0 it shows demand.
+    ThreadCpu,
+    // Time inside a blocking call: reads 1.0 under any backlog.
+    WallInCall,
+};
+
 // One interval's worth of measurements for a thread pool.
 struct PoolSample {
     size_t size{0}; // live threads at the end of the interval
@@ -22,6 +31,11 @@ struct PoolSample {
     double busyMax{0}; // the busiest thread
     double avgBatch{0}; // work items per wakeup, where the pool knows it
     double waitUs{0}; // mean time work waited for a thread, where measurable
+    BusyKind kind{BusyKind::WallInCall};
+    double workCores{0}; // busy summed over threads
+    double queueWaitUs{0}; // submit to claim, or loop time for IO; 0 if unknown
+    double inFlightPerThread{0}; // magma readers only
+    size_t depthCap{0}; // per-thread in-flight limit, 0 if none
     // Optional per-thread detail for the stats endpoint.
     std::vector<double> threadBusy;
     std::vector<int> threadLoad;
@@ -50,6 +64,8 @@ public:
     virtual bool Settled() const {
         return true;
     }
+    // Idle threads that may spin for work before sleeping.
+    virtual void SetIdleSpin(size_t /*spinners*/) {}
 };
 
 // The per-shard pools of one role presented to the tuner as a single pool.
