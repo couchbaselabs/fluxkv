@@ -174,6 +174,7 @@ struct ControllerState {
     std::array<PoolState, kPoolCount> pools;
     WindowRing history{30};
     std::optional<PoolId> probing; // at most one probe process-wide
+    size_t sinceResize{0}; // windows measured at the current sizes
 };
 
 // One window's decisions. Mutates only s.

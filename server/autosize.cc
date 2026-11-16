@@ -219,7 +219,7 @@ void stepProbe(const Window& w,
     }
     // n more threads out of `from` cannot move reads by much more than n/from.
     const double step = double(pr.to - pr.from) / std::max<size_t>(1, pr.from);
-    if (refReads <= 0 || std::abs(r) > std::max(0.05, step)) {
+    if (refReads <= 0 || std::abs(r) > std::max(0.05, 1.25 * step)) {
         abandon(Reason::ProbeAbandonImplausible);
         return;
     }
@@ -273,7 +273,11 @@ Decisions Decide(const Window& w,
                  ControllerState& s) {
     Decisions d;
     s.history.Push(w);
-    const auto recent = s.history.Last(kRefWindows);
+    // A reference never mixes windows from before the last resize: after
+    // an abandoned doubling it read high and the next doubling was reverted.
+    s.sinceResize++;
+    const auto recent =
+            s.history.Last(std::min(kRefWindows, s.sinceResize));
     const double recentReads = medianOf(recent, reads);
     const double recentOther = medianOf(recent, other);
     const double recentCompactions = medianOf(recent, compactions);
@@ -359,10 +363,21 @@ Decisions Decide(const Window& w,
             ps.shrinkVotes = 0;
 
             const bool saturated = smp.queueWaitUs >= p.saturatedWaitUs[i];
+            // A pegged IO pool grows without a probe: it gates every other
+            // pool's probe (both reverted at a joint bottleneck), and the
+            // demand law shrinks it back if the threads turn out idle.
+            if (id == PoolId::Io && util >= p.censoredUtil && saturated &&
+                size < cap) {
+                act(d, ps, id, size,
+                    std::min(cap, size + std::max(b.step, size / 2)),
+                    Reason::Demand);
+                continue;
+            }
             // A probe starts from a window where nothing else moved.
             if (util >= p.censoredUtil && saturated && size < cap &&
                 now >= ps.backoffUntil && d.resize.empty() &&
-                s.history.Size() >= kRefWindows && recentReads > 0 &&
+                s.history.Size() >= kRefWindows && s.sinceResize >= 2 &&
+                recentReads > 0 &&
                 !otherMoved(w.otherCores, recentOther) &&
                 !compactionsMoved(w.compactions, recentCompactions)) {
                 auto& pr = ps.probe;
@@ -379,6 +394,10 @@ Decisions Decide(const Window& w,
                 const double m = std::ceil(8 * std::pow(pr.noise / p.minGain, 2));
                 pr.measure = std::clamp(size_t(m), p.minMeasureWindows,
                                         p.maxMeasureWindows);
+                if (grow == size) {
+                    // A doubling moves reads far past the noise.
+                    pr.measure = 2;
+                }
                 ps.regime = Regime::Probing;
                 s.probing = id;
                 act(d, ps, id, pr.from, pr.to, Reason::ProbeStart);
@@ -403,6 +422,9 @@ Decisions Decide(const Window& w,
             ps.spinners = spinners;
             d.spin.push_back({static_cast<PoolId>(i), spinners});
         }
+    }
+    if (!d.resize.empty()) {
+        s.sinceResize = 0;
     }
     return d;
 }
