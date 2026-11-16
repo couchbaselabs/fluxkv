@@ -368,7 +368,10 @@ Decisions Decide(const Window& w,
                 auto& pr = ps.probe;
                 pr = {};
                 pr.from = size;
-                pr.to = std::min(cap, size + std::max(b.step, size / 4));
+                // A pegged pool far below its max (regrowing after an idle
+                // shrink to 1) doubles: +25% steps from 1 took 5 min on .54.
+                const size_t grow = size * 4 <= b.max ? size : size / 4;
+                pr.to = std::min(cap, size + std::max(b.step, grow));
                 pr.ref = recent;
                 pr.refOther = recentOther;
                 pr.refCompactions = recentCompactions;

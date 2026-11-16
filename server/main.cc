@@ -979,6 +979,12 @@ int main(int argc, char* argv[]) {
             spdlog::error("--auto-size needs --io-reads");
             return 1;
         }
+        // The pool's reads in flight are threads x this. At magma's 16 the
+        // x86 lab box stopped at 1.49M GET/s with 56 threads pegged; at 64
+        // it reached 1.64M on fewer cores. The env var still wins.
+        if (!std::getenv("MAGMA_READER_INFLIGHT")) {
+            magma::Magma::SetReaderPoolInFlight(64);
+        }
         const auto budget = kvserver::ReadCpuBudget();
         autosize = kvserver::AutosizeConfig::For(
                 budget,

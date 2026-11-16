@@ -210,6 +210,19 @@ void stepLoadDownAndUp() {
     CHECK(r.plant.io * 0.95 / 2.5e-6 >= capacity(r.plant.magma));
 }
 
+// No reads (load, overwrite and settle phases) shrink magma to 1; closed-loop
+// GETs then regrow it by doubling probes within a minute.
+void regrowAfterIdle() {
+    Run r;
+    r.plant.offered = 0;
+    r.Steps(120);
+    CHECK(r.plant.magma <= 2);
+    r.plant.offered = kInf;
+    r.Steps(60);
+    std::printf("regrow after idle: magma=%zu io=%zu\n", r.plant.magma, r.plant.io);
+    CHECK(r.plant.magma >= 48);
+}
+
 // Compaction CPU appearing mid-probe: abandoned, no ceiling, no backoff.
 void compactionAbandonsProbe() {
     for (int byCounter = 0; byCounter < 2; byCounter++) {
@@ -374,6 +387,7 @@ int main() {
     steadyT2Converges();
     efficiencyKnobStopsEarlier();
     stepLoadDownAndUp();
+    regrowAfterIdle();
     compactionAbandonsProbe();
     implausibleGainAbandons();
     noReadSignalStillSizesByCpu();
