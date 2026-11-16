@@ -366,8 +366,9 @@ Decisions Decide(const Window& w,
             // A pegged IO pool grows without a probe: it gates every other
             // pool's probe (both reverted at a joint bottleneck), and the
             // demand law shrinks it back if the threads turn out idle.
-            if (id == PoolId::Io && util >= p.censoredUtil && saturated &&
-                size < cap) {
+            // Loop delay is no test here: 2 IO threads at 100% CPU showed
+            // 0.7 ms and held T2 at 0.46M GET/s without --direct-send.
+            if (id == PoolId::Io && util >= p.censoredUtil && size < cap) {
                 act(d, ps, id, size,
                     std::min(cap, size + std::max(b.step, size / 2)),
                     Reason::Demand);
