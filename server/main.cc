@@ -151,7 +151,7 @@ struct Config {
     // Size IO threads and magma readers from measured work (--io-reads
     // only); a pool given on the command line is pinned.
     bool autoSize = false;
-    double sizeEfficiency = 0.15;
+    double sizeEfficiency = 0.05;
     bool ioThreadsSet = false;
     bool readersSet = false;
     int sharedWalPrewrite = -1; // -1 = magma default (on)
@@ -385,7 +385,7 @@ static void printUsage(const char* prog) {
                  "their measured work, writers by trial (needs --io-reads); "
                  "--io-threads/--magma-readers pin a pool\n"
               << "  --size-efficiency E   with --auto-size, keep a grow only if "
-                 "its GET/s gain is >= E x its CPU gain (default 0.15)\n"
+                 "its GET/s gain is >= E x its CPU gain (default 0.05)\n"
               << "  --write-cache N       per-shard write cache in bytes "
                  "(default: half the per-shard quota). This is the threshold "
                  "magma throttles writers against\n"

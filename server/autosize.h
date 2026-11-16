@@ -39,7 +39,7 @@ struct AutosizePolicy {
     double censoredUtil{0.90}; // at or above, demand is unknown: probe
     double depthHeadroom{0.75}; // grow when in-flight/thread >= this x cap
     // A probe grow is kept iff dReads/R >= efficiency x dCpu/C ...
-    double efficiency{0.15};
+    double efficiency{0.05};
     // ... and dReads/R >= max(minGain, 2 standard errors).
     double minGain{0.01};
     unsigned shrinkPatienceWindows{5};
