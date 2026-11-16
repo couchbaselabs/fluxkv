@@ -89,6 +89,11 @@ if(FLUXKV_BUILD_SERVER)
     target_compile_definitions(metadata_test PRIVATE ${CBMAGMA_DEFINITIONS})
 endif()
 
+# Linux-only like the server, but needs no Couchbase build.
+add_executable(cpu_budget_test tests/cpu_budget_test.cc server/cpu_budget.cc)
+target_include_directories(cpu_budget_test PRIVATE
+                           "${CMAKE_CURRENT_SOURCE_DIR}/server")
+
 add_executable(fluxbench client/fluxbench.cc)
 target_link_libraries(fluxbench PRIVATE pthread)
 

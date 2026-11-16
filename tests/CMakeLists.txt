@@ -3,6 +3,8 @@
 # The smoke test needs both binaries, so it is only registered when the server
 # is built. Run with: ctest --test-dir build --output-on-failure
 
+add_test(NAME cpu_budget_unit COMMAND cpu_budget_test)
+
 if(FLUXKV_BUILD_SERVER)
     add_test(NAME cache_unit COMMAND cache_test)
     set_tests_properties(cache_unit PROPERTIES TIMEOUT 120)
