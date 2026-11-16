@@ -355,6 +355,11 @@ Pipeline depth matters more than batch: at 192 sessions, depth 256 gives
 
 ### Auto-tuning: the hand-tuned numbers without the sweep
 
+`--auto-tune` is gone: `--auto-size --io-reads` sizes IO threads and magma
+readers from their own CPU and probes only a starved, pegged pool
+(server/autosize.cc); writers keep the trial tuner below. The results in
+this section were measured with `--auto-tune`.
+
 Every result above came from a sweep over `--io-threads` and `--readers`.
 `--auto-tune` replaces the sweep: the flags become starting points, and a
 tuner thread (server/tuner.cc) resizes both pools at run time. Reader

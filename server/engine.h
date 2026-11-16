@@ -127,6 +127,9 @@ extern bool gAsyncReads;
 // --io-reads: an IO thread hands each read loop's GETs to magma's reader pool
 // (GetDocsAsync) itself, skipping the vbucket queues and reader threads.
 extern bool gIoReads;
+// fluxkv reader spin before parking; < 0 takes MAGMA_READER_SPIN_ITERS or
+// the default. Set before the bucket starts its readers.
+extern int gReaderSpinIters;
 // --io-inline-max N: an IO thread reads a loop pass of at most N GETs itself,
 // synchronously, and replies; larger passes go to magma's reader pool.
 extern size_t gIoInlineMax;
@@ -907,6 +910,8 @@ public:
         return echoGetValue_;
     }
     std::string GetStatsJson();
+    // Compactions finished by all shards, cumulative.
+    uint64_t CompactionsDone();
     // Per-kvstore magma counters, for locating a kvstore that stopped reclaiming.
     std::string GetKVStoreStatsJson();
 
@@ -926,13 +931,6 @@ public:
 
     size_t NumShards() const {
         return numShards_;
-    }
-    std::vector<ReaderPool*> ReaderPools() {
-        std::vector<ReaderPool*> v;
-        for (auto& s : shards_) {
-            v.push_back(s->GetReaderPool());
-        }
-        return v;
     }
     std::vector<WriterPool*> WriterPools() {
         std::vector<WriterPool*> v;
@@ -963,10 +961,8 @@ private:
     // no global pools — EnqueueRead/StageWrite route to the shard's own.
 };
 
-// One thread per shard is the step for both roles, so the group adapter is
-// shared: see ShardedPoolGroup in tuner.h.
+// One thread per shard is the step: see ShardedPoolGroup in tuner.h.
 using WriterPoolGroup = ShardedPoolGroup<WriterPool>;
-using ReaderPoolGroup = ShardedPoolGroup<ReaderPool>;
 
 } // namespace kvserver
 } // namespace magma

@@ -156,6 +156,15 @@ struct RecycledRequests {
 };
 thread_local RecycledRequests tlsRecycled;
 
+// One per IO thread that ever ran a pass. Slots outlive their threads, so a
+// reaped loop's count stays in the sum.
+struct alignas(64) PassReads {
+    std::atomic<uint64_t> n{0};
+};
+constexpr size_t kMaxPassThreads = 1024;
+PassReads gPassReads[kMaxPassThreads];
+std::atomic<size_t> gPassThreads{0};
+
 // --io-reads: the GETs an IO thread parses in one EventBase loop pass, over
 // all its sockets, read in one GetDocsAsync call when the pass ends. Per
 // socket read, each call carried the few GETs of one connection, each its
@@ -167,6 +176,7 @@ struct IoReadBatch final : folly::EventBase::LoopCallback {
     // Inline read time in the current 10 ms window, for --io-inline-budget.
     uint64_t windowStart{0};
     uint64_t inlineNs{0};
+    PassReads* reads{nullptr};
 
     bool inlineAllowed(uint64_t now) {
         if (gIoInlineBudgetPct == 0) {
@@ -180,6 +190,11 @@ struct IoReadBatch final : folly::EventBase::LoopCallback {
     }
 
     void runLoopCallback() noexcept override {
+        if (!reads) {
+            reads = &gPassReads[std::min(gPassThreads.fetch_add(1),
+                                         kMaxPassThreads - 1)];
+        }
+        reads->n.fetch_add(reqs.size(), std::memory_order_relaxed);
         // A pass this small costs less read here than handed to a pool
         // thread: no wakeup, and the response leaves from this thread.
         if (reqs.size() <= gIoInlineMax) {
@@ -195,6 +210,15 @@ struct IoReadBatch final : folly::EventBase::LoopCallback {
 };
 thread_local IoReadBatch tlsIoReads;
 } // namespace
+
+uint64_t ReadsAnswered() {
+    const size_t n = std::min(gPassThreads.load(), kMaxPassThreads);
+    uint64_t sum = 0;
+    for (size_t i = 0; i < n; i++) {
+        sum += gPassReads[i].n.load(std::memory_order_relaxed);
+    }
+    return sum;
+}
 
 Request* Connection::acquireRequest(uint16_t vbucket) {
     auto& c = tlsRecycled.chain;

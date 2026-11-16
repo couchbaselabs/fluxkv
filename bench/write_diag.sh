@@ -5,7 +5,7 @@
 # magma stats and a profile. Runs on the server host.
 # Env: WRITERS FLUSHERS MEMQ VALSIZE CONNS PIPE SRVX SWF TAG PF JECONF
 #      ZIPF=0.99 for a skewed keyspace; unset for uniform random keys
-#      NOTUNE=" " (fixed thread counts instead of --auto-tune)
+#      NOTUNE=" " (fixed thread counts instead of --auto-size)
 #      DWARF=1 (add a DWARF call graph of six writer threads)
 set -u
 KV=/root/fluxkv/build/fluxkv_server
@@ -29,7 +29,7 @@ setsid env ${JECONF:+JE_MALLOC_CONF=$JECONF} ${PRELOAD:+LD_PRELOAD=$PRELOAD} FLU
   --shards 8 --vbuckets 256 --mem-quota ${MEMQ:-8589934592} \
   --writers ${WRITERS:-64} --flushers ${FLUSHERS:-16} --write-queue-mem 4294967296 \
   --no-compression --index-compression-lz4 --data-block-size 1024 \
-  --io-queue-depth 16 --stats-port 18091 ${NOTUNE:---auto-tune} \
+  --io-queue-depth 16 --stats-port 18091 ${NOTUNE:---auto-size --io-reads} \
   --shared-wal --shared-wal-flushers ${SWF:-4} ${SRVX:-} \
   > /tmp/flux-$TAG.log 2>&1 </dev/null &
 for i in $(seq 1 180); do grep -q "listening on" /tmp/flux-$TAG.log 2>/dev/null && break; sleep 1; done

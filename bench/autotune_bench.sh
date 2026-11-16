@@ -1,7 +1,7 @@
 #!/bin/bash
 #
-# Watch the thread tuner converge under a fixed client load. Restarts the
-# server through the recipe with --auto-tune, runs the client for RUNTIME and
+# Watch the autosizer converge under a fixed client load. Restarts the
+# server through the recipe with --auto-size --io-reads, runs the client for RUNTIME and
 # prints one line per SAMPLE seconds: server throughput (from its own
 # counters), server cores, and each pool's size and busy fraction. The last
 # line is the client's own rate and error count.
@@ -14,7 +14,7 @@
 # Env:
 #   RECIPE      server start script honouring DATA_DIR/IO_THREADS/READERS/EXTRA
 #   DATA_DIR, IO_THREADS, READERS, BLOCK   passed to the recipe (starting sizes)
-#   EXTRA       further server flags; --auto-tune is added here
+#   EXTRA       further server flags; --auto-size --io-reads are added here
 #   CLIENT      ssh prefix for the client host; empty runs it locally
 #   RUNTIME     client run time in seconds (default 240)
 #   SAMPLE      seconds between report lines (default 10)
@@ -31,7 +31,7 @@ HZ=$(getconf CLK_TCK)
 
 setsid env DATA_DIR="${DATA_DIR:-/data/flux-k8-25m}" \
     IO_THREADS="${IO_THREADS:-6}" READERS="${READERS:-40}" \
-    BLOCK="${BLOCK:-1024}" EXTRA="${EXTRA:-} --auto-tune" bash "$RECIPE" \
+    BLOCK="${BLOCK:-1024}" EXTRA="${EXTRA:-} --auto-size --io-reads" bash "$RECIPE" \
     > /tmp/recipe.out 2>&1 < /dev/null &
 for _ in $(seq 1 90); do
     up=$(tail -1 /tmp/recipe.out 2>/dev/null)
@@ -53,17 +53,11 @@ ops() {
         python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["cmd_get"]+d["cmd_set"]+d["cmd_delete"])'
 }
 pools() {
-    curl -s --max-time 2 "$STATS/stats/tuner" |
+    curl -s --max-time 2 "$STATS/stats/autosize" |
         python3 -c 'import json,sys
 d=json.load(sys.stdin)
-out=[]
-for p in d["pools"]:
-    s="%s=%d(%.2f)" % (p["name"], p["size"], p["busy_mean"])
-    if "thread_load" in p and p["thread_load"]:
-        s+=" conns/thread %d-%d" % (min(p["thread_load"]), max(p["thread_load"]))
-    if "thread_busy" in p and p["thread_busy"]:
-        s+=" busy %.2f-%.2f" % (min(p["thread_busy"]), max(p["thread_busy"]))
-    out.append(s)
+out=["%s=%d(%.2f,%s)" % (p["name"], p["size"], p["util"], p["regime"])
+     for p in d["pools"]]
 print(" ".join(out))'
 }
 cpu() {

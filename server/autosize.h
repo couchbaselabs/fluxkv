@@ -160,6 +160,7 @@ struct PoolState {
     } probe;
 
     // For stats.
+    size_t want{0}; // the demand law's size at the last window it ran
     Reason lastReason{Reason::Demand};
     size_t lastFrom{0};
     size_t lastTo{0};

@@ -2,6 +2,7 @@
 #include "connection.h"
 
 #include <folly/io/async/AsyncSocket.h>
+#include <folly/json/json.h>
 #include <spdlog/spdlog.h>
 
 #include <pthread.h>
@@ -35,28 +36,26 @@ Server::Server(Bucket* bucket,
         iot->evb = std::make_unique<folly::EventBase>();
         ioThreads_.push_back(std::move(iot));
     }
+    ioPool_ = std::make_unique<IOPool>(this);
 }
 
 Server::~Server() {
     Stop();
 }
 
-void Server::EnableAutoTune(const TunerConfig& cfg,
-                            ThreadTuner::Bounds ioBounds,
-                            ThreadTuner::Bounds readerBounds,
-                            ThreadTuner::Bounds writerBounds) {
+void Server::EnableAutosize(const AutosizeConfig& cfg) {
+    autosizeCfg_ = cfg;
+}
+
+void Server::EnableWriterTune(const TunerConfig& cfg,
+                              ThreadTuner::Bounds bounds) {
     tuner_ = std::make_unique<ThreadTuner>(cfg, []() {
         return gDispStats.cmdGet.Sum() + gDispStats.cmdSet.Sum() +
                gDispStats.cmdDelete.Sum();
     });
-    ioPool_ = std::make_unique<IOPool>(this);
-    readerGroup_ =
-            std::make_unique<ReaderPoolGroup>("readers", bucket_->ReaderPools());
     writerGroup_ =
             std::make_unique<WriterPoolGroup>("writers", bucket_->WriterPools());
-    tuner_->AddPool(ioPool_.get(), ioBounds);
-    tuner_->AddPool(readerGroup_.get(), readerBounds);
-    tuner_->AddPool(writerGroup_.get(), writerBounds);
+    tuner_->AddPool(writerGroup_.get(), bounds);
 }
 
 void Server::addIOThread() {
@@ -336,6 +335,10 @@ PoolSample Server::IOPool::Sample(double wallSec) {
         s.waitUs = std::max(s.waitUs, iot->evb->getAvgLoopTime());
     }
     s.busyMean = s.size > 0 ? sum / s.size : 0;
+    // A loop blocks in epoll when idle, so its CPU is uncensored demand.
+    s.kind = BusyKind::ThreadCpu;
+    s.workCores = sum;
+    s.queueWaitUs = s.waitUs;
     return s;
 }
 
@@ -376,6 +379,15 @@ void Server::Start() {
             iot->Start();
             iot->lastCpuNs = iot->CpuNs();
         }
+    }
+    // Before the stats thread, which reads autosizer_ unlocked.
+    if (autosizeCfg_) {
+        autosizer_ = Autosizer::Start(
+                *autosizeCfg_,
+                {ioPool_.get(),
+                 &magmaReaderPort_,
+                 ReadsAnswered,
+                 [this]() { return bucket_->CompactionsDone(); }});
     }
 
     running_.store(true);
@@ -430,6 +442,9 @@ void Server::Start() {
                            "\"00000000000000000000000000000000\"}";
                 } else if (strstr(buf, "/stats/dispatcher")) {
                     body = gDispStats.toJson();
+                } else if (strstr(buf, "/stats/autosize")) {
+                    body = autosizer_ ? folly::toJson(autosizer_->Stats())
+                                      : "{\"enabled\":false}";
                 } else if (strstr(buf, "/stats/tuner")) {
                     body = tuner_ ? tuner_->ToJson() : "{\"enabled\":false}";
                 } else if (strstr(buf, "/stats/kvstores")) {
@@ -556,6 +571,7 @@ void Server::Stop() {
     if (statsThread_.joinable()) {
         statsThread_.join();
     }
+    autosizer_.reset();
     std::lock_guard<std::mutex> g(ioMu_);
     for (auto& iot : ioThreads_) {
         iot->evb->terminateLoopSoon();

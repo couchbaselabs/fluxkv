@@ -331,6 +331,7 @@ Decisions Decide(const Window& w,
             const size_t cap = std::max(b.min, std::min(b.max, ps.ceiling));
             const size_t want =
                     std::clamp(std::max(wantCpu, wantDepth), b.min, cap);
+            ps.want = want;
 
             if (smp.kind == BusyKind::ThreadCpu && util < p.censoredUtil) {
                 const double shrinkGap =

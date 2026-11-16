@@ -1,7 +1,9 @@
 #pragma once
 
+#include "autosizer.h"
 #include "engine.h"
 #include "iothread.h"
+#include "magma_reader_port.h"
 #include "tuner.h"
 
 #include <folly/io/async/EventBase.h>
@@ -34,12 +36,10 @@ public:
     // Joins every thread. Idempotent.
     void Stop();
 
-    // Size the IO threads and the reader pools at run time from load.
-    // Bounds are inclusive thread counts; see ThreadTuner.
-    void EnableAutoTune(const TunerConfig& cfg,
-                        ThreadTuner::Bounds ioBounds,
-                        ThreadTuner::Bounds readerBounds,
-                        ThreadTuner::Bounds writerBounds);
+    // Size the IO threads and magma reader pool from load, from Start() on.
+    void EnableAutosize(const AutosizeConfig& cfg);
+    // Size the writer pools by trial; see ThreadTuner.
+    void EnableWriterTune(const TunerConfig& cfg, ThreadTuner::Bounds bounds);
 
 private:
     // The IO threads as one pool. Growing starts loops and spreads existing
@@ -93,9 +93,11 @@ private:
     std::vector<std::unique_ptr<IOThread>> retiredIOThreads_;
 
     std::unique_ptr<IOPool> ioPool_;
-    std::unique_ptr<ReaderPoolGroup> readerGroup_;
     std::unique_ptr<WriterPoolGroup> writerGroup_;
     std::unique_ptr<ThreadTuner> tuner_;
+    MagmaReaderPort magmaReaderPort_;
+    std::optional<AutosizeConfig> autosizeCfg_;
+    std::unique_ptr<Autosizer> autosizer_;
 };
 
 } // namespace kvserver

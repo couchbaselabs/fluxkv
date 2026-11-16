@@ -20,11 +20,11 @@ VBUCKETS=64
 # Non-zero runs the same test through the document cache and additionally
 # requires the read pass to have been served from it.
 CACHE_SIZE=${FLUXKV_TEST_CACHE_SIZE:-0}
-# Non-zero starts the server with --auto-tune and runs the read pass with
-# enough connections, for long enough, that the tuner resizes the pools and
-# moves connections between IO threads while requests are in flight. The
-# assertions are then: no errors, no connection dropped, and the tuner did
-# act.
+# Non-zero starts the server with --auto-size --io-reads and runs the read
+# pass with enough connections, for long enough, that the autosizer resizes
+# the pools and moves connections between IO threads while requests are in
+# flight. The assertions are then: no errors, no connection dropped, and the
+# autosizer did act.
 AUTO_TUNE=${FLUXKV_TEST_AUTO_TUNE:-0}
 
 # The load here is deliberately light: one connection, one request in flight.
@@ -35,9 +35,12 @@ KEYS=1000
 CONNS=1
 PIPELINE=1
 RUNTIME=3s
+# Under --auto-size a given --io-threads would pin the IO pool.
+IO_ARGS=(--io-threads 4)
 EXTRA_SERVER_ARGS=()
 if (( AUTO_TUNE > 0 )); then
-    EXTRA_SERVER_ARGS+=(--auto-tune)
+    IO_ARGS=()
+    EXTRA_SERVER_ARGS+=(--auto-size --io-reads)
 fi
 DATA_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fluxkv-smoke-XXXXXX")
 LOG="${DATA_DIR}/server.log"
@@ -61,7 +64,7 @@ echo "# data dir: ${DATA_DIR}"
     --vbuckets "${VBUCKETS}" \
     --readers 8 \
     --writers 4 \
-    --io-threads 4 \
+    "${IO_ARGS[@]}" \
     --mem-quota 268435456 \
     --stats-port "${STATS_PORT}" \
     --cache-size "${CACHE_SIZE}" \
@@ -160,34 +163,34 @@ fi
 
 if (( AUTO_TUNE > 0 )); then
     # Light load on many connections: the pools start oversized for it, so
-    # the tuner shrinks them, and every shrink of the IO pool moves live,
-    # pipelined connections between loops.
+    # the demand law shrinks them, and every shrink of the IO pool moves
+    # live, pipelined connections between loops.
     CONNS=16
     PIPELINE=8
     RUNTIME=30s
     tune_out=$(run_phase get)
-    check "get under auto-tune" "${tune_out}"
+    check "get under auto-size" "${tune_out}"
 
     stats=$(curl -s --max-time 5 "http://127.0.0.1:${STATS_PORT}/stats/dispatcher")
     closes=$(sed -n 's/.*"connect_close": \([0-9]*\).*/\1/p' <<<"${stats}" | head -1)
-    tuner=$(curl -s --max-time 5 "http://127.0.0.1:${STATS_PORT}/stats/tuner")
-    changes=$(sed -n 's/.*"changes": \([0-9]*\).*/\1/p' <<<"${tuner}" | paste -sd+ | bc)
+    tuner=$(curl -s --max-time 5 "http://127.0.0.1:${STATS_PORT}/stats/autosize")
+    changes=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(sum(p["changes"] for p in d["pools"]))' <<<"${tuner}")
     io_size=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print([p["size"] for p in d["pools"] if p["name"]=="io"][0])' <<<"${tuner}")
-    rd_size=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print([p["size"] for p in d["pools"] if p["name"]=="readers"][0])' <<<"${tuner}")
+    rd_size=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print([p["size"] for p in d["pools"] if p["name"]=="magma_readers"][0])' <<<"${tuner}")
     # Connections close only when the client finishes; each earlier phase
     # opened one. A higher count means a connection broke mid-run.
     expected_closes=$(( 2 + 16 ))
     if (( closes > expected_closes )); then
-        echo "FAIL: auto-tune: ${closes} connections closed, expected ${expected_closes}" >&2
+        echo "FAIL: auto-size: ${closes} connections closed, expected ${expected_closes}" >&2
         echo "${tuner}" >&2
         exit 1
     fi
     if (( changes == 0 )); then
-        echo "FAIL: auto-tune: tuner made no changes in ${RUNTIME}" >&2
+        echo "FAIL: auto-size: no changes in ${RUNTIME}" >&2
         echo "${tuner}" >&2
         exit 1
     fi
-    echo "# auto-tune: changes=${changes} io=${io_size} readers=${rd_size} closes=${closes}"
+    echo "# auto-size: changes=${changes} io=${io_size} readers=${rd_size} closes=${closes}"
 fi
 
 echo "PASS"

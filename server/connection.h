@@ -257,5 +257,9 @@ private:
     void releaseRequest(Request* req);
 };
 
+// GETs the --io-reads passes of every IO thread have handed to a read, ever.
+// Independent of --no-hot-stats.
+uint64_t ReadsAnswered();
+
 } // namespace kvserver
 } // namespace magma

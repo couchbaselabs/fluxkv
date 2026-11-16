@@ -49,6 +49,10 @@ if(FLUXKV_BUILD_SERVER)
                    server/protocol.cc
                    server/engine.cc
                    server/tuner.cc
+                   server/autosize.cc
+                   server/autosizer.cc
+                   server/cpu_budget.cc
+                   server/magma_reader_port.cc
                    server/alloc.cc)
 
     target_include_directories(fluxkv_server PRIVATE

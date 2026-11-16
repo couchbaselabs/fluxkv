@@ -26,6 +26,7 @@
 #include <iostream>
 #include <string>
 #include <atomic>
+#include <optional>
 #include <thread>
 
 using namespace magma;
@@ -147,12 +148,12 @@ struct Config {
     bool cacheValuePtr = false;
     bool streamReaders = false;
     bool directSend = false;
-    // Size IO threads and readers from load at run time. --io-threads and
-    // --readers become the starting points; these are the ceilings.
-    bool autoTune = false;
-    size_t maxIoThreads = 0; // 0 = hardware threads
-    size_t maxReaders = 0; // 0 = 4 x hardware threads
-    size_t maxWriters = 0; // 0 = 2 x hardware threads
+    // Size IO threads and magma readers from measured work (--io-reads
+    // only); a pool given on the command line is pinned.
+    bool autoSize = false;
+    double sizeEfficiency = 0.15;
+    bool ioThreadsSet = false;
+    bool readersSet = false;
     int sharedWalPrewrite = -1; // -1 = magma default (on)
     // 256 MB: big enough that rotation is rare, small enough that the
     // recycle pool fills and a pre-write pass is cheap.
@@ -237,8 +238,6 @@ struct Config {
     bool lsdTieredL0 = false;
     double memLwmRatio = 0;
     double writeCacheRatio = 0; // 0 keeps magma's default
-    bool tuneWritersOnly = false;
-    std::string tunePools; // empty = all
     std::string blockCachePolicy;
     size_t readAhead = 0;
     bool noIndexCompression = false;
@@ -382,16 +381,11 @@ static void printUsage(const char* prog) {
                  "reader pool (as --async-reads)\n"
               << "  --cache-value-ptr     the seqno index also keeps each doc's last known "
                  "block, so reads skip magma's block locate (needs --cache-seqno-index)\n"
-              << "  --auto-tune           size IO threads and readers from "
-                 "load; --io-threads/--readers are the starting points\n"
-              << "  --max-io-threads N    ceiling for --auto-tune (default: "
-                 "hardware threads)\n"
-              << "  --max-readers N       ceiling for --auto-tune (default: "
-                 "4 x hardware threads)\n"
-              << "  --tune-writers-only   with --auto-tune, hold IO threads and "
-                 "readers at their configured sizes\n"
-              << "  --max-writers N       ceiling for --auto-tune (default: "
-                 "2 x hardware threads)\n"
+              << "  --auto-size           size IO threads and magma readers from "
+                 "their measured work, writers by trial (needs --io-reads); "
+                 "--io-threads/--magma-readers pin a pool\n"
+              << "  --size-efficiency E   with --auto-size, keep a grow only if "
+                 "its GET/s gain is >= E x its CPU gain (default 0.15)\n"
               << "  --write-cache N       per-shard write cache in bytes "
                  "(default: half the per-shard quota). This is the threshold "
                  "magma throttles writers against\n"
@@ -449,9 +443,6 @@ static void printUsage(const char* prog) {
                  "level (magma default 0.05); smaller gives LSD GC finer victims\n"
               << "  --lsd-tiered-l0      tiered level-0 seqIndex GC (needs "
                  "--lsd-levels 3 and the magma research branch)\n"
-              << "  --tune-pools LIST    comma list of io,readers,writers that "
-                 "--auto-tune may resize; the rest stay at their configured "
-                 "sizes (default all)\n"
               << "  --block-cache-policy P  block cache eviction: LRU (magma "
                  "default), DFR (delayed FIFO reinsertion) or C2QP (Clock2Q+)\n"
               << "  --disk-limit-bytes N  hold SETs while disk use > N bytes (default: off)\n"
@@ -556,10 +547,8 @@ static Config parseArgs(int argc, char* argv[]) {
             {"cache-seqno-index-max", required_argument, nullptr, 1309},
             {"stream-readers", no_argument, nullptr, 1307},
             {"direct-send", no_argument, nullptr, 1308},
-            {"auto-tune", no_argument, nullptr, 1030},
-            {"max-io-threads", required_argument, nullptr, 1031},
-            {"max-readers", required_argument, nullptr, 1032},
-            {"max-writers", required_argument, nullptr, 1060},
+            {"auto-size", no_argument, nullptr, 1030},
+            {"size-efficiency", required_argument, nullptr, 1031},
             {"durable-spin", required_argument, nullptr, 1061},
             {"trace-latency", no_argument, nullptr, 1062},
             {"shared-wal-prewrite", required_argument, nullptr, 1063},
@@ -591,9 +580,7 @@ static Config parseArgs(int argc, char* argv[]) {
             {"lsd-levels", required_argument, nullptr, 1077},
             {"lsd-tiered-l0", no_argument, nullptr, 1078},
             {"mem-lwm-ratio", required_argument, nullptr, 1079},
-            {"tune-writers-only", no_argument, nullptr, 1080},
             {"read-ahead", required_argument, nullptr, 1081},
-            {"tune-pools", required_argument, nullptr, 1083},
             {"block-cache-policy", required_argument, nullptr, 1084},
             {"write-cache-ratio", required_argument, nullptr, 1099},
             {"no-index-compression", no_argument, nullptr, 1082},
@@ -644,12 +631,14 @@ static Config parseArgs(int argc, char* argv[]) {
             break;
         case 'i':
             cfg.ioThreads = static_cast<uint16_t>(atoi(optarg));
+            cfg.ioThreadsSet = true;
             break;
         case 'w':
             cfg.writers = static_cast<uint16_t>(atoi(optarg));
             break;
         case 'r':
             cfg.readers = static_cast<uint16_t>(atoi(optarg));
+            cfg.readersSet = true;
             break;
         case 'm':
             cfg.memQuota = strtoull(optarg, nullptr, 10);
@@ -792,16 +781,10 @@ static Config parseArgs(int argc, char* argv[]) {
             cfg.cacheSeqnoIndexMax = strtoull(optarg, nullptr, 10);
             break;
         case 1030:
-            cfg.autoTune = true;
+            cfg.autoSize = true;
             break;
         case 1031:
-            cfg.maxIoThreads = strtoull(optarg, nullptr, 10);
-            break;
-        case 1032:
-            cfg.maxReaders = strtoull(optarg, nullptr, 10);
-            break;
-        case 1060:
-            cfg.maxWriters = strtoull(optarg, nullptr, 10);
+            cfg.sizeEfficiency = std::stod(optarg);
             break;
         case 1061:
             kvserver::gDurableSpinIters = atoi(optarg);
@@ -948,17 +931,11 @@ static Config parseArgs(int argc, char* argv[]) {
         case 1079:
             cfg.memLwmRatio = std::stod(optarg);
             break;
-        case 1080:
-            cfg.tuneWritersOnly = true;
-            break;
         case 1081:
             cfg.readAhead = strtoull(optarg, nullptr, 10);
             break;
         case 1082:
             cfg.noIndexCompression = true;
-            break;
-        case 1083:
-            cfg.tunePools = optarg;
             break;
         case 1084:
             cfg.blockCachePolicy = optarg;
@@ -993,6 +970,39 @@ extern "C" int je_mallctl(const char* name, void* oldp, size_t* oldlenp,
 
 int main(int argc, char* argv[]) {
     Config cfg = parseArgs(argc, argv);
+
+    std::optional<kvserver::AutosizeConfig> autosize;
+    if (cfg.autoSize) {
+        // The sync path's busy figure is time in a blocking call, which
+        // reads 1.0 under any backlog: nothing to size from.
+        if (!kvserver::gIoReads) {
+            spdlog::error("--auto-size needs --io-reads");
+            return 1;
+        }
+        const auto budget = kvserver::ReadCpuBudget();
+        autosize = kvserver::AutosizeConfig::For(
+                budget,
+                cfg.ioThreadsSet ? cfg.ioThreads : 0,
+                cfg.magmaReaders,
+                cfg.sizeEfficiency);
+        cfg.ioThreads = static_cast<uint16_t>(autosize->InitialIo());
+        cfg.magmaReaders = autosize->InitialMagma();
+        // fluxkv readers only take the overflow of a full magma queue.
+        if (!cfg.readersSet) {
+            cfg.readers = cfg.shards;
+        }
+        kvserver::gReaderSpinIters = 0;
+        spdlog::info("  auto-size: usable={} cores={} smt={} cgroup={}; "
+                     "io-threads {}{} magma-readers {}{}",
+                     budget.usable,
+                     budget.physicalCores,
+                     budget.smtWidth,
+                     budget.cgroup,
+                     cfg.ioThreads,
+                     autosize->pinIo ? " (pinned)" : "",
+                     cfg.magmaReaders,
+                     autosize->pinMagma ? " (pinned)" : "");
+    }
 
     spdlog::info("magma-kvserver starting");
     spdlog::info(
@@ -1435,46 +1445,13 @@ int main(int argc, char* argv[]) {
                   cfg.statsPort);
     gServer = &server;
 
-    if (cfg.autoTune) {
+    if (autosize) {
+        server.EnableAutosize(*autosize);
+        // Writers until they join the autosizer: one switch for both.
         const size_t hw = std::max(1u, std::thread::hardware_concurrency());
-        ThreadTuner::Bounds io{1, cfg.maxIoThreads ? cfg.maxIoThreads : hw};
-        // Readers move in whole shards; the floor is one per shard.
-        ThreadTuner::Bounds rd{cfg.shards,
-                               cfg.maxReaders ? cfg.maxReaders : 4 * hw};
-        // Writers move in whole shards too.
         ThreadTuner::Bounds wr{cfg.shards,
-                               cfg.maxWriters ? cfg.maxWriters : 2 * hw};
-        io.max = std::max(io.max, static_cast<size_t>(cfg.ioThreads));
-        rd.max = std::max(rd.max, static_cast<size_t>(cfg.readers));
-        if (cfg.tuneWritersOnly) {
-            io.min = io.max = cfg.ioThreads;
-            rd.min = rd.max = cfg.readers;
-        }
-        if (!cfg.tunePools.empty()) {
-            auto has = [&](const char* n) {
-                return ("," + cfg.tunePools + ",").find(std::string(",") + n + ",") !=
-                       std::string::npos;
-            };
-            if (!has("io")) {
-                io.min = io.max = cfg.ioThreads;
-            }
-            if (!has("readers")) {
-                rd.min = rd.max = cfg.readers;
-            }
-            if (!has("writers")) {
-                wr.min = wr.max = cfg.writers;
-            }
-        }
-        wr.max = std::max(wr.max, static_cast<size_t>(cfg.writers));
-        server.EnableAutoTune(TunerConfig{}, io, rd, wr);
-        spdlog::info(
-                "  auto-tune: io-threads {}..{} readers {}..{} writers {}..{}",
-                io.min,
-                io.max,
-                rd.min,
-                rd.max,
-                wr.min,
-                wr.max);
+                               std::max<size_t>(2 * hw, cfg.writers)};
+        server.EnableWriterTune(TunerConfig{}, wr);
     }
 
     // --no-wal --sync-interval-ms: spread SyncKVStore calls over the interval

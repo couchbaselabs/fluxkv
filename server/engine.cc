@@ -52,6 +52,7 @@ bool gCacheValuePtr = false;
 size_t gMaxReadBatch = 128;
 bool gAsyncReads = false;
 bool gIoReads = false;
+int gReaderSpinIters = -1;
 size_t gIoInlineMax = 0;
 unsigned gIoInlineBudgetPct = 0;
 uint32_t gMaxReadOwners = 1;
@@ -1485,6 +1486,9 @@ void ReaderPool::workerLoop(Worker* self) {
     // hot and shaves wake-up tail latency. Set MAGMA_READER_SPIN_ITERS=0 to
     // disable. Default chosen so total spin time ~50µs on typical hw.
     static const int kSpinIters = []() {
+        if (gReaderSpinIters >= 0) {
+            return gReaderSpinIters;
+        }
         const char* env = std::getenv("MAGMA_READER_SPIN_ITERS");
         return env ? std::atoi(env) : 2000;
     }();
@@ -2381,6 +2385,16 @@ std::string Bucket::GetStatsJson() {
     merged["bucket"] = name_;
     merged["numShards"] = numShards_;
     return merged.dump(2);
+}
+
+uint64_t Bucket::CompactionsDone() {
+    uint64_t n = 0;
+    for (auto& shard : shards_) {
+        Magma::MagmaStats stats;
+        shard->GetMagma()->GetStats(stats);
+        n += stats.NCompacts;
+    }
+    return n;
 }
 
 std::string Bucket::GetKVStoreStatsJson() {
