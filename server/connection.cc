@@ -164,7 +164,13 @@ struct IoReadBatch final : folly::EventBase::LoopCallback {
     std::vector<Request*> reqs;
     Bucket* bucket{nullptr};
     void runLoopCallback() noexcept override {
-        bucket->ReadAsyncNow(reqs);
+        // A pass this small costs less read here than handed to a pool
+        // thread: no wakeup, and the response leaves from this thread.
+        if (reqs.size() <= gIoInlineMax) {
+            bucket->ReadInlineNow(reqs);
+        } else {
+            bucket->ReadAsyncNow(reqs);
+        }
     }
 };
 thread_local IoReadBatch tlsIoReads;

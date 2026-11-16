@@ -127,6 +127,9 @@ extern bool gAsyncReads;
 // --io-reads: an IO thread hands each read loop's GETs to magma's reader pool
 // (GetDocsAsync) itself, skipping the vbucket queues and reader threads.
 extern bool gIoReads;
+// --io-inline-max N: an IO thread reads a loop pass of at most N GETs itself,
+// synchronously, and replies; larger passes go to magma's reader pool.
+extern size_t gIoInlineMax;
 // Max concurrent owners one vbucket's reads can have (--max-read-owners).
 // 1 keeps the old single-owner behavior.
 extern uint32_t gMaxReadOwners;
@@ -883,6 +886,9 @@ public:
     // --io-reads: reads reqs in one GetDocsAsync call; on RetryLater they go
     // through EnqueueRead. Takes the requests and leaves reqs empty.
     void ReadAsyncNow(std::vector<Request*>& reqs);
+    // --io-inline-max: reads reqs on this thread with magma Get and sends the
+    // responses. Takes the requests and leaves reqs empty.
+    void ReadInlineNow(std::vector<Request*>& reqs);
     bool IsDurable() const {
         return durable_;
     }

@@ -52,6 +52,7 @@ bool gCacheValuePtr = false;
 size_t gMaxReadBatch = 128;
 bool gAsyncReads = false;
 bool gIoReads = false;
+size_t gIoInlineMax = 0;
 uint32_t gMaxReadOwners = 1;
 std::atomic<uint64_t> gMaxReadQueueAgeNs{0};
 std::atomic<uint32_t> gMaxReadRequeues{0};
@@ -1948,6 +1949,24 @@ void Bucket::ReadAsyncNow(std::vector<Request*>& reqs) {
         }
         delete call;
     }
+    reqs.clear();
+}
+
+void Bucket::ReadInlineNow(std::vector<Request*>& reqs) {
+    thread_local Magma::FetchBuffer idxBuf, seqBuf;
+    thread_local std::vector<Request*> one(1);
+    auto& accum = AsyncReadCall::accum();
+    for (auto* req : reqs) {
+        if (gTraceLatency) {
+            req->tReadEnqueue = steadyNowNs();
+        }
+        Slice meta, value;
+        auto status = GetShard(req->vbucket).GetMagma()->Get(
+                req->vbucket, req->key, idxBuf, seqBuf, meta, value);
+        one[0] = req;
+        completeGets(this, req->vbucket, one, status, meta, value, accum);
+    }
+    accum.FlushAll();
     reqs.clear();
 }
 
