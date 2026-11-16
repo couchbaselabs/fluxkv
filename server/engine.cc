@@ -442,6 +442,10 @@ private:
     void run() {
         pthread_setname_np(pthread_self(), "fx:durwake");
         uint64_t lastD = 0, lastG = 0;
+        // Idle polls in a row. A 50 us poll costs about 20K wakeups a second;
+        // after 10 ms with nothing to publish the poll slows to 1 ms, so an
+        // idle or read-only server does not pay a core's fraction for it.
+        int idle = 0;
         for (;;) {
             const bool stopping = stop_.load(std::memory_order_acquire);
             const uint64_t g = parkGen_.load(std::memory_order_acquire);
@@ -451,6 +455,7 @@ private:
                 wake();
                 lastD = d;
                 lastG = g;
+                idle = 0;
             }
             if (stopping) {
                 return;
@@ -459,8 +464,11 @@ private:
                 // Something committed is not durable yet: the log's
                 // flushers will publish it, and this returns when they do.
                 magmas_[0]->AwaitWALDurable(d + 1);
-            } else {
+                idle = 0;
+            } else if (++idle < 200) {
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
     }
