@@ -163,7 +163,7 @@ extern std::atomic<uint64_t> gVbidMaxQueueAgeNs[kMaxVbidStats];
 // writer is free turns a saturated pool into one that spends its CPU on
 // one- and two-item batches. 0 disables.
 extern size_t gMinWriteBatch;
-extern uint64_t gWriteCoalesceNs;
+extern std::atomic<uint64_t> gWriteCoalesceNs;
 
 // Sorting a write batch by key pays when the batch holds repeats of the
 // same key (they collapse to one write) and, less, through locality in the
@@ -189,6 +189,9 @@ inline uint64_t steadyNowNs() {
 }
 
 extern bool gAsyncDurable;
+// Moves what follows --durable besides the acks (the shared log's sync on
+// commit, write coalescing) when Bucket::SetDurable switches; set by main.
+extern std::function<void(bool durable)> gDurableHook;
 // Write metas in DocMeta's compact form. Old binaries cannot read it, so main
 // only sets this when magma's storage format keeps them off the data.
 extern bool gCompactMeta;
@@ -401,6 +404,8 @@ struct alignas(64) Request {
     uint64_t resultSeqno{0};
     // Async-durable: log position that must be durable before the reply.
     uint64_t durableLsn{0};
+    // Staged in durable mode: answered after the write, not before it.
+    bool durable{false};
     uint32_t resultFlags{0};
     uint8_t resultDatatype{0}; // stored datatype (GET)
     // GET result value copied from FetchBuffer. std::vector with capacity
@@ -434,6 +439,7 @@ struct alignas(64) Request {
         resultStatus = Status();
         resultSeqno = 0;
         durableLsn = 0;
+        durable = false;
         resultFlags = 0;
         responseBuf.clear(); // preserve capacity for reuse
     }
@@ -897,8 +903,11 @@ public:
     // responses. Takes the requests and leaves reqs empty.
     void ReadInlineNow(std::vector<Request*>& reqs);
     bool IsDurable() const {
-        return durable_;
+        return durable_.load(std::memory_order_acquire);
     }
+    // Switches durable acks for SETs staged from now on; one already staged
+    // keeps the mode it was staged in (Request::durable). "" or why not.
+    std::string SetDurable(bool on);
 
     const std::string& GetName() const {
         return name_;
@@ -950,7 +959,7 @@ private:
     std::string dataDir_;
     uint16_t numShards_;
     uint16_t numVBuckets_;
-    bool durable_;
+    std::atomic<bool> durable_;
     size_t writeQueueMemLimit_;
     size_t echoGetSize_;
     std::string echoGetValue_;

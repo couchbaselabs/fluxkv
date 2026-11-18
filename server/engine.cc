@@ -79,7 +79,8 @@ double gSortDupThreshold = 0.05;
 // Slots in each shard's queue of recycled chains; a chain holds at least one
 // Request, so this never binds before Shard::kMaxFreeRequests.
 static constexpr size_t kFreeRequestCap = Shard::kMaxFreeRequests;
-uint64_t gWriteCoalesceNs = 0;
+std::atomic<uint64_t> gWriteCoalesceNs{0};
+std::function<void(bool)> gDurableHook;
 
 namespace {
 
@@ -1305,9 +1306,16 @@ size_t WriterPool::executePersist(PersistTask& task) {
 
     bucket_->queuedBytes_.fetch_sub(batchBytes, std::memory_order_relaxed);
 
-    if (bucket_->IsDurable()) {
-        // Durable mode: send response after WriteDocs completes
-        for (auto* req : batch) {
+    // Each request is answered in the mode it was staged in: durability can
+    // switch while a batch is queued.
+    auto async = std::stable_partition(batch.begin(), batch.end(),
+                                       [](Request* r) { return r->durable; });
+    if (async != batch.begin()) {
+        // Durable: send the response now that WriteDocs, and with it the
+        // log sync, is done.
+        for (auto it = batch.begin(); it != async; ++it) {
+            auto* req = *it;
+            req->tDurable = req->tWritten;
             req->resultStatus = status;
             if (status.IsOK()) {
                 hotStatAdd(gDispStats.cmdSetResp);
@@ -1318,28 +1326,30 @@ size_t WriterPool::executePersist(PersistTask& task) {
             req->evb->runInEventBaseThread(
                     [conn, req]() { conn->sendWriteResponse(req); });
         }
-    } else {
-        // Async mode: response already sent by IO thread. Recycle the
-        // requests for the IO threads to reuse; deleting here frees memory
-        // another thread allocated.
+    }
+    const size_t written = batch.size();
+    if (async != batch.end()) {
+        // Async: the IO thread already answered. Recycle the requests for
+        // the IO threads to reuse; deleting here frees memory another
+        // thread allocated.
+        const size_t n = batch.end() - async;
         if (status.IsOK()) {
-            hotStatAdd(gDispStats.cmdSetResp, batch.size());
+            hotStatAdd(gDispStats.cmdSetResp, n);
         } else {
-            hotStatAdd(gDispStats.cmdSetRespErr, batch.size());
+            hotStatAdd(gDispStats.cmdSetRespErr, n);
         }
-        for (size_t i = 0; i < batch.size(); i++) {
-            batch[i]->reset();
-            batch[i]->hook.next = i + 1 < batch.size() ? batch[i + 1] : nullptr;
+        for (auto it = async; it != batch.end(); ++it) {
+            (*it)->reset();
+            (*it)->hook.next = it + 1 != batch.end() ? *(it + 1) : nullptr;
         }
-        batch[0]->chainLen = static_cast<uint32_t>(batch.size());
-        if (!shard->RecycleRequests(batch[0])) {
-            for (auto* req : batch) {
-                delete req;
+        (*async)->chainLen = static_cast<uint32_t>(n);
+        if (!shard->RecycleRequests(*async)) {
+            for (auto it = async; it != batch.end(); ++it) {
+                delete *it;
             }
         }
     }
 
-    const size_t written = batch.size();
     releaseVBQueueAfterWrite(vbq, shard, task.vbid, *this);
     return written;
 }
@@ -2108,6 +2118,25 @@ static void completeGets(Bucket* bucket_,
 
 
 // ---- Bucket ----
+
+std::string Bucket::SetDurable(bool on) {
+    if (gAsyncDurable) {
+        return "--async-durable fixes durability at startup";
+    }
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lock(mu);
+    // On: the log syncs on commit before any SET is staged durable. Off: a
+    // SET staged durable just before may be answered without the sync.
+    if (on && gDurableHook) {
+        gDurableHook(true);
+    }
+    durable_.store(on, std::memory_order_release);
+    if (!on && gDurableHook) {
+        gDurableHook(false);
+    }
+    spdlog::info("durable acks {}", on ? "on" : "off");
+    return "";
+}
 
 Bucket::Bucket(const std::string& name,
                const std::string& dataDir,

@@ -1061,6 +1061,7 @@ int main(int argc, char* argv[]) {
                                     cfg.magmaReaders);
     }
     kvserver::gMaxReadOwners = std::max<uint32_t>(1, cfg.maxReadOwners);
+    const bool coalesceFollowsDurable = cfg.writeCoalesceUs < 0;
     if (cfg.writeCoalesceUs < 0) {
         cfg.writeCoalesceUs = cfg.durable ? 0 : 20000;
     }
@@ -1232,6 +1233,23 @@ int main(int argc, char* argv[]) {
                 o.NumChunks,
                 o.ChunkSize / (1024 * 1024),
                 o.SyncOnCommit);
+    }
+    {
+        // /settings/durable moves what follows --durable at startup: the
+        // shared log's sync on commit and the write coalescing window, which
+        // grows back only where its coalescing thread exists (started async).
+        const bool syncFollows = sharedWal && cfg.sharedWalSyncCommit < 0;
+        const uint64_t asyncCoalesceNs =
+                coalesceFollowsDurable ? kvserver::gWriteCoalesceNs.load() : 0;
+        kvserver::gDurableHook = [sharedWal, syncFollows, coalesceFollowsDurable,
+                                  asyncCoalesceNs](bool on) {
+            if (syncFollows) {
+                sharedWal->SetSyncOnCommit(on);
+            }
+            if (coalesceFollowsDurable) {
+                kvserver::gWriteCoalesceNs = on ? 0 : asyncCoalesceNs;
+            }
+        };
     }
 
     if (cfg.lsmSSTableSize > 0) {

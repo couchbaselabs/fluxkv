@@ -440,6 +440,21 @@ void Server::Start() {
                            "\"isEnterprise\":true,"
                            "\"uuid\":"
                            "\"00000000000000000000000000000000\"}";
+                } else if (strstr(buf, "/settings/durable")) {
+                    // /settings/durable?on=1|0 switches durable acks;
+                    // without on= it reports the mode.
+                    std::string err;
+                    if (strstr(buf, "/settings/durable?on=1")) {
+                        err = bucket_->SetDurable(true);
+                    } else if (strstr(buf, "/settings/durable?on=0")) {
+                        err = bucket_->SetDurable(false);
+                    }
+                    body = err.empty()
+                                   ? std::string("{\"durable\":") +
+                                             (bucket_->IsDurable() ? "true"
+                                                                   : "false") +
+                                             "}"
+                                   : "{\"error\":\"" + err + "\"}";
                 } else if (strstr(buf, "/stats/dispatcher")) {
                     body = gDispStats.toJson();
                 } else if (strstr(buf, "/stats/autosize")) {

@@ -1245,6 +1245,7 @@ void Connection::handleSet(McbpHeader& hdr,
     if (bucket_->IsDurable()) {
         // Durable: track outstanding, wait for WriteDocs completion
         outstandingRequests_.fetch_add(1, std::memory_order_relaxed);
+        req->durable = true;
         req->conn = this;
         req->evb = socket_->getEventBase();
         // Keep this loop alive until the response is sent: with
@@ -1334,6 +1335,7 @@ void Connection::handleDelete(McbpHeader& hdr,
 
     if (bucket_->IsDurable()) {
         outstandingRequests_.fetch_add(1, std::memory_order_relaxed);
+        req->durable = true;
         req->conn = this;
         req->evb = socket_->getEventBase();
         // Keep this loop alive until the response is sent: with
