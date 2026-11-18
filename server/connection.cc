@@ -1541,6 +1541,14 @@ void Connection::traceRead(Request* req) {
         gReadStages.record(ReadStageTimers::MagmaGet, magmaGet);
         gReadStages.record(ReadStageTimers::Respond, respond);
         gReadStages.record(ReadStageTimers::Total, now - req->tReadEnqueue);
+        if (req->tReaderStart >= req->tReadDispatch && req->tReaderStart) {
+            gReadStages.record(ReadStageTimers::ReaderQueue,
+                               req->tReaderStart - req->tReadDispatch);
+            gReadStages.record(ReadStageTimers::MagmaRead, req->magmaReadNs);
+            gReadStages.magmaReads.fetch_add(1, std::memory_order_relaxed);
+            gReadStages.fileReads.fetch_add(req->readIOs,
+                                            std::memory_order_relaxed);
+        }
 
         if (req->tReadPosted >= req->tReadDone &&
             req->tReadPickedUp >= req->tReadPosted) {

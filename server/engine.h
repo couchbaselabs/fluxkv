@@ -255,6 +255,9 @@ struct ReadStageTimers {
     std::atomic<uint64_t> mailboxEnqueueMax{0};
     std::atomic<uint64_t> mailboxPickupMax{0};
     std::atomic<uint64_t> writeRespMax{0};
+    // Reads magma timed, and their file reads.
+    std::atomic<uint64_t> magmaReads{0};
+    std::atomic<uint64_t> fileReads{0};
     static constexpr int kBuckets = 24;
     enum Hist {
         QueueWait,
@@ -264,6 +267,8 @@ struct ReadStageTimers {
         MailboxEnqueue,
         MailboxPickup,
         WriteResp,
+        ReaderQueue,
+        MagmaRead,
         NumHist
     };
     std::atomic<uint64_t> hist[NumHist][kBuckets]{};
@@ -398,6 +403,12 @@ struct alignas(64) Request {
     // the top of the lambda the IO thread's loop actually runs.
     uint64_t tReadPosted{0};
     uint64_t tReadPickedUp{0};
+    // From magma's GetStats (gTraceLatency only): when a reader started this
+    // request's key, how long magma's read took and its file reads. Splits
+    // magma_get into reader_queue and magma_read.
+    uint64_t tReaderStart{0};
+    uint64_t magmaReadNs{0};
+    uint32_t readIOs{0};
 
     // Result filled by engine thread
     Status resultStatus;
@@ -435,6 +446,8 @@ struct alignas(64) Request {
         tArrive = tWriter = tWritten = tDurable = tReadEnqueue = 0;
         tReadDispatch = tReadDone = 0;
         tReadPosted = tReadPickedUp = 0;
+        tReaderStart = magmaReadNs = 0;
+        readIOs = 0;
         readRequeues = 0;
         resultStatus = Status();
         resultSeqno = 0;

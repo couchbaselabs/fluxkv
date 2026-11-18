@@ -180,6 +180,10 @@ std::string DispatcherStats::toJson() const {
                 gReadStages.respondNs.load(std::memory_order_relaxed) / 1e3 /
                 n;
         j["read_stage_count"] = n;
+        j["read_stage_magma_reads"] =
+                gReadStages.magmaReads.load(std::memory_order_relaxed);
+        j["read_stage_file_reads"] =
+                gReadStages.fileReads.load(std::memory_order_relaxed);
         j["read_stage_max_queue_wait_us"] =
                 gReadStages.queueWaitMax.load(std::memory_order_relaxed) / 1e3;
         j["read_stage_max_magma_get_us"] =
@@ -209,7 +213,9 @@ std::string DispatcherStats::toJson() const {
                                                "total",
                                                "mailbox_enqueue",
                                                "mailbox_pickup",
-                                               "write_resp"};
+                                               "write_resp",
+                                               "reader_queue",
+                                               "magma_read"};
         for (int h = 0; h < ReadStageTimers::NumHist; h++) {
             auto& arr = j["read_stage_hist"][kReadHistNames[h]];
             for (int b = 0; b < ReadStageTimers::kBuckets; b++) {
@@ -1563,7 +1569,8 @@ static void completeGets(Bucket* bucket_,
                          Status s,
                          const Slice& meta,
                          const Slice& value,
-                         DispatchAccum& accum);
+                         DispatchAccum& accum,
+                         const Magma::GetStats* stats);
 
 // Takes this vbucket's next batch (overflow first, then one sweep) and
 // accounts it. An empty batch has already released the queue.
@@ -1744,8 +1751,13 @@ size_t ReaderPool::executeRead(ReadTask& task) {
                     .push_back(req);
         }
         OperationsList<Magma::GetOperation> getOps;
+        std::vector<Magma::GetStats> stats(gTraceLatency ? byKey.size() : 0);
+        size_t nextStats = 0;
         for (auto& [key, reqs] : byKey) {
             Magma::GetOperation op(reqs.front()->key, &reqs);
+            if (!stats.empty()) {
+                op.Stats = &stats[nextStats++];
+            }
             if (gCacheSeqnoIndex) {
                 op.SeqnoHint = gDocCache->SeqnoHint(
                         task.vbid,
@@ -1769,7 +1781,8 @@ size_t ReaderPool::executeRead(ReadTask& task) {
                                  s,
                                  meta,
                                  value,
-                                 accum);
+                                 accum,
+                                 op.Stats);
                 });
         accum.FlushAll();
     }
@@ -1790,6 +1803,7 @@ public:
     struct KeyReqs {
         uint16_t vbid;
         std::vector<Request*> reqs;
+        Magma::GetStats stats;
     };
 
     AsyncReadCall(Bucket* bucket, size_t batches)
@@ -1802,7 +1816,8 @@ public:
                const Slice& value) override {
         auto* kr = static_cast<KeyReqs*>(op.UserContext);
         learnValuePtr(kr->vbid, op, s, meta);
-        completeGets(bucket, kr->vbid, kr->reqs, s, meta, value, accum());
+        completeGets(bucket, kr->vbid, kr->reqs, s, meta, value, accum(),
+                     op.Stats);
     }
 
     void OnJobDone() override {
@@ -1865,6 +1880,9 @@ size_t ReaderPool::submitReadsAsync(std::vector<ReadTask>& tasks) {
                 call->keyReqs.push_back(AsyncReadCall::KeyReqs{tasks[i].vbid, {}});
                 slot = &call->keyReqs.back();
                 Magma::GetOperation op(req->key, slot);
+                if (gTraceLatency) {
+                    op.Stats = &slot->stats;
+                }
                 if (gCacheSeqnoIndex) {
                     op.SeqnoHint = gDocCache->SeqnoHint(
                             tasks[i].vbid,
@@ -1891,7 +1909,7 @@ size_t ReaderPool::submitReadsAsync(std::vector<ReadTask>& tasks) {
             // Shutting down: fail every read of the call.
             for (auto& kr : call->keyReqs) {
                 completeGets(bucket_, kr.vbid, kr.reqs, status, {}, {},
-                             AsyncReadCall::accum());
+                             AsyncReadCall::accum(), nullptr);
             }
             AsyncReadCall::accum().FlushAll();
             call->release();
@@ -1939,6 +1957,9 @@ void Bucket::ReadAsyncNow(std::vector<Request*>& reqs) {
             call->keyReqs.push_back(AsyncReadCall::KeyReqs{vbid, {}});
             slot = &call->keyReqs.back();
             Magma::GetOperation op(req->key, slot);
+            if (gTraceLatency) {
+                op.Stats = &slot->stats;
+            }
             if (gCacheSeqnoIndex) {
                 op.SeqnoHint = gDocCache->SeqnoHint(
                         vbid,
@@ -1952,6 +1973,12 @@ void Bucket::ReadAsyncNow(std::vector<Request*>& reqs) {
     gets.push_back({*GetShard(reqs.back()->vbucket).GetMagma(),
                     reqs.back()->vbucket,
                     call->getOps[g]});
+    if (gTraceLatency) {
+        const uint64_t now = steadyNowNs();
+        for (auto* req : reqs) {
+            req->tReadDispatch = now;
+        }
+    }
     auto status = Magma::GetDocsAsync(gets, *call);
     if (!status) {
         // The pool's queue is full or magma is closing: the readers take them.
@@ -1971,13 +1998,14 @@ void Bucket::ReadInlineNow(std::vector<Request*>& reqs) {
     auto& accum = AsyncReadCall::accum();
     for (auto* req : reqs) {
         if (gTraceLatency) {
-            req->tReadEnqueue = steadyNowNs();
+            req->tReadEnqueue = req->tReadDispatch = steadyNowNs();
         }
         Slice meta, value;
         auto status = GetShard(req->vbucket).GetMagma()->Get(
                 req->vbucket, req->key, idxBuf, seqBuf, meta, value);
         one[0] = req;
-        completeGets(this, req->vbucket, one, status, meta, value, accum);
+        completeGets(this, req->vbucket, one, status, meta, value, accum,
+                     nullptr);
     }
     accum.FlushAll();
     reqs.clear();
@@ -1991,6 +2019,7 @@ size_t ReaderPool::executeReadMulti(std::vector<ReadTask>& tasks) {
     struct KeyReqs {
         uint16_t vbid;
         std::vector<Request*> reqs;
+        Magma::GetStats stats;
     };
     std::vector<std::vector<Request*>> batches(tasks.size());
     std::deque<KeyReqs> keyReqs; // stable addresses for UserContext
@@ -2015,6 +2044,9 @@ size_t ReaderPool::executeReadMulti(std::vector<ReadTask>& tasks) {
                 keyReqs.push_back(KeyReqs{tasks[i].vbid, {}});
                 slot = &keyReqs.back();
                 Magma::GetOperation op(req->key, slot);
+                if (gTraceLatency) {
+                    op.Stats = &slot->stats;
+                }
                 if (gCacheSeqnoIndex) {
                     op.SeqnoHint = gDocCache->SeqnoHint(
                             tasks[i].vbid,
@@ -2037,7 +2069,8 @@ size_t ReaderPool::executeReadMulti(std::vector<ReadTask>& tasks) {
                                const Slice& value) {
                     auto* kr = static_cast<KeyReqs*>(op.UserContext);
                     learnValuePtr(kr->vbid, op, s, meta);
-                    completeGets(bucket_, kr->vbid, kr->reqs, s, meta, value, accum);
+                    completeGets(bucket_, kr->vbid, kr->reqs, s, meta, value,
+                                 accum, op.Stats);
                 });
         accum.FlushAll();
     }
@@ -2058,7 +2091,8 @@ static void completeGets(Bucket* bucket_,
                          Status s,
                          const Slice& meta,
                          const Slice& value,
-                         DispatchAccum& accum) {
+                         DispatchAccum& accum,
+                         const Magma::GetStats* stats) {
                     auto* reqsPtr = &reqs;
                     bool hit = s.IsOK() && !s.IsOkDocNotFound();
                     DocMeta dm;
@@ -2067,8 +2101,21 @@ static void completeGets(Bucket* bucket_,
                     }
                     const uint64_t tReadDone =
                             gTraceLatency ? steadyNowNs() : 0;
+                    const bool timed =
+                            stats &&
+                            stats->Start !=
+                                    std::chrono::steady_clock::time_point{};
                     for (auto* req : *reqsPtr) {
                         req->tReadDone = tReadDone;
+                        if (timed) {
+                            req->tReaderStart =
+                                    std::chrono::duration_cast<
+                                            std::chrono::nanoseconds>(
+                                            stats->Start.time_since_epoch())
+                                            .count();
+                            req->magmaReadNs = stats->Duration.count();
+                            req->readIOs = stats->Reader.NReadIOs;
+                        }
                         req->resultStatus = s;
                         if (hit) {
                             req->resultFlags = dm.flags;
