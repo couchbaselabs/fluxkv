@@ -403,7 +403,7 @@ struct alignas(64) Request {
     // the top of the lambda the IO thread's loop actually runs.
     uint64_t tReadPosted{0};
     uint64_t tReadPickedUp{0};
-    // From magma's GetStats (gTraceLatency only): when a reader started this
+    // From magma's ReadStats (gTraceLatency only): when a reader started this
     // request's key, how long magma's read took and its file reads. Splits
     // magma_get into reader_queue and magma_read.
     uint64_t tReaderStart{0};

@@ -1570,7 +1570,7 @@ static void completeGets(Bucket* bucket_,
                          const Slice& meta,
                          const Slice& value,
                          DispatchAccum& accum,
-                         const Magma::GetStats* stats);
+                         const Magma::ReadStats* stats);
 
 // Takes this vbucket's next batch (overflow first, then one sweep) and
 // accounts it. An empty batch has already released the queue.
@@ -1751,7 +1751,7 @@ size_t ReaderPool::executeRead(ReadTask& task) {
                     .push_back(req);
         }
         OperationsList<Magma::GetOperation> getOps;
-        std::vector<Magma::GetStats> stats(gTraceLatency ? byKey.size() : 0);
+        std::vector<Magma::ReadStats> stats(gTraceLatency ? byKey.size() : 0);
         size_t nextStats = 0;
         for (auto& [key, reqs] : byKey) {
             Magma::GetOperation op(reqs.front()->key, &reqs);
@@ -1803,7 +1803,7 @@ public:
     struct KeyReqs {
         uint16_t vbid;
         std::vector<Request*> reqs;
-        Magma::GetStats stats;
+        Magma::ReadStats stats;
     };
 
     AsyncReadCall(Bucket* bucket, size_t batches)
@@ -2019,7 +2019,7 @@ size_t ReaderPool::executeReadMulti(std::vector<ReadTask>& tasks) {
     struct KeyReqs {
         uint16_t vbid;
         std::vector<Request*> reqs;
-        Magma::GetStats stats;
+        Magma::ReadStats stats;
     };
     std::vector<std::vector<Request*>> batches(tasks.size());
     std::deque<KeyReqs> keyReqs; // stable addresses for UserContext
@@ -2092,7 +2092,7 @@ static void completeGets(Bucket* bucket_,
                          const Slice& meta,
                          const Slice& value,
                          DispatchAccum& accum,
-                         const Magma::GetStats* stats) {
+                         const Magma::ReadStats* stats) {
                     auto* reqsPtr = &reqs;
                     bool hit = s.IsOK() && !s.IsOkDocNotFound();
                     DocMeta dm;
