@@ -348,6 +348,51 @@ Shard::~Shard() {
     }
 }
 
+// Answers durable writes on their IO threads, each thread's share in one
+// post. Grouping alone was not enough: runInEventBaseThread is drained only
+// when a loop reaches its cross-thread queue, and a loop with many
+// always-ready sockets can go a long time without doing so (mean durable to
+// response 18.8 ms at pipeline 512 against a 0.9 ms durable wait).
+// IOThread::Post leaves the work in a mailbox the read path checks on every
+// event. One post per thread also lets each connection's replies leave in one
+// flush instead of a packet each. Posted in slices, so answering tens of
+// thousands of requests does not keep a loop from its sockets. Each request
+// holds its loop, so the loop cannot be retired underneath; the hold drops
+// after the response.
+static void postWriteResponses(const std::vector<Request*>& reqs) {
+    folly::F14FastMap<IOThread*, std::vector<Request*>> byThread;
+    folly::F14FastMap<folly::EventBase*, std::vector<Request*>> byLoop;
+    for (auto* req : reqs) {
+        if (req->ioOwner) {
+            byThread[req->ioOwner].push_back(req);
+        } else {
+            byLoop[req->evb].push_back(req);
+        }
+    }
+    auto post = [](auto&& submit, std::vector<Request*>& group) {
+        for (size_t i = 0; i < group.size(); i += gCompletionSlice) {
+            const size_t n = std::min(gCompletionSlice, group.size() - i);
+            std::vector<Request*> slice(group.begin() + i,
+                                        group.begin() + i + n);
+            submit([v = std::move(slice)]() {
+                for (auto* req : v) {
+                    req->conn->sendWriteResponse(req);
+                }
+            });
+        }
+    };
+    for (auto& [iot, group] : byThread) {
+        post([iot](std::function<void()> fn) { iot->Post(std::move(fn)); },
+             group);
+    }
+    for (auto& [evb, group] : byLoop) {
+        post([evb](std::function<void()> fn) {
+                 evb->runInEventBaseThread(std::move(fn));
+             },
+             group);
+    }
+}
+
 // Async-durable completion. A writer stamps each request with the log
 // position its batch ended at and parks it on the IO loop that answers it;
 // the batch's queue bytes go into a ledger. One thread waits on the shared
@@ -595,18 +640,7 @@ void Shard::durableLoop() {
             continue;
         }
 
-        // Group the responses per IO thread and hand each one its whole
-        // share at once. Grouping alone was not enough: this used
-        // runInEventBaseThread, which a loop only drains when it reaches its
-        // cross-thread queue, and a loop with many always-ready sockets can
-        // go a long time without doing so. That was the tail - the mean time
-        // from durable to response was 18.8 ms at pipeline 512 while the
-        // durable wait itself was 0.9 ms. IOThread::Post exists for this: it
-        // leaves the work in a mailbox and raises a flag the read path
-        // checks on every event, so a busy loop picks it up within one
-        // iteration.
-        folly::F14FastMap<IOThread*, std::vector<Request*>> byThread;
-        folly::F14FastMap<folly::EventBase*, std::vector<Request*>> byLoop;
+        std::vector<Request*> answer;
         for (auto& p : ready) {
             const bool ok = p.status.IsOK();
             const uint64_t tDurable = gTraceLatency ? steadyNowNs() : 0;
@@ -617,11 +651,7 @@ void Shard::durableLoop() {
                 if (!ok) {
                     req->resultStatus = p.status;
                 }
-                if (req->ioOwner) {
-                    byThread[req->ioOwner].push_back(req);
-                } else {
-                    byLoop[req->evb].push_back(req);
-                }
+                answer.push_back(req);
             }
             hotStatAdd(ok ? gDispStats.cmdSetResp : gDispStats.cmdSetRespErr,
                        p.reqs.size());
@@ -632,35 +662,7 @@ void Shard::durableLoop() {
                         p.bytes, std::memory_order_relaxed);
             }
         }
-
-        // Each parked request holds the loop it will be
-        // answered on, so the loop cannot be retired underneath us. The
-        // hold is dropped on that loop, after the response.
-        // Post in slices: answering tens of thousands of requests in one
-        // callback keeps that loop from reading its sockets for the whole
-        // run of them.
-        auto post = [](auto&& submit, std::vector<Request*>& reqs) {
-            for (size_t i = 0; i < reqs.size(); i += gCompletionSlice) {
-                const size_t n = std::min(gCompletionSlice, reqs.size() - i);
-                std::vector<Request*> slice(reqs.begin() + i,
-                                            reqs.begin() + i + n);
-                submit([v = std::move(slice)]() {
-                    for (auto* req : v) {
-                        req->conn->sendWriteResponse(req);
-                    }
-                });
-            }
-        };
-        for (auto& [iot, reqs] : byThread) {
-            post([iot](std::function<void()> fn) { iot->Post(std::move(fn)); },
-                 reqs);
-        }
-        for (auto& [evb, reqs] : byLoop) {
-            post([evb](std::function<void()> fn) {
-                     evb->runInEventBaseThread(std::move(fn));
-                 },
-                 reqs);
-        }
+        postWriteResponses(answer);
     }
 }
 
@@ -1313,19 +1315,15 @@ size_t WriterPool::executePersist(PersistTask& task) {
     if (async != batch.begin()) {
         // Durable: send the response now that WriteDocs, and with it the
         // log sync, is done.
-        for (auto it = batch.begin(); it != async; ++it) {
-            auto* req = *it;
+        std::vector<Request*> answer(batch.begin(), async);
+        for (auto* req : answer) {
             req->tDurable = req->tWritten;
             req->resultStatus = status;
-            if (status.IsOK()) {
-                hotStatAdd(gDispStats.cmdSetResp);
-            } else {
-                hotStatAdd(gDispStats.cmdSetRespErr);
-            }
-            auto* conn = req->conn;
-            req->evb->runInEventBaseThread(
-                    [conn, req]() { conn->sendWriteResponse(req); });
         }
+        hotStatAdd(status.IsOK() ? gDispStats.cmdSetResp
+                                 : gDispStats.cmdSetRespErr,
+                   answer.size());
+        postWriteResponses(answer);
     }
     const size_t written = batch.size();
     if (async != batch.end()) {
